@@ -202,7 +202,8 @@ true` puts `@embed`'s HNSW index on the native plane). Each lane passes `waitFor
   so a search covers every write committed before it began; an index that is already current does not
   wait, otherwise a search waits about one index flush. Measured on Harper 5.3.2 (one node, local): a
   search with no recent write takes 6–13 ms, one right after a write about 1 s, and a write transaction
-  held open for 6 s by a slow embedding did not delay a concurrent search (8 ms). A coverage wait that
+  held open for 6 s by a slow embedding did not delay a concurrent search (8 ms), nor did a two-row
+  import whose second row stalled 6 s after the first was staged (11 ms). A coverage wait that
   exceeds 5 s returns 503 `unavailable`.
 - **One vector space**: each row records the `embeddingModel` that embedded it, and the vector lane
   only compares rows of the configured model. Changing `embeddingModel` does not re-embed existing

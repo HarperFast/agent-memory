@@ -7,7 +7,6 @@ type SinkLog @table(database: "memory") {
 	revision: Int
 }
 
-# A host table with the plugin's table name, in the host's own database; the plugin must never touch it.
 type Memory @table {
 	id: ID @primaryKey
 	note: String

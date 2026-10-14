@@ -29,8 +29,7 @@ models.registerBackend(
 	}),
 );
 
-// Registered from the host app's own import of the package, as harper-eye will. The sink writes its row before it
-// can throw, so a failure has to roll that row back too.
+// Writes before it can throw, so a failure must roll this row back along with the memory.
 const record = (kind) => async (memory, context) => {
 	await databases.memory.SinkLog.put(
 		{
@@ -46,9 +45,26 @@ const record = (kind) => async (memory, context) => {
 };
 registerMemorySink({ write: record('write'), withdraw: record('withdraw') });
 
-// erin authenticates as a Harper user but acts as an app-defined principal with its own grants.
 setPrincipalResolver((context, next) =>
 	context.user?.username === 'erin'
 		? { id: 'agent-erin', grants: { read: ['global'], write: ['global'] }, source: 'fixture-resolver' }
 		: next(),
 );
+
+// Runs a vector query whose size differs from the index's, as a model switch would; search's fallback to
+// full-text depends on Harper answering it with a 400.
+export class MismatchProbe extends Resource {
+	static loadAsInstance = false;
+	async get() {
+		try {
+			for await (const _ of databases.memory.Memory.search({
+				sort: { attribute: 'embedding', target: new Array(64).fill(0.1) },
+				select: ['id'],
+				limit: 1,
+			}));
+			return { statusCode: 200 };
+		} catch (error) {
+			return { statusCode: error?.statusCode };
+		}
+	}
+}

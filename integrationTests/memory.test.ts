@@ -474,6 +474,16 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 		);
 	});
 
+	test('Harper rejects a vector query of another size with 400, which the full-text fallback relies on', async () => {
+		const response = await fetch(`${ctx.harper.httpURL}/MismatchProbe/`, {
+			headers: {
+				Authorization: basic(ctx.harper.admin.username, ctx.harper.admin.password),
+				Accept: 'application/json',
+			},
+		});
+		deepStrictEqual(await response.json(), { statusCode: 400 });
+	});
+
 	test('rejects unauthenticated requests and unknown routes', async () => {
 		const anonymous = await fetch(`${ctx.harper.httpURL}/Memory/?q=anything`, {
 			headers: { Accept: 'application/json' },
