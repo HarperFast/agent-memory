@@ -16,7 +16,6 @@ let current: Settings = Object.freeze({
 	contentChars: 20_000,
 });
 
-/** Each request reads this once, so a reload mid-request cannot mix two configurations. */
 export function getSettings(): Settings {
 	return current;
 }

@@ -2,7 +2,7 @@ import { beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { __test } from 'harper';
 import { importMemories } from '../dist/import.js';
-import { getMemory, memoryIdFor, withdrawMemory } from '../dist/lifecycle.js';
+import { createMemory, getMemory, memoryIdFor, withdrawMemory } from '../dist/lifecycle.js';
 import { createPrincipal } from '../dist/scopes.js';
 import { registerMemorySink } from '../dist/sinks.js';
 import { applySettings, parseSettings } from '../dist/settings.js';
@@ -93,6 +93,20 @@ describe('importMemories', () => {
 		assert.equal(superseded.status, 'superseded');
 		assert.equal(superseded.supersededBy, idOf(2));
 		assert.equal(superseded.revision, 2);
+	});
+
+	it('keeps the newest superseder as the pointer when a later native create supersedes the same memory', async () => {
+		await importMemories(
+			{ rows: [row(2, { supersedes: [idOf(1)], createdAt: '2099-01-01T00:00:00.000Z' }), row(1)] },
+			root,
+			context,
+		);
+		await createMemory(
+			{ idempotencyKey: 'native', title: 'n', content: 'native replacement', supersedes: [idOf(1)] },
+			alice,
+			context,
+		);
+		assert.equal((await getMemory(idOf(1), alice)).supersededBy, idOf(2));
 	});
 
 	it('re-runs idempotently and reports a changed row as a conflict without overwriting it', async () => {

@@ -1,8 +1,3 @@
-// POST /Memory/import (super_user): bulk import with preserved owner, createdAt and supersession links. One
-// request is one transaction. Status is not trusted from the row: a non-withdrawn row's status is derived from
-// the supersession graph as it stands (rows already stored plus this batch), the same rule a withdrawal
-// applies, so a replay or an interrupted run can never publish a memory hidden behind a missing or withdrawn
-// replacement.
 import { badRequest, isCallerSafe, memoryError } from './errors.ts';
 import {
 	boundedText,

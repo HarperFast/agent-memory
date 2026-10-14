@@ -81,7 +81,6 @@ export function parseSearchParams(params: URLSearchParams): SearchParams {
 	};
 }
 
-/** Status, narrowing and the readable set, carried by every lane so each applies them before its limit. */
 function filterConditions(params: SearchParams, principal: Principal): Condition[] {
 	const conditions: Condition[] = [
 		anyOf(
@@ -208,8 +207,6 @@ export function parseBootstrapParams(params: URLSearchParams): BootstrapParams {
 	};
 }
 
-// A memory that does not fit the budget is skipped, not the end of the pack, so one large memory does not crowd
-// out smaller ones behind it.
 export async function bootstrapMemories(params: BootstrapParams, principal: Principal, context: object) {
 	const Memory = memoryTable();
 	const active = { attribute: 'status', comparator: 'equals', value: STATUS_ACTIVE };

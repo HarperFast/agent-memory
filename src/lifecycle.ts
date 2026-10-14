@@ -1,6 +1,3 @@
-// Memory lifecycle, ported from harper-eye's Agent Memory Interface (lib/memory.js). The only writer of the
-// Memory table: ownership, scopes, revision, status and timestamps are server-derived, and a payload that
-// carries any of them is rejected rather than trimmed, so a caller never believes it set what the server owns.
 import { createHash } from 'node:crypto';
 import { databases, models, transaction } from 'harper';
 import { badRequest, memoryError, notFound } from './errors.ts';
@@ -287,6 +284,7 @@ export async function createMemory(input: unknown, principal: Principal, request
 			return { memory: toMemoryView(existing), created: false };
 		}
 
+		const now = new Date();
 		const targets = [];
 		for (const targetId of supersedes) {
 			const target = await Memory.get(targetId, txn);
@@ -300,10 +298,13 @@ export async function createMemory(input: unknown, principal: Principal, request
 					'supersede_scope_narrowing',
 				);
 			}
-			targets.push(target);
+			// The newest superseder wins the pointer, which is not necessarily this one: an imported superseder can
+			// carry a later createdAt, and two creates can share a millisecond.
+			const current = await newestSuperseder(Memory, targetId, txn);
+			const supersededBy = current && compareNewest(current, { id, createdAt: now }) > 0 ? current.id : id;
+			targets.push({ target, supersededBy });
 		}
 
-		const now = new Date();
 		await Memory.put(
 			{
 				id,
@@ -331,18 +332,14 @@ export async function createMemory(input: unknown, principal: Principal, request
 			},
 			txn,
 		);
-		for (const target of targets) {
-			await Memory.patch(
-				target.id,
-				{ status: STATUS_SUPERSEDED, supersededBy: id, revision: target.revision + 1 },
-				txn,
-			);
+		for (const { target, supersededBy } of targets) {
+			await Memory.patch(target.id, { status: STATUS_SUPERSEDED, supersededBy, revision: target.revision + 1 }, txn);
 		}
 		// Re-read inside the transaction: @updatedTime is applied by the database.
 		const memory = toMemoryView(await Memory.get(id, txn));
 		if (hasSinks()) {
 			await notifySinks('write', memory, txn);
-			for (const target of targets) await notifySinks('write', toMemoryView(await Memory.get(target.id, txn)), txn);
+			for (const { target } of targets) await notifySinks('write', toMemoryView(await Memory.get(target.id, txn)), txn);
 		}
 		return { memory, created: true };
 	});

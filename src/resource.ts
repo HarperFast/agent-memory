@@ -1,6 +1,4 @@
-// The only HTTP surface over the Memory table (routes: DESIGN.md "HTTP surface"). Identity comes from the
-// request context only; nothing in the path, query or body contributes to it. Memory ids are 32 hex
-// characters, so the `bootstrap` and `import` segments cannot collide with one.
+// Memory ids are 32 hex characters, so the `bootstrap` and `import` path segments cannot collide with one.
 import { logger, Resource } from 'harper';
 import { isCallerSafe, notFound } from './errors.ts';
 import { importMemories } from './import.ts';

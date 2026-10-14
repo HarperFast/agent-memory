@@ -1,5 +1,3 @@
-// The scope and grant model, with no Harper runtime dependency: id-addressed reads and writes and the
-// conditions pushed into search are all derived from one compiled Principal, so they cannot disagree.
 import { badRequest, memoryError } from './errors.ts';
 
 export const GLOBAL_SCOPE = 'global';

@@ -1,5 +1,4 @@
-// Boots Harper with the packed plugin in a host app (fixtures/memory-app) and drives the Memory resource
-// over HTTP as different Harper users. Run `npm run install:fixtures` first.
+// Needs `npm run install:fixtures` first: the fixture app loads the packed plugin from its own node_modules.
 import { suite, test, before, after } from 'node:test';
 import { deepStrictEqual, ok, strictEqual } from 'node:assert/strict';
 import { join, dirname } from 'node:path';

@@ -196,9 +196,10 @@ lagging, a lock or database briefly unavailable) is a 503 `unavailable` to retry
 - **Searchable at commit**: both indexes are Harper derived indexes maintained after commit (`audit:
 true` puts `@embed`'s HNSW index on the native plane). Each lane passes `waitForIndexMilliseconds`,
   so a search covers every write committed before it began; an index that is already current does not
-  wait, otherwise a search waits about one index flush (~1 s). A long-open write transaction (a large
-  import embedding its rows) holds back index coverage for everyone, so a search during one can wait
-  the full 5 s and return 503 `unavailable`.
+  wait, otherwise a search waits about one index flush. Measured on Harper 5.3.2 (one node, local): a
+  search with no recent write takes 6–13 ms, one right after a write about 1 s, and a write transaction
+  held open for 6 s by a slow embedding did not delay a concurrent search (8 ms). A coverage wait that
+  exceeds 5 s returns 503 `unavailable`.
 - **One vector space**: each row records the `embeddingModel` that embedded it, and the vector lane
   only compares rows of the configured model. Changing `embeddingModel` does not re-embed existing
   rows; they stay reachable through full-text until revised. A model whose dimensions differ from the
