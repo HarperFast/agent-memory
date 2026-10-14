@@ -1,0 +1,7 @@
+type SinkLog @table @export {
+	id: ID @primaryKey
+	kind: String
+	memoryId: String
+	status: String
+	revision: Int
+}

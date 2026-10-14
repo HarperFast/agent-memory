@@ -1,0 +1,6 @@
+{
+	"name": "agent-memory-fixture-app",
+	"private": true,
+	"type": "module",
+	"description": "Integration-test host app. scripts/install-fixtures.js installs the packed @harperfast/agent-memory into it."
+}

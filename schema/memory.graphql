@@ -1,7 +1,7 @@
 # Not @export-ed: every read and write goes through the Memory resource (src/), which is the single
-# enforcement point for ownership and scope rules. See DESIGN.md.
+# enforcement point for ownership and scope rules. See DESIGN.md. audit: true is required by @fullText.
 
-type Memory @table(database: "memory") {
+type Memory @table(database: "memory", audit: true) {
 	id: ID @primaryKey
 	title: String
 	content: String
@@ -16,14 +16,17 @@ type Memory @table(database: "memory") {
 	supersededBy: ID @indexed
 	evidence: Any
 	idempotencyKey: String
+	createFingerprint: String
 	author: Any
 	lastEditor: Any
 	validUntil: Date
 	withdrawnAt: Date
 	withdrawnReason: String
-	embedding: [Float] @embed(source: "content", model: "embedder")
+	# The plugin replaces this embedder when the embeddingModel option is not "default".
+	embedding: [Float] @embed(source: "content", model: "default")
+	embeddingModel: String @indexed
 	text: FullText @fullText(fields: [{ name: "title", weight: 2.0 }, { name: "content" }])
-	createdAt: Date @createdTime
+	createdAt: Date
 	updatedAt: Date @updatedTime @indexed
 }
 

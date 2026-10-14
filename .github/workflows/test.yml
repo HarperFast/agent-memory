@@ -1,0 +1,37 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Unit & integration (Node ${{ matrix.node-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [22, 24]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run format:check
+      - run: npm test
+      # Linux loopback already covers 127.0.0.0/8, so the integration pool needs no alias setup.
+      - run: npm run install:fixtures
+      - run: npm run test:integration
+        timeout-minutes: 10
+        env:
+          HARPER_INTEGRATION_TEST_LOG_DIR: /tmp/harper-test-logs
+      - if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: harper-logs-node-${{ matrix.node-version }}
+          path: /tmp/harper-test-logs
+          retention-days: 7

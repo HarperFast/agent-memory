@@ -13,28 +13,45 @@ rather than each defining their own memory tables and endpoints.
  Harper core                         tables, subscribe, @embed, @fullText, HNSW, users/roles, mcp
 ```
 
-| Concern | Owner |
-| --- | --- |
-| Memory table, lifecycle, scope semantics, supersession, live updates | this plugin |
-| Mount path, which identities hold which grants, rollout policy | the host app (config + `ScopeGrant` rows) |
-| Authentication | Harper (`context.user`); interactive MCP clients via `@harperfast/oauth` `mcp` mode |
-| Document corpus, chunking, retrieval lanes, answers | Reflex — memory joins it as a lane (Reflex #543), not as copied source rows |
+| Concern                                                              | Owner                                                                               |
+| -------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| Memory table, lifecycle, scope semantics, supersession, live updates | this plugin                                                                         |
+| Mount path, which identities hold which grants, rollout policy       | the host app (config + `ScopeGrant` rows)                                           |
+| Embedding model behind the `embeddingModel` name                     | the host app (Harper `models` config or `models.registerBackend`)                   |
+| Authentication                                                       | Harper (`context.user`); interactive MCP clients via `@harperfast/oauth` `mcp` mode |
+| Document corpus, chunking, retrieval lanes, answers                  | Reflex — memory joins it as a lane (Reflex #543), not as copied source rows         |
 
 Seeded from the Agent Memory Interface in harper-eye (#178): server-derived ownership, strict payload
 allowlists, idempotent create, expected-revision edits, withdraw-as-tombstone, identical 404 for
 "missing" and "not yours". Those rules carry over unchanged unless a section below says otherwise.
 
+## Implementation status
+
+| Area                                                                                                             | v0 core                                           |
+| ---------------------------------------------------------------------------------------------------------------- | ------------------------------------------------- |
+| Lifecycle, scopes and grants, supersede and restore, hybrid search, bootstrap, import, sinks, principal resolver | implemented (`src/`)                              |
+| Write-time supersession candidates and the judge (`supersession.*` options)                                      | not yet                                           |
+| Live updates (subscriptions, `MemoryWatch`, `/MemoryEvents`)                                                     | not yet; the `MemoryWatch` table is declared only |
+
 ## Data model
 
-Tables live in their own database, `memory`, so a host app's own `Memory` table cannot collide.
+Tables live in their own database, `memory`, so a host app's own `Memory` table cannot collide. The
+plugin reads them through `databases.memory`, never through `tables` (which is the host's `data`
+database).
 
 - `Memory` — one row per memory. `content` is embedded on write (`@embed`) and full-text indexed
-  (`@fullText`), so a memory is searchable at commit, with no indexing queue.
+  (`@fullText`, which requires `@table(audit: true)`), so a memory is searchable at commit, with no
+  indexing queue of the plugin's own.
 - `ScopeGrant` — read/write scope patterns held by a Harper role or user.
 - `MemoryWatch` — a principal's time-bounded interest in specific memories (live updates).
 
 See `schema/memory.graphql`. The table is not `@export`ed: every read and write goes through the
 `Memory` resource so the rules below have exactly one enforcement point.
+
+Server-owned fields: `ownerId`, `status`, `revision`, `author`, `lastEditor`, `supersededBy`,
+`createdAt`, `createFingerprint`, `embeddingModel`. `createdAt` is set by the lifecycle rather than
+`@createdTime`, because Harper's `@createdTime` overwrites a supplied value on insert and import must
+preserve it. `updatedAt` stays `@updatedTime`.
 
 ## Identity
 
@@ -46,8 +63,9 @@ authentication of its own and has no credential tables.
 - Headless agents use Harper credentials bound to a user (operation tokens, or a host-app API key that
   resolves to a user).
 - An app with its own principal registry (harper-eye's `AgentPrincipal`) can install a resolver with
-  `setPrincipalResolver(fn)` that returns `{ id, grants }`. This exists for migration; the default is
-  Harper users.
+  `setPrincipalResolver((context, next) => …)` that returns `{ id, grants: { read, write }, superUser?,
+source? }`, or `undefined` for unauthenticated. `next()` is the default Harper-user resolution, so a
+  resolver can handle its own credentials and defer the rest. This exists for migration.
 
 Principal ids must not contain whitespace, `:` or `*`, and are capped at 122 characters, so that
 `user:<id>` fits a 128-character scope label.
@@ -55,47 +73,64 @@ Principal ids must not contain whitespace, `:` or `*`, and are capped at 122 cha
 ## Scopes and grants
 
 A scope label is `namespace:value` (or the bare label `global`), at most 128 characters, never
-containing `*`. Shared vocabulary with Reflex visibility scopes (Reflex #573):
+containing `*` or whitespace. A memory carries 1–16 labels, stored deduplicated and sorted. Shared
+vocabulary with Reflex visibility scopes (Reflex #573):
 
-| Label | Meaning |
-| --- | --- |
-| `global` | everyone with global read |
-| `user:<id>` | the owner only (private) |
+| Label           | Meaning                                               |
+| --------------- | ----------------------------------------------------- |
+| `global`        | everyone with global read                             |
+| `user:<id>`     | the owner only (private)                              |
 | `customer:<id>` | people and agents cleared for that customer's content |
-| `team:<id>` | a team |
+| `team:<id>`     | a team                                                |
 
 Each memory carries `scopes: [String]`. A caller sees a memory when **any** of its labels is in the
 caller's readable set. To restrict content, use one specific label (`customer:acme`), not a list.
 
 Grants are `ScopeGrant` rows keyed `role:<roleName>` or `user:<username>`, with `read` and `write`
-pattern lists. A pattern is an exact label or a namespace wildcard (`customer:*`). Every principal
-implicitly reads and writes `user:<self>`. `super_user` reads and writes everything.
+pattern lists. A pattern is an exact label or a namespace wildcard (`customer:*`); a wildcard never
+covers the bare `global`. Every principal implicitly reads and writes `user:<self>`. `super_user`
+reads and writes everything. Grant rows are read on every request, so revoking one takes effect on
+the next request. An invalid pattern grants nothing and is logged; at most 256 patterns per principal
+count, which bounds the condition every search carries.
 
 Rules:
 
-1. **Read**: `scopes ∩ readable(caller) ≠ ∅`, or the caller is the owner. A memory the caller cannot
-   read is indistinguishable from one that does not exist (same 404 body).
+1. **Read**: `scopes ∩ readable(caller) ≠ ∅`, or the caller is the owner. A withdrawn memory is
+   readable by its owner and `super_user` only. A memory the caller cannot read is indistinguishable
+   from one that does not exist (same 404 body), on reads, writes and `supersedes` references alike.
 2. **Write scopes**: creating or revising with scopes `S` requires every label of `S` to be writable by
-   the caller. `visibility: "private" | "shared"` is shorthand for `[user:<self>]` / `[global]`;
-   explicit `scopes` wins when both are given.
+   the caller — the resulting scopes, so revising a memory that stays `global` needs `global` write.
+   `visibility: "private" | "shared"` is shorthand for `[user:<owner>]` / `[global]`; explicit
+   `scopes` wins when both are given. Withdrawal is exempt.
 3. **Edit**: only the owner (or `super_user`) revises, changes scopes, or withdraws. Read access never
-   grants edit.
+   grants edit; a reader that is not the owner gets 403, a non-reader the 404 of rule 1.
 4. **Supersede**: see below. It is the only write that touches another principal's memory, and it
-   only changes status fields.
-5. **Search pushes the readable set into the query** (a condition on the indexed `scopes` attribute,
-   applied before the limit), never post-filters a top-k.
+   only changes status fields (`status`, `supersededBy`, `revision`).
+5. **Search pushes the readable set into the query**, applied before the limit in every lane, never
+   as a post-filter on a top-k. The set compiles to one condition (`src/scopes.ts`
+   `readableCondition`): an `or` of `ownerId = self`, `scopes = <label>` per exact grant, and
+   `scopes gelt [ns:, ns;)` per wildcard — the exact prefix range, which Harper plans from the index
+   where `starts_with` would scan. Harper matches an array attribute when any element matches.
 
 ## Lifecycle
 
-| Operation | Effect |
-| --- | --- |
-| create | id = `sha256(memory:<owner>:<idempotencyKey>)[:32]`; retry returns the existing row (200 vs 201) |
-| revise | requires `expectedRevision`; bumps `revision`; re-embeds via `@embed` |
-| scopes | owner changes scopes (rule 2) |
-| supersede | create a memory with `supersedes: [ids]` (below) |
-| withdraw | `status = withdrawn`, row kept as a tombstone, never deleted |
+| Operation | Effect                                                                                                                                                     |
+| --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| create    | id = `sha256(memory:<owner>:<idempotencyKey>)[:32]`; a matching retry returns the existing row (200 vs 201), a different payload under the same key is 409 |
+| revise    | requires `expectedRevision`; bumps `revision`; re-embeds via `@embed` when `content` changes                                                               |
+| scopes    | owner changes scopes (rule 2)                                                                                                                              |
+| supersede | create a memory with `supersedes: [ids]` (below)                                                                                                           |
+| withdraw  | `status = withdrawn`, row kept as a tombstone, never deleted                                                                                               |
 
-`status` is `active | superseded | withdrawn`. Search returns `active` by default.
+`status` is `active | superseded | withdrawn`. Search returns `active` by default. The `import:` key
+prefix is reserved for import, so a native create cannot land on an imported row.
+
+Every lifecycle operation runs in a transaction of its own (not the request's, which would commit
+whatever was staged before an error the resource turns into a response) and takes Harper's record
+lock (`Memory.lock`) on every row it will change, in sorted id order, before reading it. The plugin is
+the only writer of `Memory`, so a read-check-write is serialized: of N concurrent revisions at the
+same expected revision exactly one succeeds. Any status change, including supersede and restore,
+bumps the affected row's `revision`.
 
 ### Supersession
 
@@ -103,32 +138,70 @@ Measured on the team's previous memory store: only 8% of updates used an explici
 and 32% of sessions read a stale memory without ever seeing its replacement. So supersession is a
 first-class operation, and the write path proposes it.
 
-- **Explicit**: `supersedes: [oldId]` on create. Requires that the caller can read `old`, and that the
-  new memory's scopes are a superset of `old.scopes`, so every reader of the old memory can read its
-  replacement. In the same transaction `old.status = superseded`, `old.supersededBy = newId`.
-- **Withdrawing a superseder** returns each memory it superseded to `active` unless another active
-  memory still supersedes it.
-- **Write-time candidates**: after a create or revise, the plugin runs a vector search for the
-  nearest memories readable by the writer that share at least one scope label, and returns those
-  above `supersession.similarity` (default 0.82) as `candidates: [{ id, title, similarity }]` on the
-  response. With `supersession.judge` configured, `models.generate` classifies each candidate as
-  `supersedes | refines | unrelated`; `supersession.mode: auto` applies a `supersedes` verdict
-  through the explicit path (same rules). The default mode is `suggest`.
+- **Explicit**: `supersedes: [oldId]` (up to 10) on create. Requires that the caller can read `old`,
+  that `old` is not withdrawn (409), and that the new memory's scopes are a superset of `old.scopes`
+  (403), so every label reader of the old memory can read its replacement. In the same transaction
+  `old.status = superseded`, `old.supersededBy = newId`. An already superseded memory may be
+  superseded again; `supersededBy` names the newest.
+- **The superset holds after the supersede, not only at it**: a superseded memory is frozen except
+  for withdrawal (revise/scopes → 409 `memory_superseded`), and a scope change on a memory that
+  supersedes others must still cover each non-withdrawn one.
+- **Owner-only readers are not covered**: an owner who reads the old memory only by ownership (none
+  of its labels is in their readable set) sees `supersededBy` but may be unable to read the
+  replacement. Covering them would publish the replacement to a principal its author did not choose.
+- **Withdrawing a superseder** recomputes each memory it superseded: it stays `superseded` while any
+  other non-withdrawn memory lists it in `supersedes` (newest by `createdAt`, then id, becomes
+  `supersededBy`), and returns to `active` otherwise. A superseder that is itself superseded still
+  counts — its replacement carries the chain forward.
+- **Write-time candidates** (not yet implemented): after a create or revise, the plugin runs a vector
+  search for the nearest memories readable by the writer that share at least one scope label, and
+  returns those above `supersession.similarity` (default 0.82) as `candidates: [{ id, title,
+similarity }]` on the response. With `supersession.judge` configured, `models.generate` classifies
+  each candidate as `supersedes | refines | unrelated`; `supersession.mode: auto` applies a
+  `supersedes` verdict through the explicit path (same rules). The default mode is `suggest`.
+
+## HTTP surface
+
+Mounted at `urlPath` (default `Memory`); hidden from MCP and OpenAPI auto-export until the MCP task.
+
+| Route                                                   | Purpose                                 |
+| ------------------------------------------------------- | --------------------------------------- |
+| `POST /Memory/`                                         | create                                  |
+| `GET /Memory/<id>`                                      | read                                    |
+| `GET /Memory/?q=&tag=&scope=&limit=&includeSuperseded=` | search (no `q`: newest first)           |
+| `GET /Memory/bootstrap?q=&budget=`                      | session-start context                   |
+| `POST /Memory/<id>/revise` · `/scopes` · `/withdraw`    | mutations, each with `expectedRevision` |
+| `POST /Memory/import`                                   | bulk import (`super_user`)              |
+
+Errors are `{ error, code }` (plus `index` for an import row). Only errors the plugin creates carry
+their own message; anything else is a 500 `internal_error`, and a Harper 503 (an index rebuilding or
+lagging) is a 503 `index_unavailable` to retry.
 
 ## Search and bootstrap
 
 - `GET /Memory/?q=&tag=&scope=&limit=&includeSuperseded=` — hybrid: HNSW over `embedding` (query
-  embedded with the same model) and the `@fullText` index, fused with reciprocal rank fusion (k = 60).
-  Both lanes carry the status and readable-scope conditions. `scope=` narrows within the readable
-  set; it never widens it. Results include `supersededBy` when `includeSuperseded` is set.
+  embedded with the same model) and the `@fullText` index, fused with reciprocal rank fusion (k = 60,
+  `2 × limit` per lane). Both lanes carry the status and readable-scope conditions. `scope=` narrows
+  within the readable set; it never widens it. Results include `supersededBy` when
+  `includeSuperseded` is set; withdrawn memories never appear. The vector lane has no distance
+  cutoff, so it contributes the nearest readable memories whatever their distance.
+- **Searchable at commit**: both indexes are Harper derived indexes maintained after commit (`audit:
+true` puts `@embed`'s HNSW index on the native plane). Each lane passes `waitForIndexMilliseconds`,
+  so a search covers every write committed before it began; an index that is already current does not
+  wait, otherwise a search waits about one index flush (~1 s).
+- **One vector space**: each row records the `embeddingModel` that embedded it, and the vector lane
+  only compares rows of the configured model. Changing `embeddingModel` does not re-embed existing
+  rows; they stay reachable through full-text until revised. A model whose dimensions differ from the
+  indexed vectors needs the index rebuilt.
 - `GET /Memory/bootstrap?q=&budget=` — pinned memories, then the caller's recent memories, then
-  memories relevant to `q`, cut to a character budget. Used at session start.
+  memories relevant to `q`, deduplicated and packed into a character budget (title + content; default
+  8000). A memory that does not fit is skipped rather than ending the pack. Used at session start.
 - Ranking may add recency decay and retrieval/citation counts later; decay is a ranking function only,
   never deletion.
 
 ## Live updates
 
-Three levels, built in order:
+Three levels, built in order (none in the v0 core):
 
 1. **Record changes**: the `Memory` resource supports Harper subscriptions (WebSocket, SSE, MQTT).
    Each event is checked against the subscriber's read rule before delivery. Event kinds: `created`,
@@ -143,19 +216,44 @@ Three levels, built in order:
 
 ## Extension points
 
-- `registerMemorySink({ write(memory, txn), withdraw(memory, txn) })` — called inside the lifecycle
-  transaction. harper-eye uses it for the interim Reflex source-row handoff until memory is a Reflex
-  lane.
+- `registerMemorySink({ write(memory, context), withdraw(memory, context) })` returns an unregister
+  function. Sinks are awaited in order inside the lifecycle transaction for every row an operation
+  changes (create, revise, scopes, the supersede and restore side effects → `write`; withdraw →
+  `withdraw`; import calls `withdraw` for a row imported as withdrawn). A Harper write the sink makes
+  through `context` commits or rolls back with the memory, and a sink that throws aborts the
+  operation. Effects outside Harper are not transactional — use an outbox table. An idempotent create
+  retry calls no sink. harper-eye uses it for the interim Reflex source-row handoff until memory is a
+  Reflex lane.
 - `setPrincipalResolver(fn)` — see Identity.
-- Options (`config.yaml` under the plugin's key): `urlPath`, `embeddingModel`, `supersession.{mode,
-  similarity, judge}`, `limits.{contentChars, titleChars}`.
+- Options (`config.yaml` under the plugin's key): `urlPath`, `embeddingModel` (default `default`),
+  `limits.{contentChars, titleChars}` (default 20000 / 200), and, once implemented,
+  `supersession.{mode, similarity, judge}`. The schema's `@embed` names `default`; for any other
+  `embeddingModel` the plugin installs a per-table embedder (`setEmbedAttribute`) that embeds with the
+  model recorded on the row. A changed option is validated before it applies; an invalid change is
+  logged and the previous configuration keeps serving. Changing `urlPath` mounts the new path and
+  removes the old one if the plugin still owns it.
 
 ## Import
 
-`POST /Memory/import` (`super_user` only) accepts rows with preserved `createdAt`, owner and
-`supersedes`, keyed `import:<source>:<sourceId>` so a re-run is idempotent. The first source is the
-team's Flair instance: agent id → Harper username via a mapping file; Flair `private` → `user:<owner>`,
-shared → `global`; `supersedes` and `validTo` carried over.
+`POST /Memory/import` (`super_user` only) takes `{ rows: [...] }`, at most 100 rows, in one transaction:
+every row commits or none does. Each row: `{ id?, idempotencyKey: "import:<source>:<sourceId>",
+ownerId, title?, content, tags?, durability?, pinned?, evidence?, scopes, status, supersedes?,
+supersededBy?, createdAt?, validUntil?, withdrawnAt?, withdrawnReason? }`.
+
+- The id is the create formula `sha256(memory:<ownerId>:<idempotencyKey>)[:32]`. A client may send it
+  (so rows can reference each other); the server recomputes it and rejects a mismatch.
+- Rows are written as given — status, links, `createdAt` — and the superset rule is not applied,
+  because the source's history is preserved. Links are format-checked only, so a link may name a row
+  in a later batch; `supersededBy` is required exactly when `status` is `superseded`. The client sends
+  successors before predecessors, so an interrupted run can leave a predecessor not yet imported, never
+  a superseded row whose replacement is missing.
+- A re-run is idempotent: an existing id with the same import fingerprint is `unchanged`, a different
+  one is `conflict` and is not overwritten, so a native revision made after import survives. The
+  response is `{ results: [{ id, result: created | unchanged | conflict }] }`; an invalid row fails the
+  batch with 400 and its `index`.
+
+The first source is the team's Flair instance: agent id → Harper username via a mapping file; Flair
+`private` → `user:<owner>`, shared → `global`; `supersedes` and `validTo` carried over.
 
 ## Not in v0
 
