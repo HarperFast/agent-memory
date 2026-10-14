@@ -304,8 +304,27 @@ status, supersedes?, supersededBy?, createdAt?, validUntil?, withdrawnAt?, withd
   revision made after import survives. The response is `{ results: [{ id, result: created | unchanged |
 conflict }] }`; an invalid row fails the batch with 400 and its `index`.
 
-The first source is the team's Flair instance: agent id → Harper username via a mapping file; Flair
-`private` → `user:<owner>`, shared → `global`; `supersedes` and `validTo` carried over.
+### Flair source (`scripts/import-flair.mjs`)
+
+The mapping is a pure function of the Flair rows and the principal map: a re-run over the same snapshot
+sends identical rows.
+
+- **Owner**: Flair `agentId` → Harper username through `--principal-map`. An unmapped agent's memories
+  are skipped and reported, never guessed. The owner is part of the id, so remapping an agent after an
+  import adds rows under the new owner; it does not move the old ones.
+- **Scopes**: Flair treats only the literal `private` as owner-only, so `private` → `[user:<owner>]` and
+  every other value (`shared`, absent, legacy) → `[global]`.
+- **Lifecycle**: `archived` → `withdrawn` with `withdrawnAt` = `archivedAt`. Flair's archive is a
+  restorable basement, mostly filled by age-based hygiene, so the row is kept out of default search,
+  not dropped. A row is `superseded` when a non-withdrawn imported row supersedes it; `supersededBy`
+  names the latest such row. `validTo` → `validUntil`.
+- **Links**: `supersedes` is rewritten to target ids. A link to a row that is missing from the source,
+  skipped, itself, or on a cycle is dropped and reported. No sent row references a row outside the
+  import set.
+- **Order**: successors before the rows they supersede, so after an interrupted run every committed
+  `superseded` row has its replacement committed.
+- **Not imported**: `ephemeral` rows (the only Flair tier with `expiresAt`; the target has no expiry),
+  embeddings (the target re-embeds through `@embed`), and Flair bookkeeping fields.
 
 ## Not in v0
 
