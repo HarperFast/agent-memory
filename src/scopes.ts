@@ -49,8 +49,10 @@ export interface ScopedRecord {
 	status?: string;
 }
 
+const USER_PREFIX = 'user:';
+
 export function userScope(principalId: string): string {
-	return `user:${principalId}`;
+	return `${USER_PREFIX}${principalId}`;
 }
 
 export function isScopeLabel(label: unknown): label is string {
@@ -77,6 +79,8 @@ export function requirePrincipalId(id: unknown): string {
 /**
  * Compile grant patterns into a matcher. `user:<self>` is always included. A pattern that is neither an exact
  * label nor `<namespace>:*` is reported in `rejected` and grants nothing; patterns past MAX_GRANT_PATTERNS too.
+ * So is any pattern in the `user` namespace: `user:<id>` means the owner only, and a grant such as `user:*`
+ * would quietly open every private memory. Reading everything is what super_user is for.
  */
 export function compileMatcher(
 	patterns: readonly unknown[] | undefined,
@@ -91,7 +95,8 @@ export function compileMatcher(
 			continue;
 		}
 		const wildcard = typeof pattern === 'string' ? WILDCARD_PATTERN.exec(pattern) : null;
-		if (wildcard) namespaces.add(wildcard[1]);
+		if (typeof pattern === 'string' && pattern.startsWith(USER_PREFIX)) rejected.push(pattern);
+		else if (wildcard) namespaces.add(wildcard[1]);
 		else if (isScopeLabel(pattern)) exact.add(pattern);
 		else rejected.push(pattern);
 	}

@@ -2,7 +2,7 @@ import { beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { __test } from 'harper';
 import { importMemories } from '../dist/import.js';
-import { getMemory, memoryIdFor } from '../dist/lifecycle.js';
+import { getMemory, memoryIdFor, withdrawMemory } from '../dist/lifecycle.js';
 import { createPrincipal } from '../dist/scopes.js';
 import { registerMemorySink } from '../dist/sinks.js';
 import { applySettings, parseSettings } from '../dist/settings.js';
@@ -44,7 +44,7 @@ describe('importMemories', () => {
 		await rejection(importMemories({ rows: [row(1)] }, alice, context), 403, 'import_forbidden', undefined);
 	});
 
-	it('writes rows as given, preserving owner, createdAt, status and links (successor first)', async () => {
+	it('preserves owner, createdAt and links, with status derived from the graph (successor first)', async () => {
 		const result = await importMemories(
 			{
 				rows: [
@@ -66,6 +66,33 @@ describe('importMemories', () => {
 		assert.equal(old.title, null);
 		assert.equal(old.author.source, 'import');
 		assert.equal(old.revision, 1);
+	});
+
+	it('never publishes a memory hidden behind a withdrawn replacement', async () => {
+		await importMemories({ rows: [row(2, { supersedes: [idOf(1)] })] }, root, context);
+		await withdrawMemory(idOf(2), { expectedRevision: 1 }, alice, context);
+		const replay = await importMemories(
+			{ rows: [row(2, { supersedes: [idOf(1)] }), row(1, { status: 'superseded', supersededBy: idOf(2) })] },
+			root,
+			context,
+		);
+		assert.deepEqual(
+			replay.results.map((result) => result.result),
+			['unchanged', 'created'],
+		);
+		const restored = await getMemory(idOf(1), alice);
+		assert.equal(restored.status, 'active');
+		assert.equal(restored.supersededBy, null);
+	});
+
+	it('marks an already stored row superseded when its replacement arrives later', async () => {
+		await importMemories({ rows: [row(1, { status: 'superseded', supersededBy: idOf(2) })] }, root, context);
+		assert.equal((await getMemory(idOf(1), alice)).status, 'active', 'no replacement exists yet');
+		await importMemories({ rows: [row(2, { supersedes: [idOf(1)] })] }, root, context);
+		const superseded = await getMemory(idOf(1), alice);
+		assert.equal(superseded.status, 'superseded');
+		assert.equal(superseded.supersededBy, idOf(2));
+		assert.equal(superseded.revision, 2);
 	});
 
 	it('re-runs idempotently and reports a changed row as a conflict without overwriting it', async () => {

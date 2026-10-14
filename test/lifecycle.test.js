@@ -434,6 +434,34 @@ describe('supersede', () => {
 	});
 });
 
+describe('supersede bookkeeping at scale and under contention', () => {
+	const shared = (key, overrides = {}) => validInput({ idempotencyKey: key, visibility: 'shared', ...overrides });
+
+	it('takes every lock a withdrawal needs once, in sorted order', async () => {
+		const old = (await createMemory(shared('t'), alice, context)).memory;
+		const next = (await createMemory(shared('n', { supersedes: [old.id] }), alice, context)).memory;
+		__test.lockLog.length = 0;
+		await withdrawMemory(next.id, { expectedRevision: 1 }, alice, context);
+		assert.deepEqual(
+			__test.lockLog.map((entry) => entry.id),
+			[old.id, next.id].sort(),
+		);
+	});
+
+	it('keeps a target superseded while any of more than 100 superseders remains', async () => {
+		const old = (await createMemory(shared('t'), alice, context)).memory;
+		const holders = [];
+		for (let i = 0; i < 101; i++)
+			holders.push((await createMemory(shared(`h${i}`, { supersedes: [old.id] }), bob, context)).memory);
+		for (const holder of holders.slice(0, 100)) await withdrawMemory(holder.id, { expectedRevision: 1 }, bob, context);
+		const still = await getMemory(old.id, alice);
+		assert.equal(still.status, 'superseded');
+		assert.equal(still.supersededBy, holders[100].id);
+		await withdrawMemory(holders[100].id, { expectedRevision: 1 }, bob, context);
+		assert.equal((await getMemory(old.id, alice)).status, 'active');
+	});
+});
+
 describe('sinks', () => {
 	it('see every changed row inside the lifecycle transaction, with its context', async () => {
 		const calls = [];
@@ -462,6 +490,30 @@ describe('sinks', () => {
 			]);
 		} finally {
 			unregister();
+		}
+	});
+
+	it('a sink unregistered during dispatch does not cost another sink its call', async () => {
+		const calls = [];
+		let release;
+		const gate = new Promise((resolve) => (release = resolve));
+		const unregisterA = registerMemorySink({
+			async write() {
+				calls.push('a');
+				await gate;
+			},
+		});
+		const unregisterB = registerMemorySink({ write: () => calls.push('b') });
+		try {
+			const pending = createMemory(validInput(), alice, context);
+			await new Promise((resolve) => setImmediate(resolve));
+			unregisterA();
+			release();
+			await pending;
+			assert.deepEqual(calls, ['a', 'b']);
+		} finally {
+			unregisterA();
+			unregisterB();
 		}
 	});
 

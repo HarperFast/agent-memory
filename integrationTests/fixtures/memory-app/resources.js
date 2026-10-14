@@ -1,4 +1,4 @@
-import { registerMemorySink } from '@harperfast/agent-memory';
+import { registerMemorySink, setPrincipalResolver } from '@harperfast/agent-memory';
 
 // Deterministic embedding model for the integration suite: a hashed bag of words, so two texts are close
 // exactly when they share words. Registered as the plugin's default `embeddingModel`.
@@ -29,11 +29,10 @@ models.registerBackend(
 	}),
 );
 
-// A host-registered sink, imported the way harper-eye will import it. It writes through the lifecycle's
-// context, so its row commits or rolls back with the memory; content containing SINK-FAIL makes it throw.
+// Registered from the host app's own import of the package, as harper-eye will. The sink writes its row before it
+// can throw, so a failure has to roll that row back too.
 const record = (kind) => async (memory, context) => {
-	if (String(memory.content).includes('SINK-FAIL')) throw new Error('sink rejected the memory');
-	await tables.SinkLog.put(
+	await databases.memory.SinkLog.put(
 		{
 			id: `${memory.id}:${memory.revision}`,
 			kind,
@@ -43,5 +42,13 @@ const record = (kind) => async (memory, context) => {
 		},
 		context,
 	);
+	if (String(memory.content).includes('SINK-FAIL')) throw new Error('sink rejected the memory');
 };
 registerMemorySink({ write: record('write'), withdraw: record('withdraw') });
+
+// erin authenticates as a Harper user but acts as an app-defined principal with its own grants.
+setPrincipalResolver((context, next) =>
+	context.user?.username === 'erin'
+		? { id: 'agent-erin', grants: { read: ['global'], write: ['global'] }, source: 'fixture-resolver' }
+		: next(),
+);

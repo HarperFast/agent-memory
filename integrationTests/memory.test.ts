@@ -4,6 +4,7 @@ import { suite, test, before, after } from 'node:test';
 import { deepStrictEqual, ok, strictEqual } from 'node:assert/strict';
 import { join, dirname } from 'node:path';
 import { createRequire } from 'node:module';
+import { createHash } from 'node:crypto';
 import { setupHarperWithFixture, teardownHarper, type ContextWithHarper } from '@harperfast/integration-testing';
 
 const require = createRequire(import.meta.url);
@@ -66,7 +67,7 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 			config: { logging: { stdStreams: true }, authentication: { authorizeLocal: false } },
 		});
 		await operation({ operation: 'add_role', role: 'member', permission: { super_user: false } });
-		for (const username of ['alice', 'bob', 'carol', 'dave']) {
+		for (const username of ['alice', 'bob', 'carol', 'dave', 'erin']) {
 			await operation({ operation: 'add_user', username, password: PASSWORD, role: 'member', active: true });
 		}
 		await operation({
@@ -106,7 +107,6 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 		const missing = await call('bob', 'GET', '0'.repeat(32));
 		strictEqual(unreadable.status, 404);
 		deepStrictEqual(unreadable, missing);
-		// A write attempt is not a side channel either.
 		deepStrictEqual(await call('bob', 'POST', `${memory.id}/withdraw`, { expectedRevision: 1 }), missing);
 
 		ok((await search('alice', 'q=zebra')).some((hit) => hit.id === memory.id));
@@ -311,16 +311,19 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 		);
 	});
 
-	test('a host-registered sink writes in the same transaction, and its failure rolls the memory back', async () => {
+	test('a host-registered sink writes in the same transaction, and its failure rolls its write back with the memory', async () => {
+		const sinkLog = async (id: string) =>
+			(
+				await operation({
+					operation: 'search_by_id',
+					database: 'memory',
+					table: 'SinkLog',
+					ids: [id],
+					get_attributes: ['*'],
+				})
+			)[0];
 		const memory = await create('alice', { idempotencyKey: 'sink-ok', title: 'sink', content: 'osprey dive depth' });
-		const logged = await fetch(`${ctx.harper.httpURL}/SinkLog/${memory.id}:1`, {
-			headers: {
-				Authorization: basic(ctx.harper.admin.username, ctx.harper.admin.password),
-				Accept: 'application/json',
-			},
-		});
-		strictEqual(logged.status, 200);
-		strictEqual((await logged.json()).kind, 'write');
+		strictEqual((await sinkLog(`${memory.id}:1`))?.kind, 'write');
 
 		const failed = await call('alice', 'POST', '', {
 			idempotencyKey: 'sink-fail',
@@ -329,12 +332,23 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 		});
 		strictEqual(failed.status, 500);
 		deepStrictEqual(failed.body, { error: 'Internal error', code: 'internal_error' });
-		const retryAfterFailure = await call('alice', 'POST', '', {
-			idempotencyKey: 'sink-fail',
-			title: 'sink',
-			content: 'different content, same key',
+		const failedId = createHash('sha256').update('memory:alice:sink-fail').digest('hex').slice(0, 32);
+		strictEqual(await sinkLog(`${failedId}:1`), undefined, 'the sink row rolled back');
+		strictEqual((await call('alice', 'GET', failedId)).status, 404, 'the memory rolled back');
+	});
+
+	test('a host-installed principal resolver replaces identity and grants, deferring other users to next()', async () => {
+		const memory = await create('erin', {
+			idempotencyKey: 'resolved',
+			title: 'resolved',
+			content: 'agent principal memory',
+			visibility: 'shared',
 		});
-		strictEqual(retryAfterFailure.status, 201, 'the failed create left no row behind');
+		strictEqual(memory.ownerId, 'agent-erin');
+		deepStrictEqual(memory.author.source, 'fixture-resolver');
+		strictEqual((await call('alice', 'GET', memory.id)).status, 200);
+		const alicePrivate = await create('alice', { idempotencyKey: 'not-for-erin', title: 'p', content: 'private' });
+		strictEqual((await call('erin', 'GET', alicePrivate.id)).status, 404);
 	});
 
 	test('bootstrap: pinned, then recent, then relevant, packed into the character budget', async () => {
@@ -387,6 +401,21 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 			(await call('admin', 'POST', 'import', { rows: [{ ...row, content: 'changed upstream' }] })).body.results[0]
 				.result,
 			'conflict',
+		);
+	});
+
+	test("never touches the host app's own Memory table in its data database", async () => {
+		await create('alice', { idempotencyKey: 'isolation', title: 'isolation', content: 'heron isolation check' });
+		deepStrictEqual(
+			await operation({
+				operation: 'search_by_value',
+				database: 'data',
+				table: 'Memory',
+				search_attribute: 'id',
+				search_value: '*',
+				get_attributes: ['id'],
+			}),
+			[],
 		);
 	});
 

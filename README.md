@@ -64,7 +64,7 @@ Requires Harper 5.3.1 or later on RocksDB (the default).
    curl -u carol:pass -X POST localhost:9926/Memory/<id>/revise -d '{ "expectedRevision": 1, "content": "Stalls above 25%." }'
    curl -u carol:pass -X POST localhost:9926/Memory/<id>/withdraw -d '{ "expectedRevision": 2, "reason": "obsolete" }'
 
-   # replace a memory: its readers must all be able to read the replacement
+   # replace a memory: everyone who reads the old one through its labels must be able to read the replacement
    curl -u carol:pass -X POST localhost:9926/Memory/ -d '{ "idempotencyKey": "run-43", "title": "Disk saturation",
      "content": "Stalls above 20% iowait on the new kernel.", "scopes": ["customer:acme"], "supersedes": ["<id>"] }'
    ```

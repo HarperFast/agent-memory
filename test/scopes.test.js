@@ -72,6 +72,14 @@ describe('grant matching', () => {
 		assert.ok(!matches(dave.write, 'customer:x'), 'read grants never imply write');
 	});
 
+	it('ignores every grant in the user namespace, so user:<id> stays private to its owner', () => {
+		const { matcher, rejected } = compileMatcher(['user:*', 'user:alice', 'team:a'], 'eve');
+		assert.deepEqual([...matcher.exact].sort(), ['team:a', 'user:eve']);
+		assert.equal(matcher.namespaces.size, 0);
+		assert.deepEqual(rejected, ['user:*', 'user:alice']);
+		assert.ok(!canRead({ ownerId: 'alice', scopes: ['user:alice'], status: 'active' }, principal('eve', ['user:*'])));
+	});
+
 	it('never lets a wildcard cover the bare global label', () => {
 		assert.ok(!matches(principal('eve', ['global:*']).read, 'global'));
 	});
@@ -191,7 +199,7 @@ describe('readableCondition', () => {
 			principal('alice'),
 			principal('carol', ['customer:x']),
 			principal('dave', ['customer:*', 'global']),
-			principal('erin', ['team:a', 'user:*']),
+			principal('erin', ['team:a', 'team:*']),
 		];
 		const records = [
 			{ ownerId: 'alice', scopes: ['user:alice'] },

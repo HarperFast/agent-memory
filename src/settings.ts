@@ -29,7 +29,6 @@ function boundedInteger(value: unknown, fallback: number, max: number, name: str
 	return value as number;
 }
 
-/** Validates the plugin's options; throws without changing the current settings. */
 export function parseSettings(options: Record<string, any>): Settings {
 	const urlPath = String(options.urlPath ?? 'Memory').replace(/^\/+|\/+$/g, '');
 	if (!urlPath) throw new Error('@harperfast/agent-memory: urlPath must not be empty');

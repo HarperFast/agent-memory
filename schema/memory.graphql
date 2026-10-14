@@ -26,7 +26,7 @@ type Memory @table(database: "memory", audit: true) {
 	embedding: [Float] @embed(source: "content", model: "default")
 	embeddingModel: String @indexed
 	text: FullText @fullText(fields: [{ name: "title", weight: 2.0 }, { name: "content" }])
-	createdAt: Date
+	createdAt: Date @indexed
 	updatedAt: Date @updatedTime @indexed
 }
 

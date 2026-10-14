@@ -116,7 +116,6 @@ function assertReadable(records: any[], principal: Principal): any[] {
 	});
 }
 
-/** Reciprocal rank fusion: score = Σ 1 / (k + rank), rank from 1 in each lane. Ties break on id. */
 export function fuse<T extends { id: string }>(lanes: readonly (readonly T[])[], k = RRF_K) {
 	const fused = new Map<string, { record: T; score: number }>();
 	for (const lane of lanes) {
@@ -190,11 +189,8 @@ export function parseBootstrapParams(params: URLSearchParams): BootstrapParams {
 	};
 }
 
-/**
- * Session-start context: pinned, then the caller's recent memories, then memories relevant to `q`, deduplicated
- * and packed into `budget` characters of title + content. A memory that does not fit is skipped, so one large
- * memory does not crowd out smaller ones behind it.
- */
+// A memory that does not fit the budget is skipped, not the end of the pack, so one large memory does not crowd
+// out smaller ones behind it.
 export async function bootstrapMemories(params: BootstrapParams, principal: Principal, context: object) {
 	const Memory = memoryTable();
 	const active = { attribute: 'status', comparator: 'equals', value: STATUS_ACTIVE };
@@ -232,7 +228,7 @@ export async function bootstrapMemories(params: BootstrapParams, principal: Prin
 					{ q: params.q, tags: [], scopes: [], limit: BOOTSTRAP_RELEVANT_LIMIT, includeSuperseded: false },
 					principal,
 					context,
-				)
+				).then((hits) => hits.map(({ score: _score, ...memory }) => memory))
 			: [],
 	]);
 	const seen = new Set<unknown>();

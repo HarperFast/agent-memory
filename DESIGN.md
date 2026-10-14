@@ -88,10 +88,12 @@ caller's readable set. To restrict content, use one specific label (`customer:ac
 
 Grants are `ScopeGrant` rows keyed `role:<roleName>` or `user:<username>`, with `read` and `write`
 pattern lists. A pattern is an exact label or a namespace wildcard (`customer:*`); a wildcard never
-covers the bare `global`. Every principal implicitly reads and writes `user:<self>`. `super_user`
-reads and writes everything. Grant rows are read on every request, so revoking one takes effect on
-the next request. An invalid pattern grants nothing and is logged; at most 256 patterns per principal
-count, which bounds the condition every search carries.
+covers the bare `global`. Every principal implicitly reads and writes `user:<self>`, and no grant
+reaches into the `user` namespace: `user:<id>` means the owner only, so a pattern such as `user:*` or
+`user:bob` is ignored rather than quietly opening private memories (reading everything is what
+`super_user` is for). `super_user` reads and writes everything. Grant rows are read on every request,
+so revoking one takes effect on the next request. An invalid pattern grants nothing and is logged; at
+most 256 patterns per principal count, which bounds the condition every search carries.
 
 Rules:
 
@@ -149,10 +151,12 @@ first-class operation, and the write path proposes it.
 - **Owner-only readers are not covered**: an owner who reads the old memory only by ownership (none
   of its labels is in their readable set) sees `supersededBy` but may be unable to read the
   replacement. Covering them would publish the replacement to a principal its author did not choose.
-- **Withdrawing a superseder** recomputes each memory it superseded: it stays `superseded` while any
-  other non-withdrawn memory lists it in `supersedes` (newest by `createdAt`, then id, becomes
-  `supersededBy`), and returns to `active` otherwise. A superseder that is itself superseded still
-  counts — its replacement carries the chain forward.
+- **A memory is superseded exactly while a non-withdrawn memory lists it in `supersedes`**; the newest
+  such memory (by `createdAt`, then id) is its `supersededBy`. A superseder that is itself superseded
+  still counts — its replacement carries the chain forward. Withdrawing a superseder recomputes each
+  memory it superseded under that rule, returning it to `active` when no superseder is left; import
+  derives status by the same rule. The lookup reads non-withdrawn superseders newest first through
+  the indexed `supersedes` and `createdAt`, so it is exact however many there are.
 - **Write-time candidates** (not yet implemented): after a create or revise, the plugin runs a vector
   search for the nearest memories readable by the writer that share at least one scope label, and
   returns those above `supersession.similarity` (default 0.82) as `candidates: [{ id, title,
@@ -192,7 +196,10 @@ true` puts `@embed`'s HNSW index on the native plane). Each lane passes `waitFor
 - **One vector space**: each row records the `embeddingModel` that embedded it, and the vector lane
   only compares rows of the configured model. Changing `embeddingModel` does not re-embed existing
   rows; they stay reachable through full-text until revised. A model whose dimensions differ from the
-  indexed vectors needs the index rebuilt.
+  indexed vectors is not supported yet: Harper's HNSW plane fixes its dimensions at the first vector,
+  skips (and logs) vectors of another size, and rejects a query vector of another size, so search
+  fails until the model is reverted. Switching dimensions needs a re-embedding migration, which v0
+  does not provide.
 - `GET /Memory/bootstrap?q=&budget=` — pinned memories, then the caller's recent memories, then
   memories relevant to `q`, deduplicated and packed into a character budget (title + content; default
   8000). A memory that does not fit is skipped rather than ending the pack. Used at session start.
@@ -219,10 +226,13 @@ Three levels, built in order (none in the v0 core):
 - `registerMemorySink({ write(memory, context), withdraw(memory, context) })` returns an unregister
   function. Sinks are awaited in order inside the lifecycle transaction for every row an operation
   changes (create, revise, scopes, the supersede and restore side effects → `write`; withdraw →
-  `withdraw`; import calls `withdraw` for a row imported as withdrawn). A Harper write the sink makes
-  through `context` commits or rolls back with the memory, and a sink that throws aborts the
-  operation. Effects outside Harper are not transactional — use an outbox table. An idempotent create
-  retry calls no sink. harper-eye uses it for the interim Reflex source-row handoff until memory is a
+  `withdraw`; import calls `withdraw` for a row imported as withdrawn). A write the sink makes through
+  `context` to a table in the `memory` database commits or rolls back with the memory, and a sink that
+  throws aborts the operation. Harper commits each database separately, so a write to another database
+  can be lost if the process dies between the two commits, and a create retry would not repair it.
+  Anything that must not be lost goes through an outbox table declared in the `memory` database. A
+  sink registered or unregistered during a dispatch takes effect from the next one. An idempotent
+  create retry calls no sink. harper-eye uses it for the interim Reflex source-row handoff until memory is a
   Reflex lane.
 - `setPrincipalResolver(fn)` — see Identity.
 - Options (`config.yaml` under the plugin's key): `urlPath`, `embeddingModel` (default `default`),
@@ -242,11 +252,12 @@ supersededBy?, createdAt?, validUntil?, withdrawnAt?, withdrawnReason? }`.
 
 - The id is the create formula `sha256(memory:<ownerId>:<idempotencyKey>)[:32]`. A client may send it
   (so rows can reference each other); the server recomputes it and rejects a mismatch.
-- Rows are written as given — status, links, `createdAt` — and the superset rule is not applied,
-  because the source's history is preserved. Links are format-checked only, so a link may name a row
-  in a later batch; `supersededBy` is required exactly when `status` is `superseded`. The client sends
-  successors before predecessors, so an interrupted run can leave a predecessor not yet imported, never
-  a superseded row whose replacement is missing.
+- Owner, links and `createdAt` are preserved, and the superset rule is not applied, because the
+  source's history is. Links are format-checked only, so a link may name a row in a later batch. A
+  `withdrawn` row stays withdrawn; any other row's status and `supersededBy` are derived from the graph
+  as it stands (stored rows plus this batch), and a stored row that a new row supersedes is marked
+  superseded. So whatever the batch order, and however a run is interrupted or replayed, no memory is
+  hidden behind a missing or withdrawn replacement. The client still sends successors first.
 - A re-run is idempotent: an existing id with the same import fingerprint is `unchanged`, a different
   one is `conflict` and is not overwritten, so a native revision made after import survives. The
   response is `{ results: [{ id, result: created | unchanged | conflict }] }`; an invalid row fails the

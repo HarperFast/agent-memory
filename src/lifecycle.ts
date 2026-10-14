@@ -6,7 +6,7 @@ import { databases, models, transaction } from 'harper';
 import { badRequest, memoryError, notFound } from './errors.ts';
 import { assertWritable, canRead, isSuperset, normalizeScopes, type Principal } from './scopes.ts';
 import { DEFAULT_EMBEDDING_MODEL, getSettings, type Settings } from './settings.ts';
-import { notifySinks } from './sinks.ts';
+import { hasSinks, notifySinks } from './sinks.ts';
 
 export const STATUS_ACTIVE = 'active';
 export const STATUS_SUPERSEDED = 'superseded';
@@ -23,8 +23,6 @@ export const SUPERSEDES_MAX_ITEMS = 10;
 // Reserved for POST /Memory/import, so a native create can never land on an imported row's id.
 export const IMPORT_KEY_PREFIX = 'import:';
 const MEMORY_ID = /^[0-9a-f]{32}$/;
-// Bounds the reverse lookup when a superseder is withdrawn.
-const SUPERSEDER_LOOKUP_LIMIT = 100;
 
 const CREATE_FIELDS = [
 	'title',
@@ -51,7 +49,6 @@ const REVISE_FIELDS = [
 	'validUntil',
 	'expectedRevision',
 ];
-// Narrower than REVISE_FIELDS on purpose: the scopes route changes scopes and nothing else.
 const SCOPE_FIELDS = ['scopes', 'visibility', 'expectedRevision'];
 const WITHDRAW_FIELDS = ['expectedRevision', 'reason'];
 
@@ -169,7 +166,6 @@ export interface MemoryView extends Record<string, unknown> {
 	content: string;
 }
 
-/** The caller-facing shape. Leaves out the vector, the fingerprint and the idempotency key. */
 export function toMemoryView(record: any): MemoryView {
 	return {
 		id: record.id,
@@ -342,8 +338,10 @@ export async function createMemory(input: unknown, principal: Principal, request
 		}
 		// Re-read inside the transaction: @updatedTime is applied by the database.
 		const memory = toMemoryView(await Memory.get(id, txn));
-		await notifySinks('write', memory, txn);
-		for (const target of targets) await notifySinks('write', toMemoryView(await Memory.get(target.id, txn)), txn);
+		if (hasSinks()) {
+			await notifySinks('write', memory, txn);
+			for (const target of targets) await notifySinks('write', toMemoryView(await Memory.get(target.id, txn)), txn);
+		}
 		return { memory, created: true };
 	});
 }
@@ -365,7 +363,10 @@ async function mutateMemory(
 	ensureEmbedder(Memory, settings);
 
 	return inOwnTransaction(requestContext, async (txn) => {
-		await lockRows(Memory, [id], txn);
+		// A withdrawal also changes the memories it superseded. `supersedes` never changes after create, so an
+		// unlocked read can plan the whole lock set, taken once in sorted order like every other operation.
+		const planned = operation === 'withdraw' ? await Memory.get(id, txn) : undefined;
+		await lockRows(Memory, [id, ...(planned?.supersedes ?? [])], txn);
 		const existing = await Memory.get(id, txn);
 		if (!existing) throw notFound();
 		// A caller that cannot read the memory gets the same 404 as a missing one, so a write attempt does not
@@ -405,8 +406,10 @@ async function mutateMemory(
 		// patch, not put: a put would echo @updatedTime back as a caller-supplied value.
 		await Memory.patch(existing.id, changes, txn);
 		const memory = toMemoryView(await Memory.get(existing.id, txn));
-		await notifySinks(operation === 'withdraw' ? 'withdraw' : 'write', memory, txn);
-		for (const targetId of restored) await notifySinks('write', toMemoryView(await Memory.get(targetId, txn)), txn);
+		if (hasSinks()) {
+			await notifySinks(operation === 'withdraw' ? 'withdraw' : 'write', memory, txn);
+			for (const targetId of restored) await notifySinks('write', toMemoryView(await Memory.get(targetId, txn)), txn);
+		}
 		return memory;
 	});
 }
@@ -425,31 +428,52 @@ async function assertStillCoversSuperseded(Memory: any, existing: any, scopes: s
 }
 
 /**
- * Withdrawing W: each memory W superseded stays superseded while any other non-withdrawn memory lists it in
- * `supersedes` (newest wins `supersededBy`), and returns to active otherwise. A superseder that has itself
- * been superseded still counts — its replacement carries the chain forward. Runs before W is patched, under
- * the targets' locks, which every create that supersedes them also takes. Returns the ids it changed.
+ * The newest non-withdrawn memory that lists `targetId` in `supersedes`, ignoring `excludeId`. A superseder that
+ * has itself been superseded still counts: its replacement carries the chain forward.
+ */
+export async function newestSuperseder(Memory: any, targetId: string, context: object, excludeId?: string) {
+	let newest: any;
+	for await (const holder of Memory.search(
+		{
+			conditions: [
+				{ attribute: 'supersedes', comparator: 'equals', value: targetId },
+				{
+					operator: 'or',
+					conditions: [
+						{ attribute: 'status', comparator: 'equals', value: STATUS_ACTIVE },
+						{ attribute: 'status', comparator: 'equals', value: STATUS_SUPERSEDED },
+					],
+				},
+			],
+			sort: { attribute: 'createdAt', descending: true },
+			select: ['id', 'createdAt'],
+		},
+		context,
+	)) {
+		if (holder.id === excludeId) continue;
+		// Newest first, so only a tie with the newest can still change the answer.
+		if (newest && new Date(holder.createdAt).getTime() < new Date(newest.createdAt).getTime()) break;
+		if (!newest || compareNewest(holder, newest) > 0) newest = holder;
+	}
+	return newest;
+}
+
+export function compareNewest(a: { id: string; createdAt: unknown }, b: { id: string; createdAt: unknown }): number {
+	const delta = new Date(a.createdAt as any).getTime() - new Date(b.createdAt as any).getTime();
+	return delta !== 0 ? delta : a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+}
+
+/**
+ * Withdrawing W: each memory W superseded stays superseded while another non-withdrawn memory supersedes it, and
+ * returns to active otherwise. Runs before W is patched, with the targets already locked by the caller; every
+ * create that supersedes them takes the same locks. Returns the ids it changed.
  */
 async function reconcileSuperseded(Memory: any, withdrawn: any, context: object): Promise<string[]> {
-	const targetIds: string[] = withdrawn.supersedes ?? [];
-	if (targetIds.length === 0) return [];
-	await lockRows(Memory, targetIds, context);
 	const changed: string[] = [];
-	for (const targetId of targetIds) {
+	for (const targetId of withdrawn.supersedes ?? []) {
 		const target = await Memory.get(targetId, context);
 		if (target?.status !== STATUS_SUPERSEDED) continue;
-		let newest: any;
-		for await (const holder of Memory.search(
-			{
-				conditions: [{ attribute: 'supersedes', comparator: 'equals', value: targetId }],
-				select: ['id', 'status', 'createdAt'],
-				limit: SUPERSEDER_LOOKUP_LIMIT,
-			},
-			context,
-		)) {
-			if (holder.id === withdrawn.id || holder.status === STATUS_WITHDRAWN) continue;
-			if (!newest || compareNewest(holder, newest) > 0) newest = holder;
-		}
+		const newest = await newestSuperseder(Memory, targetId, context, withdrawn.id);
 		const next = newest
 			? { status: STATUS_SUPERSEDED, supersededBy: newest.id }
 			: { status: STATUS_ACTIVE, supersededBy: null };
@@ -458,11 +482,6 @@ async function reconcileSuperseded(Memory: any, withdrawn: any, context: object)
 		changed.push(targetId);
 	}
 	return changed;
-}
-
-function compareNewest(a: any, b: any): number {
-	const delta = new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime();
-	return delta !== 0 ? delta : a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
 }
 
 /** Omitting `scopes`/`visibility` keeps the stored scopes; supplying either is the explicit scope change. */

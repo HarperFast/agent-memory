@@ -1,9 +1,12 @@
-// POST /Memory/import (super_user): bulk import with preserved owner, createdAt, status and supersession
-// links. Rows are written as given — the client derives status and links from its source and sends
-// successors before predecessors — and one request is one transaction.
+// POST /Memory/import (super_user): bulk import with preserved owner, createdAt and supersession links. One
+// request is one transaction. Status is not trusted from the row: a non-withdrawn row's status is derived from
+// the supersession graph as it stands (rows already stored plus this batch), the same rule a withdrawal
+// applies, so a replay or an interrupted run can never publish a memory hidden behind a missing or withdrawn
+// replacement.
 import { badRequest, isCallerSafe, memoryError } from './errors.ts';
 import {
 	boundedText,
+	compareNewest,
 	ensureEmbedder,
 	fingerprint,
 	inOwnTransaction,
@@ -14,6 +17,7 @@ import {
 	lockRows,
 	memoryIdFor,
 	memoryTable,
+	newestSuperseder,
 	normalizeEvidence,
 	normalizeIds,
 	normalizeTags,
@@ -27,7 +31,7 @@ import {
 } from './lifecycle.ts';
 import { isScopeLabel, MAX_SCOPES_PER_MEMORY, requirePrincipalId, type Principal } from './scopes.ts';
 import { getSettings } from './settings.ts';
-import { notifySinks } from './sinks.ts';
+import { hasSinks, notifySinks } from './sinks.ts';
 
 export const IMPORT_MAX_ROWS = 100;
 const IMPORT_SUPERSEDES_MAX_ITEMS = 100;
@@ -112,7 +116,25 @@ function validateRow(input: unknown, index: number) {
 			withdrawnAt: withdrawnAt ?? null,
 			withdrawnReason: withdrawnReason ?? null,
 		};
-		return { ...record, createFingerprint: fingerprint(['import', ...Object.values(record)]) };
+		const createFingerprint = fingerprint([
+			'import',
+			record.ownerId,
+			record.title,
+			record.content,
+			record.tags,
+			record.durability,
+			record.pinned,
+			record.evidence,
+			record.scopes,
+			record.status,
+			record.supersedes,
+			record.supersededBy,
+			record.createdAt?.toISOString() ?? null,
+			record.validUntil?.toISOString() ?? null,
+			record.withdrawnAt?.toISOString() ?? null,
+			record.withdrawnReason,
+		]);
+		return { ...record, createFingerprint };
 	} catch (error) {
 		if (isCallerSafe(error)) throw memoryError(error.message, error.statusCode, error.code, index);
 		throw error;
@@ -139,36 +161,64 @@ export async function importMemories(input: unknown, principal: Principal, reque
 	ensureEmbedder(Memory, settings);
 
 	return inOwnTransaction(requestContext, async (txn) => {
-		await lockRows(
-			Memory,
-			rows.map((row: { id: string }) => row.id),
-			txn,
-		);
+		const targetIds = new Set<string>(rows.flatMap((row: { supersedes: string[] }) => row.supersedes));
+		await lockRows(Memory, [...rows.map((row: { id: string }) => row.id), ...targetIds], txn);
 		const results: Array<{ id: string; result: ImportResult }> = [];
+		const created = [];
+		const now = new Date();
 		for (const row of rows) {
 			const existing = await Memory.get(row.id, txn);
 			if (existing) {
-				results.push({
-					id: row.id,
-					result: existing.createFingerprint === row.createFingerprint ? 'unchanged' : 'conflict',
-				});
-				continue;
+				const result = existing.createFingerprint === row.createFingerprint ? 'unchanged' : 'conflict';
+				results.push({ id: row.id, result });
+			} else {
+				created.push({ ...row, createdAt: row.createdAt ?? now });
+				results.push({ id: row.id, result: 'created' });
 			}
-			const createdAt = row.createdAt ?? new Date();
+		}
+		const liveCreated = created.filter((row) => row.status !== STATUS_WITHDRAWN);
+		const graphState = async (targetId: string) => {
+			let newest = await newestSuperseder(Memory, targetId, txn);
+			for (const row of liveCreated) {
+				if (row.supersedes.includes(targetId) && (!newest || compareNewest(row, newest) > 0)) newest = row;
+			}
+			return newest
+				? { status: STATUS_SUPERSEDED, supersededBy: newest.id }
+				: { status: STATUS_ACTIVE, supersededBy: null };
+		};
+
+		for (const row of created) {
+			const state =
+				row.status === STATUS_WITHDRAWN
+					? { status: row.status, supersededBy: row.supersededBy }
+					: await graphState(row.id);
 			await Memory.put(
 				{
 					...row,
-					createdAt,
+					...state,
 					revision: 1,
-					author: { principalId: row.ownerId, source: 'import', authoredAt: createdAt.toISOString() },
+					author: { principalId: row.ownerId, source: 'import', authoredAt: row.createdAt.toISOString() },
 					lastEditor: null,
 					embeddingModel: settings.embeddingModel,
 				},
 				txn,
 			);
-			const memory = toMemoryView(await Memory.get(row.id, txn));
-			await notifySinks(row.status === STATUS_WITHDRAWN ? 'withdraw' : 'write', memory, txn);
-			results.push({ id: row.id, result: 'created' });
+			if (hasSinks()) {
+				const memory = toMemoryView(await Memory.get(row.id, txn));
+				await notifySinks(row.status === STATUS_WITHDRAWN ? 'withdraw' : 'write', memory, txn);
+			}
+		}
+
+		// Rows stored earlier that this batch supersedes (an import that arrived predecessor-first).
+		const createdIds = new Set(created.map((row) => row.id));
+		for (const targetId of new Set(liveCreated.flatMap((row) => row.supersedes))) {
+			if (createdIds.has(targetId)) continue;
+			const target = await Memory.get(targetId, txn);
+			if (!target || target.status === STATUS_WITHDRAWN) continue;
+			const next = await graphState(targetId);
+			if (next.status === target.status && next.supersededBy === target.supersededBy) continue;
+			await Memory.patch(targetId, { ...next, revision: target.revision + 1 }, txn);
+			if (hasSinks()) await notifySinks('write', toMemoryView(await Memory.get(targetId, txn)), txn);
 		}
 		return { results };
 	});
