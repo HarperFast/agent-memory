@@ -136,7 +136,9 @@ the same expected revision exactly one succeeds. The locks are node-scoped, beca
 lock on a replicated database fails closed unless the cluster has opted into replicated record locks
 (`replication.recordLocks`); across nodes, two revisions at the same expected revision can both
 succeed and replication keeps the later write — the limit harper-eye documented for expected
-revisions. Any status change, including supersede and restore, bumps the affected row's `revision`.
+revisions. The same applies to derived status: a withdrawal's restore on one node and a supersede of the
+same memory on another replicate as competing writes, so the memory can end up `active` beside a live
+superseder until a later operation recomputes it. Any status change, including supersede and restore, bumps the affected row's `revision`.
 
 ### Supersession
 
@@ -182,8 +184,10 @@ Mounted at `urlPath` (default `Memory`); hidden from MCP and OpenAPI auto-export
 | `POST /Memory/import`                                   | bulk import (`super_user`)              |
 
 Errors are `{ error, code }` (plus `index` for an import row). Only errors the plugin creates carry
-their own message; anything else is a 500 `internal_error`, and a Harper 503 (an index rebuilding or
-lagging, a lock or database briefly unavailable) is a 503 `unavailable` to retry.
+their own message; anything else is a 500 `internal_error`. Harper's retryable failures — 503 (an index
+rebuilding or lagging, a database closing), 423 (a record lock not granted within 30 s) and 409 (a lock
+lease that lapsed before commit) — become a 503 `unavailable` to retry. Import holds its locks with a
+5-minute lease, since a batch embeds every row inside its transaction.
 
 ## Search and bootstrap
 

@@ -10,15 +10,18 @@ function json(data: unknown, status = 200): Response {
 	return new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json' } });
 }
 
+const RETRYABLE_STATUS = new Set([409, 423, 503]);
+
 function errorResponse(error: unknown, route: string): Response {
 	if (isCallerSafe(error)) {
 		const body: Record<string, unknown> = { error: error.message, code: error.code };
 		if (error.index !== undefined) body.index = error.index;
 		return json(body, error.statusCode);
 	}
-	// Harper's 503s (an index rebuilding or lagging, a lock or database briefly unavailable) are retryable; the
-	// fixed message keeps their text, which is not vetted for callers, out of the response.
-	if ((error as any)?.statusCode === 503) {
+	// Harper's 503s (an index rebuilding or lagging, a database closing), 423s (a record lock not granted in
+	// time) and 409s (a lock lease that lapsed before commit) are all retryable; the fixed message keeps their
+	// text, which is not vetted for callers, out of the response.
+	if (RETRYABLE_STATUS.has((error as any)?.statusCode)) {
 		return json({ error: 'Temporarily unavailable; retry shortly', code: 'unavailable' }, 503);
 	}
 	logger.error?.(`[agent-memory] ${route} failed`, error);

@@ -216,8 +216,9 @@ export function ensureEmbedder(Memory: any, settings: Settings): void {
  * database fails closed unless the cluster has opted into replicated record locks; across nodes, concurrent
  * revisions are therefore not serialized (replication keeps the later write).
  */
-export async function lockRows(Memory: any, ids: Iterable<string>, context: object): Promise<void> {
-	for (const id of [...new Set(ids)].sort()) await Memory.lock(id, { scope: 'node' }, context);
+export async function lockRows(Memory: any, ids: Iterable<string>, context: object, lease?: number): Promise<void> {
+	const options = lease ? { scope: 'node', lease } : { scope: 'node' };
+	for (const id of [...new Set(ids)].sort()) await Memory.lock(id, options, context);
 }
 
 /**

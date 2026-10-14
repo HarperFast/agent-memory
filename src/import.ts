@@ -29,6 +29,8 @@ import { getSettings } from './settings.ts';
 import { hasSinks, notifySinks } from './sinks.ts';
 
 export const IMPORT_MAX_ROWS = 100;
+// A batch embeds every row inside its transaction; Harper's default 30 s lock lease could lapse before commit.
+const IMPORT_LOCK_LEASE_MS = 5 * 60_000;
 const IMPORT_SUPERSEDES_MAX_ITEMS = 100;
 const ROW_FIELDS = [
 	'id',
@@ -158,7 +160,7 @@ export async function importMemories(input: unknown, principal: Principal, reque
 
 	return inOwnTransaction(requestContext, async (txn) => {
 		const targetIds = new Set<string>(rows.flatMap((row: { supersedes: string[] }) => row.supersedes));
-		await lockRows(Memory, [...rows.map((row: { id: string }) => row.id), ...targetIds], txn);
+		await lockRows(Memory, [...rows.map((row: { id: string }) => row.id), ...targetIds], txn, IMPORT_LOCK_LEASE_MS);
 		const results: Array<{ id: string; result: ImportResult }> = [];
 		const created = [];
 		const now = new Date();
