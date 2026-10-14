@@ -144,8 +144,9 @@ for Flair, `AGENT_MEMORY_USER` and `AGENT_MEMORY_PASS` (a `super_user`) for the 
 
 The summary (JSON on stdout) counts rows by owner, scope and status, and lists what was skipped
 (unmapped agents, ephemeral rows), `supersedes` links that were dropped (`missing`, `skipped`, `self`,
-`cycle`), links where the replacement loses a reader of the old memory (`scopeNarrowing`), and Flair
-visibility values other than `private`/`shared` (imported as `global`). It never contains memory content.
+`cycle`, or `narrowing` when the replacement would hide the old memory from some of its readers), and
+Flair visibility values other than `private`/`shared` (imported as `global`). It never contains memory
+content. The whole export is held in memory while it is mapped.
 Before importing, check that the principals who read shared Flair memories hold `global` read in the
 target.
 
@@ -153,3 +154,6 @@ A failed batch stops the run; earlier batches stay committed. Re-run the same co
 snapshot and principal map: rows already imported come back `unchanged`, and a row that was edited in
 the target since comes back `conflict` and is left alone. A live `--flair` re-run reads Flair again, so
 rows changed in Flair since the first run also come back `conflict`; import from a snapshot to avoid that.
+Do not edit imported memories in the target until the import has finished. The result lists conflicted
+rows (`conflicts`) and the rows created as superseded by one of them (`dependsOnConflict`); check those
+by hand.

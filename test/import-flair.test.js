@@ -2,7 +2,7 @@ import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { once } from 'node:events';
-import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -55,9 +55,9 @@ async function stubServer(handler) {
 		for await (const chunk of request) body += chunk;
 		const entry = { method: request.method, url: request.url, headers: request.headers, body };
 		requests.push(entry);
-		const { status = 200, json } = await handler(entry, requests.length);
+		const { status = 200, json, raw } = await handler(entry, requests.length);
 		response.writeHead(status, { 'Content-Type': 'application/json' });
-		response.end(JSON.stringify(json));
+		response.end(raw ?? JSON.stringify(json));
 	});
 	server.listen(0, '127.0.0.1');
 	await once(server, 'listening');
@@ -106,19 +106,20 @@ describe('mapFlairMemories', () => {
 		assert.equal(byKey.get('m03').status, 'active');
 		assert.equal(byKey.get('m03').supersededBy, undefined);
 		assert.equal(byKey.get('m01').validUntil, '2026-01-02T00:00:00.000Z');
-		assert.equal(summary.supersedes.resolved, 4);
-		assert.deepEqual(summary.byStatus, { active: 7, superseded: 3, withdrawn: 1 });
+		assert.equal(summary.supersedes.resolved, 3);
+		assert.deepEqual(summary.byStatus, { active: 8, superseded: 2, withdrawn: 1 });
 	});
 
 	it('drops dangling links and reports each with its reason', () => {
 		const { rows, byKey, summary } = mapped();
-		for (const flairId of ['m04', 'm06', 'm11', 'm12']) {
+		for (const flairId of ['m04', 'm06', 'm11', 'm12', 'm13']) {
 			assert.equal(byKey.get(flairId).supersedes, undefined, `${flairId} carries no dangling link`);
 			assert.equal(byKey.get(flairId).status, 'active');
 		}
 		assert.deepEqual(summary.supersedes.unresolved, [
 			{ from: 'm04', to: 'gone', reason: 'missing' },
 			{ from: 'm06', to: 'm05', reason: 'skipped' },
+			{ from: 'm13', to: 'm10', reason: 'narrowing' },
 			{ from: 'm11', to: 'm12', reason: 'cycle' },
 			{ from: 'm12', to: 'm11', reason: 'cycle' },
 		]);
@@ -154,8 +155,68 @@ describe('mapFlairMemories', () => {
 		assert.equal(byKey.get('m09').supersededBy, undefined);
 	});
 
-	it('reports links whose replacement drops a reader of the predecessor', () => {
-		assert.deepEqual(mapped().summary.supersedes.scopeNarrowing, [{ from: 'm13', to: 'm10' }]);
+	it('drops a link whose replacement some reader of the old memory cannot read', () => {
+		assert.equal(mapped().byKey.get('m10').status, 'active', 'global m10 stays visible; private m13 cannot replace it');
+		const pair = (old, replacement) => [
+			{ id: 'old', content: 'c', createdAt: '2026-01-01T00:00:00Z', ...old },
+			{ id: 'new', content: 'c', createdAt: '2026-01-02T00:00:00Z', supersedes: 'old', ...replacement },
+		];
+		const outcome = (old, replacement) => {
+			const { rows, summary } = mapFlairMemories(pair(old, replacement), principalMap);
+			return [rows.find((row) => row.idempotencyKey === importKey('old')).status, summary.supersedes.unresolved];
+		};
+		const ann = { agentId: 'agent-ann' };
+		const bob = { agentId: 'agent-bob' };
+		assert.deepEqual(outcome({ ...ann, visibility: 'private' }, { ...ann, visibility: 'private' }), ['superseded', []]);
+		assert.deepEqual(outcome({ ...ann, visibility: 'private' }, { ...ann, visibility: 'shared' }), ['superseded', []]);
+		assert.deepEqual(outcome({ ...ann, visibility: 'private' }, { ...bob, visibility: 'shared' }), ['superseded', []]);
+		const narrowing = [{ from: 'new', to: 'old', reason: 'narrowing' }];
+		assert.deepEqual(outcome({ ...ann, visibility: 'shared' }, { ...ann, visibility: 'private' }), [
+			'active',
+			narrowing,
+		]);
+		assert.deepEqual(outcome({ ...ann, visibility: 'private' }, { ...bob, visibility: 'private' }), [
+			'active',
+			narrowing,
+		]);
+	});
+
+	it('never marks an archived memory superseded, even when a live memory supersedes it', () => {
+		const { rows } = mapFlairMemories(
+			[
+				{ id: 'old', agentId: 'agent-ann', content: 'c', createdAt: '2026-01-01T00:00:00Z', archived: true },
+				{ id: 'new', agentId: 'agent-ann', content: 'c', createdAt: '2026-01-02T00:00:00Z', supersedes: 'old' },
+			],
+			principalMap,
+		);
+		const [replacement, archived] = rows;
+		assert.equal(archived.status, 'withdrawn');
+		assert.equal(archived.supersededBy, undefined);
+		assert.deepEqual(replacement.supersedes, [archived.id]);
+		assert.equal(replacement.status, 'active');
+	});
+
+	it('counts ids that collide with Object.prototype names', () => {
+		const rows = ['__proto__', 'toString', 'constructor'].map((agentId, index) => ({
+			id: `p${index}`,
+			agentId,
+			content: 'c',
+			createdAt: '2026-01-01T00:00:00Z',
+		}));
+		rows.push({
+			id: 'v',
+			agentId: 'agent-ann',
+			content: 'c',
+			createdAt: '2026-01-01T00:00:00Z',
+			visibility: '__proto__',
+		});
+		const { summary } = mapFlairMemories(rows, principalMap);
+		assert.deepEqual(JSON.parse(JSON.stringify(summary.skipped.unmappedAgents)), {
+			['__proto__']: 1,
+			toString: 1,
+			constructor: 1,
+		});
+		assert.equal(JSON.stringify(summary.unknownVisibility), '{"__proto__":1}');
 	});
 
 	it('orders every successor before the row it supersedes', () => {
@@ -230,7 +291,7 @@ describe('import-flair CLI', () => {
 		directory = await mkdtemp(join(tmpdir(), 'import-flair-'));
 	});
 	after(async () => {
-		await rm(directory, { recursive: true, force: true });
+		if (directory) await rm(directory, { recursive: true, force: true });
 	});
 
 	it('--dry-run prints counts and ids only, and contacts no target', async () => {
@@ -278,6 +339,7 @@ describe('import-flair CLI', () => {
 				unchanged: 0,
 				conflict: 1,
 				conflicts: [{ id: idOf('bob', 'm04'), idempotencyKey: importKey('m04') }],
+				dependsOnConflict: [],
 			});
 		} finally {
 			target.close();
@@ -314,6 +376,11 @@ describe('import-flair CLI', () => {
 			);
 			assert.equal(again.code, 1, 'an existing snapshot is never overwritten');
 			assert.match(again.stderr, /EEXIST/);
+			assert.deepEqual(
+				(await readdir(directory)).filter((name) => name.includes('partial')),
+				[],
+				'no partial snapshot is left behind',
+			);
 		} finally {
 			flair.close();
 			target.close();
@@ -336,6 +403,61 @@ describe('import-flair CLI', () => {
 			const secondBatch = JSON.parse(target.requests[1].body).rows;
 			assert.match(result.stderr, /batch 2\/3 failed: HTTP 400, code import_id_mismatch, row 1 \(import:flair:/);
 			assert.ok(result.stderr.includes(secondBatch[1].idempotencyKey));
+			assert.doesNotMatch(result.stderr, /SECRET/);
+		} finally {
+			target.close();
+		}
+	});
+
+	it('lists created rows whose replacement came back as a conflict', async () => {
+		for (const batchSize of ['4', '100']) {
+			const target = await stubServer(
+				importHandler((row) => (row.idempotencyKey === importKey('m03') ? 'conflict' : 'created')),
+			);
+			try {
+				const result = await cli(
+					[
+						'--from-jsonl',
+						FIXTURE,
+						'--principal-map',
+						PRINCIPAL_MAP,
+						'--target',
+						target.url,
+						'--batch-size',
+						batchSize,
+					],
+					TARGET_ENV,
+				);
+				assert.equal(result.code, 0, result.stderr);
+				assert.deepEqual(JSON.parse(result.stdout).result.dependsOnConflict, [
+					{ id: idOf('ann', 'm02'), idempotencyKey: importKey('m02'), supersededBy: idOf('bob', 'm03') },
+				]);
+			} finally {
+				target.close();
+			}
+		}
+	});
+
+	it('never prints memory content from a malformed Flair response or an unrecognized error code', async () => {
+		const flair = await stubServer(() => ({ raw: '[{"content":"SECRET-truncated' }));
+		try {
+			const result = await cli(['--flair', flair.url, '--principal-map', PRINCIPAL_MAP, '--dry-run'], {
+				FLAIR_ADMIN_PASS: 'flair-secret',
+			});
+			assert.equal(result.code, 1);
+			assert.match(result.stderr, /not a JSON array/);
+			assert.doesNotMatch(result.stderr, /SECRET/);
+		} finally {
+			flair.close();
+		}
+		const target = await stubServer(() => ({ status: 400, json: { code: 'SECRET content here', index: 0 } }));
+		try {
+			const result = await cli(
+				['--from-jsonl', FIXTURE, '--principal-map', PRINCIPAL_MAP, '--target', target.url],
+				TARGET_ENV,
+			);
+			assert.equal(result.code, 1);
+			assert.match(result.stderr, /HTTP 400, row 0 \(import:flair:/);
 			assert.doesNotMatch(result.stderr, /SECRET/);
 		} finally {
 			target.close();

@@ -1,11 +1,7 @@
 #!/usr/bin/env node
-// Import memories from a Flair instance (tpsdev-ai/flair) into @harperfast/agent-memory through
-// POST /Memory/import. Usage and rules: README.md "Import" and DESIGN.md "Import".
-
 import { createHash } from 'node:crypto';
-import { readFile, writeFile } from 'node:fs/promises';
 import { realpathSync } from 'node:fs';
-import { pathToFileURL } from 'node:url';
+import { link, readFile, unlink, writeFile } from 'node:fs/promises';
 import { parseArgs } from 'node:util';
 
 export const MAX_BATCH_SIZE = 100;
@@ -25,6 +21,7 @@ const FLAIR_FIELDS = [
 	'expiresAt',
 ];
 const IMPORT_RESULTS = new Set(['created', 'unchanged', 'conflict']);
+const ERROR_CODE = /^[A-Za-z0-9_.-]{1,64}$/;
 const LOOPBACK_HOSTS = new Set(['localhost', '[::1]']);
 
 class UsageError extends Error {}
@@ -108,56 +105,48 @@ function validateFlairRow(row, index) {
 	}
 }
 
-function compareByCreated(a, b) {
-	return Date.parse(a.createdAt) - Date.parse(b.createdAt) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
-}
-
 function increment(counts, key) {
-	counts[key] = (counts[key] ?? 0) + 1;
+	counts.set(key, (counts.get(key) ?? 0) + 1);
 }
 
-/**
- * Maps raw Flair Memory rows to import rows, ordered so every successor precedes the rows it supersedes.
- * Pure: the same input and principal map always produce the same rows and summary.
- */
 export function mapFlairMemories(flairRows, principalMap) {
 	const byFlairId = new Map();
+	const createdMs = new Map();
 	flairRows.forEach((row, index) => {
 		validateFlairRow(row, index);
 		if (byFlairId.has(row.id)) throw new Error(`Flair memory ${JSON.stringify(row.id)} appears more than once`);
 		byFlairId.set(row.id, row);
+		createdMs.set(row.id, Date.parse(row.createdAt));
 	});
+	const compareByCreated = (a, b) => createdMs.get(a) - createdMs.get(b) || (a < b ? -1 : a > b ? 1 : 0);
 
-	const summary = {
-		source: 'flair',
-		read: flairRows.length,
-		toImport: 0,
-		skipped: { unmappedAgents: {}, ephemeral: 0 },
-		byOwner: {},
-		byScope: {},
-		byStatus: { active: 0, superseded: 0, withdrawn: 0 },
-		unknownVisibility: {},
-		supersedes: { resolved: 0, unresolved: [], scopeNarrowing: [] },
-	};
+	const unmappedAgents = new Map();
+	const byOwner = new Map();
+	const byScope = new Map();
+	const unknownVisibility = new Map();
+	const byStatus = { active: 0, superseded: 0, withdrawn: 0 };
+	const unresolved = [];
+	let ephemeral = 0;
 
 	const eligible = new Map();
-	for (const row of [...byFlairId.values()].sort(compareByCreated)) {
+	for (const flairId of [...byFlairId.keys()].sort(compareByCreated)) {
+		const row = byFlairId.get(flairId);
 		const ownerId = principalMap.get(row.agentId);
 		if (ownerId === undefined) {
-			increment(summary.skipped.unmappedAgents, row.agentId);
+			increment(unmappedAgents, row.agentId);
 			continue;
 		}
 		// Flair stamps expiresAt only on the ephemeral tier; the target has no expiry, so importing would
 		// make self-pruning working state permanent.
 		if (row.durability === 'ephemeral' || row.expiresAt != null) {
-			summary.skipped.ephemeral++;
+			ephemeral++;
 			continue;
 		}
 		const idempotencyKey = importKey(row.id);
 		// Flair reads only the literal "private" as owner-only; any other value is readable by every agent.
 		const scopes = row.visibility === 'private' ? [`user:${ownerId}`] : ['global'];
 		if (row.visibility != null && row.visibility !== 'private' && row.visibility !== 'shared') {
-			increment(summary.unknownVisibility, row.visibility);
+			increment(unknownVisibility, row.visibility);
 		}
 		eligible.set(row.id, { flair: row, id: memoryIdFor(ownerId, idempotencyKey), idempotencyKey, ownerId, scopes });
 	}
@@ -166,15 +155,24 @@ export function mapFlairMemories(flairRows, principalMap) {
 	for (const entry of eligible.values()) {
 		const target = entry.flair.supersedes;
 		if (!target) continue;
+		const predecessor = eligible.get(target);
+		// DESIGN.md supersession: every reader of the old memory must be able to read its replacement.
+		// `global` covers every imported principal, as the visibility mapping already assumes.
+		const narrows =
+			predecessor &&
+			!entry.scopes.includes('global') &&
+			predecessor.scopes.some((label) => !entry.scopes.includes(label));
 		const reason =
 			target === entry.flair.id
 				? 'self'
 				: !byFlairId.has(target)
 					? 'missing'
-					: !eligible.has(target)
+					: !predecessor
 						? 'skipped'
-						: null;
-		if (reason) summary.supersedes.unresolved.push({ from: entry.flair.id, to: target, reason });
+						: narrows
+							? 'narrowing'
+							: null;
+		if (reason) unresolved.push({ from: entry.flair.id, to: target, reason });
 		else predecessorOf.set(entry.flair.id, target);
 	}
 
@@ -199,7 +197,7 @@ export function mapFlairMemories(flairRows, principalMap) {
 	}
 	const onCycle = [...eligible.keys()].filter((flairId) => pending.has(flairId));
 	for (const flairId of onCycle) {
-		summary.supersedes.unresolved.push({ from: flairId, to: predecessorOf.get(flairId), reason: 'cycle' });
+		unresolved.push({ from: flairId, to: predecessorOf.get(flairId), reason: 'cycle' });
 		predecessorOf.delete(flairId);
 		order.push(flairId);
 	}
@@ -207,11 +205,11 @@ export function mapFlairMemories(flairRows, principalMap) {
 	const latestLiveSuccessor = new Map();
 	for (const flairId of order) {
 		const target = predecessorOf.get(flairId);
-		if (target === undefined || eligible.get(flairId).flair.archived === true) continue;
-		const current = latestLiveSuccessor.get(target);
-		if (!current || compareByCreated(byFlairId.get(current), byFlairId.get(flairId)) < 0) {
-			latestLiveSuccessor.set(target, flairId);
+		if (target === undefined || byFlairId.get(flairId).archived === true || byFlairId.get(target).archived === true) {
+			continue;
 		}
+		const current = latestLiveSuccessor.get(target);
+		if (!current || compareByCreated(current, flairId) < 0) latestLiveSuccessor.set(target, flairId);
 	}
 
 	const rows = order.map((flairId) => {
@@ -222,27 +220,29 @@ export function mapFlairMemories(flairRows, principalMap) {
 		if (flair.tags?.length) row.tags = flair.tags;
 		if (flair.durability != null) row.durability = flair.durability;
 		const target = predecessorOf.get(flairId);
-		if (target !== undefined) {
-			const predecessor = eligible.get(target);
-			row.supersedes = [predecessor.id];
-			summary.supersedes.resolved++;
-			// DESIGN.md read rule: a reader of the predecessor keeps access through a shared label, or as the owner.
-			if (predecessor.scopes.some((label) => !scopes.includes(label) && label !== `user:${ownerId}`)) {
-				summary.supersedes.scopeNarrowing.push({ from: flairId, to: target });
-			}
-		}
+		if (target !== undefined) row.supersedes = [eligible.get(target).id];
 		if (successor) row.supersededBy = eligible.get(successor).id;
 		if (flair.validTo != null) row.validUntil = flair.validTo;
 		if (status === 'withdrawn') {
 			if (flair.archivedAt != null) row.withdrawnAt = flair.archivedAt;
 			row.withdrawnReason = 'archived in Flair';
 		}
-		increment(summary.byOwner, ownerId);
-		for (const label of scopes) increment(summary.byScope, label);
-		summary.byStatus[status]++;
+		increment(byOwner, ownerId);
+		for (const label of scopes) increment(byScope, label);
+		byStatus[status]++;
 		return row;
 	});
-	summary.toImport = rows.length;
+	const summary = {
+		source: 'flair',
+		read: flairRows.length,
+		toImport: rows.length,
+		skipped: { unmappedAgents: Object.fromEntries(unmappedAgents), ephemeral },
+		byOwner: Object.fromEntries(byOwner),
+		byScope: Object.fromEntries(byScope),
+		byStatus,
+		unknownVisibility: Object.fromEntries(unknownVisibility),
+		supersedes: { resolved: predecessorOf.size, unresolved },
+	};
 	return { rows, summary };
 }
 
@@ -280,7 +280,8 @@ async function readFlairLive(flairBase, authorization) {
 		signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
 	});
 	if (!response.ok) throw new Error(`reading Flair memories failed: HTTP ${response.status}`);
-	const rows = await response.json();
+	// A JSON parse error message quotes the body, which is memory content.
+	const rows = await response.json().catch(() => null);
 	if (!Array.isArray(rows)) throw new Error('reading Flair memories failed: response is not a JSON array');
 	return rows;
 }
@@ -289,7 +290,7 @@ async function errorDetail(response, rows) {
 	try {
 		const body = await response.json();
 		const parts = [];
-		if (typeof body?.code === 'string') parts.push(`code ${body.code.slice(0, 80)}`);
+		if (typeof body?.code === 'string' && ERROR_CODE.test(body.code)) parts.push(`code ${body.code}`);
 		if (Number.isInteger(body?.index) && rows[body.index]) {
 			parts.push(`row ${body.index} (${rows[body.index].idempotencyKey})`);
 		}
@@ -301,7 +302,8 @@ async function errorDetail(response, rows) {
 
 async function postBatches(rows, { target, authorization, batchSize, stderr }) {
 	const url = `${target}/Memory/import`;
-	const result = { created: 0, unchanged: 0, conflict: 0, conflicts: [] };
+	const result = { created: 0, unchanged: 0, conflict: 0, conflicts: [], dependsOnConflict: [] };
+	const conflictIds = new Set();
 	const batchCount = Math.ceil(rows.length / batchSize);
 	for (let start = 0, batch = 1; start < rows.length; start += batchSize, batch++) {
 		const batchRows = rows.slice(start, start + batchSize);
@@ -329,12 +331,35 @@ async function postBatches(rows, { target, authorization, batchSize, stderr }) {
 		results.forEach((entry, index) => {
 			result[entry.result]++;
 			if (entry.result === 'conflict') {
+				conflictIds.add(entry.id);
 				result.conflicts.push({ id: entry.id, idempotencyKey: batchRows[index].idempotencyKey });
+			}
+		});
+		// Successors come first, so a conflicted successor is already known when its predecessor's result arrives.
+		results.forEach((entry, index) => {
+			const { id, idempotencyKey, supersededBy } = batchRows[index];
+			if (entry.result === 'created' && conflictIds.has(supersededBy)) {
+				result.dependsOnConflict.push({ id, idempotencyKey, supersededBy });
 			}
 		});
 		stderr.write(`batch ${batch}/${batchCount}: ${batchRows.length} rows\n`);
 	}
 	return result;
+}
+
+// Written aside and linked into place, so an interrupted write never leaves a truncated snapshot under the
+// final name, and an existing file is never replaced.
+async function writeSnapshot(path, flairRows) {
+	const partial = `${path}.${process.pid}.partial`;
+	try {
+		await writeFile(partial, flairRows.map((row) => JSON.stringify(row)).join('\n') + '\n', {
+			mode: 0o600,
+			flag: 'wx',
+		});
+		await link(partial, path);
+	} finally {
+		await unlink(partial).catch(() => {});
+	}
 }
 
 const OPTIONS = {
@@ -390,8 +415,7 @@ export async function run(argv, env, { stdout = process.stdout, stderr = process
 				basicAuth(env, 'FLAIR_ADMIN_USER', 'FLAIR_ADMIN_PASS', 'admin'),
 			);
 			if (values.snapshot) {
-				const jsonl = flairRows.map((row) => JSON.stringify(row)).join('\n') + '\n';
-				await writeFile(values.snapshot, jsonl, { mode: 0o600, flag: 'wx' });
+				await writeSnapshot(values.snapshot, flairRows);
 				stderr.write(`snapshot: ${flairRows.length} Flair memories written to ${values.snapshot}\n`);
 			}
 		} else {
@@ -423,6 +447,12 @@ export async function run(argv, env, { stdout = process.stdout, stderr = process
 	}
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href) {
-	process.exitCode = await run(process.argv.slice(2), process.env);
+function isEntryPoint() {
+	try {
+		return realpathSync(process.argv[1]) === import.meta.filename;
+	} catch {
+		return false;
+	}
 }
+
+if (isEntryPoint()) process.exitCode = await run(process.argv.slice(2), process.env);

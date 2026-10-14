@@ -316,13 +316,18 @@ sends identical rows.
   every other value (`shared`, absent, legacy) → `[global]`.
 - **Lifecycle**: `archived` → `withdrawn` with `withdrawnAt` = `archivedAt`. Flair's archive is a
   restorable basement, mostly filled by age-based hygiene, so the row is kept out of default search,
-  not dropped. A row is `superseded` when a non-withdrawn imported row supersedes it; `supersededBy`
-  names the latest such row. `validTo` → `validUntil`.
+  not dropped. A non-withdrawn row is `superseded` when a non-withdrawn imported row supersedes it;
+  `supersededBy` names the latest such row. A withdrawn row never carries `supersededBy`, so withdrawing
+  its replacement later cannot restore it. `validTo` → `validUntil`.
 - **Links**: `supersedes` is rewritten to target ids. A link to a row that is missing from the source,
-  skipped, itself, or on a cycle is dropped and reported. No sent row references a row outside the
-  import set.
+  skipped, itself, or on a cycle is dropped and reported. So is a link that breaks the supersession
+  reader rule above: a replacement that is not `global` must carry every label of the old memory
+  (`global` counts as readable by every imported principal, as the scope mapping already assumes). No
+  sent row references a row outside the import set.
 - **Order**: successors before the rows they supersede, so after an interrupted run every committed
-  `superseded` row has its replacement committed.
+  `superseded` row has its replacement committed. This holds only while nobody edits imported rows in
+  the target until the import finishes: a re-run cannot see a replacement that was withdrawn in
+  between, so it reports created rows whose replacement came back `conflict`.
 - **Not imported**: `ephemeral` rows (the only Flair tier with `expiresAt`; the target has no expiry),
   embeddings (the target re-embeds through `@embed`), and Flair bookkeeping fields.
 
