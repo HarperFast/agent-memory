@@ -185,9 +185,10 @@ Mounted at `urlPath` (default `Memory`); hidden from MCP and OpenAPI auto-export
 
 Errors are `{ error, code }` (plus `index` for an import row). Only errors the plugin creates carry
 their own message; anything else is a 500 `internal_error`. Harper's retryable failures — 503 (an index
-rebuilding or lagging, a database closing), 423 (a record lock not granted within 30 s) and 409 (a lock
-lease that lapsed before commit) — become a 503 `unavailable` to retry. Import holds its locks with a
-5-minute lease, since a batch embeds every row inside its transaction.
+rebuilding or lagging, a database closing), 423 (a record lock not granted within 30 s) and the 409 of
+a lock lease that lapsed before commit — become a 503 `unavailable` to retry, with a rate-limited warning
+in the log. Any other 409 from Harper (for example a sink inserting a row that exists) is a 500. Import
+holds its locks with a 5-minute lease, since a batch embeds every row inside its transaction.
 
 ## Search and bootstrap
 

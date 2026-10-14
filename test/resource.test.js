@@ -41,6 +41,24 @@ describe('MemoryResource errors', () => {
 		}
 	});
 
+	it('treats a lapsed lock lease as retryable but any other 409 as a defect', async () => {
+		const Memory = databases.memory.Memory;
+		const put = Memory.put;
+		const create = (key) => request(superUser, 'POST', '/', { idempotencyKey: key, title: 't', content: 'c' });
+		try {
+			Memory.put = async () => {
+				throw Object.assign(new Error('Record lock lease expired'), { statusCode: 409 });
+			};
+			assert.equal((await create('a')).status, 503);
+			Memory.put = async () => {
+				throw Object.assign(new Error('Record already exists'), { statusCode: 409 });
+			};
+			assert.deepEqual(await create('b'), { status: 500, body: { error: 'Internal error', code: 'internal_error' } });
+		} finally {
+			Memory.put = put;
+		}
+	});
+
 	it('hides the text of any other unexpected error behind a 500', async () => {
 		const Memory = databases.memory.Memory;
 		const get = Memory.get;

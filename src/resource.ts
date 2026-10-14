@@ -10,7 +10,16 @@ function json(data: unknown, status = 200): Response {
 	return new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json' } });
 }
 
-const RETRYABLE_STATUS = new Set([409, 423, 503]);
+// Harper's retryable failures: 503 (an index rebuilding or lagging, a database closing), 423 (a record lock not
+// granted in time) and the 409 a lock lease that lapsed before commit raises. Any other 409 (a sink inserting a
+// row that exists) is a defect, not a reason to retry.
+function isRetryable(error: any): boolean {
+	const status = error?.statusCode;
+	return status === 503 || status === 423 || (status === 409 && String(error?.message).startsWith('Record lock'));
+}
+
+const RETRYABLE_WARN_INTERVAL_MS = 60_000;
+let lastRetryableWarning = 0;
 
 function errorResponse(error: unknown, route: string): Response {
 	if (isCallerSafe(error)) {
@@ -18,10 +27,14 @@ function errorResponse(error: unknown, route: string): Response {
 		if (error.index !== undefined) body.index = error.index;
 		return json(body, error.statusCode);
 	}
-	// Harper's 503s (an index rebuilding or lagging, a database closing), 423s (a record lock not granted in
-	// time) and 409s (a lock lease that lapsed before commit) are all retryable; the fixed message keeps their
-	// text, which is not vetted for callers, out of the response.
-	if (RETRYABLE_STATUS.has((error as any)?.statusCode)) {
+	// The fixed message keeps Harper's text, which is not vetted for callers, out of the response; the log keeps
+	// a persistent condition diagnosable without logging every request.
+	if (isRetryable(error)) {
+		const now = Date.now();
+		if (now - lastRetryableWarning >= RETRYABLE_WARN_INTERVAL_MS) {
+			lastRetryableWarning = now;
+			logger.warn?.(`[agent-memory] ${route} answered 503 for a retryable failure`, error);
+		}
 		return json({ error: 'Temporarily unavailable; retry shortly', code: 'unavailable' }, 503);
 	}
 	logger.error?.(`[agent-memory] ${route} failed`, error);
