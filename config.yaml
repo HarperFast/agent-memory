@@ -1,0 +1,11 @@
+# Plugin entry point and defaults. Every option can be overridden under the plugin's key in the
+# host application's config.yaml.
+pluginModule: 'dist/index.js'
+
+graphqlSchema:
+  files: 'schema/*.graphql'
+
+embeddingModel: 'embedder'
+supersession:
+  mode: 'suggest' # suggest | auto
+  similarity: 0.82

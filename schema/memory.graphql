@@ -1,0 +1,43 @@
+# Not @export-ed: every read and write goes through the Memory resource (src/), which is the single
+# enforcement point for ownership and scope rules. See DESIGN.md.
+
+type Memory @table(database: "memory") {
+	id: ID @primaryKey
+	title: String
+	content: String
+	tags: [String] @indexed
+	scopes: [String] @indexed
+	ownerId: String @indexed
+	status: String @indexed # active | superseded | withdrawn
+	revision: Int
+	pinned: Boolean @indexed
+	durability: String
+	supersedes: [ID] @indexed
+	supersededBy: ID @indexed
+	evidence: Any
+	idempotencyKey: String
+	author: Any
+	lastEditor: Any
+	validUntil: Date
+	withdrawnAt: Date
+	withdrawnReason: String
+	embedding: [Float] @embed(source: "content", model: "embedder")
+	text: FullText @fullText(fields: [{ name: "title", weight: 2.0 }, { name: "content" }])
+	createdAt: Date @createdTime
+	updatedAt: Date @updatedTime @indexed
+}
+
+# Keyed "role:<roleName>" or "user:<username>". Patterns are exact labels or "<namespace>:*".
+type ScopeGrant @table(database: "memory") {
+	id: ID @primaryKey
+	read: [String]
+	write: [String]
+	updatedAt: Date @updatedTime
+}
+
+type MemoryWatch @table(database: "memory") {
+	id: ID @primaryKey
+	principalId: String @indexed
+	memoryId: ID @indexed
+	expiresAt: Date @expiresAt
+}
