@@ -1,4 +1,4 @@
-# @harperfast/memory — design
+# @harperfast/agent-memory — design
 
 A Harper plugin that gives an application a shared, permissioned, live memory store for agents and
 people. Any Harper app adds it to `config.yaml`; harper-eye, Dispatch and customer apps consume it

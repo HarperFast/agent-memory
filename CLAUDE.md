@@ -1,6 +1,6 @@
-# harper-memory
+# agent-memory
 
-Harper plugin (`@harperfast/memory`). DESIGN.md is the contract: read it before changing behavior, and
+Harper plugin (`@harperfast/agent-memory`). DESIGN.md is the contract: read it before changing behavior, and
 update it in the same PR when a rule changes. Follow the harper-engineering-guidelines skill and the
 Harper DLC for every PR.
 

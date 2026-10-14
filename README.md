@@ -1,4 +1,4 @@
-# @harperfast/memory
+# @harperfast/agent-memory
 
 Shared, permissioned, live memory for agents and people, as a Harper plugin.
 
@@ -11,6 +11,6 @@ Status: pre-release. Design and contracts: [DESIGN.md](DESIGN.md).
 
 ```yaml
 # host app config.yaml
-'@harperfast/memory':
-  package: '@harperfast/memory'
+'@harperfast/agent-memory':
+  package: '@harperfast/agent-memory'
 ```
