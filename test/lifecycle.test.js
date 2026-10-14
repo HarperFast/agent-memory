@@ -1,5 +1,3 @@
-// Ported from harper-eye's test/memory-lifecycle.test.js and test/v2-memory-atomic-lifecycle.test.js, adapted
-// from capability principals to Harper users with scope grants, plus supersession and restore.
 import { beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { __test, databases, models } from 'harper';
