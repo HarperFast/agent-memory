@@ -80,7 +80,7 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 				{ id: 'user:dave', read: ['customer:*'] },
 			],
 		});
-		// A new table's full-text index builds after boot; until then search answers 503 index_unavailable.
+		// A new table's full-text index builds after boot; until then search answers 503 unavailable.
 		const deadline = Date.now() + 60_000;
 		let ready = await call('admin', 'GET', '?q=warmup');
 		while (ready.status === 503 && Date.now() < deadline) {
@@ -295,6 +295,54 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 		);
 		ok(results.filter((result) => result.status === 409).every((result) => result.body.code === 'revision_conflict'));
 		strictEqual((await call('alice', 'GET', memory.id)).body.memory.revision, 2);
+	});
+
+	test('a supersede racing the withdrawal of an earlier superseder leaves the newest one in charge', async () => {
+		const shared = (key: string, content: string, supersedes?: string[]) =>
+			create('alice', { idempotencyKey: key, title: 'egret', content, visibility: 'shared', supersedes });
+		const target = await shared('egret-t', 'egret roost one');
+		const first = await shared('egret-w', 'egret roost two', [target.id]);
+		// The new superseder embeds slowly, so it holds the target's lock while the withdrawal waits on it.
+		const [replacement, withdrawn] = await Promise.all([
+			call('alice', 'POST', '', {
+				idempotencyKey: 'egret-n',
+				title: 'egret',
+				content: 'egret roost three, embedded slowly',
+				visibility: 'shared',
+				supersedes: [target.id],
+			}),
+			call('alice', 'POST', `${first.id}/withdraw`, { expectedRevision: 1 }),
+		]);
+		strictEqual(replacement.status, 201, JSON.stringify(replacement.body));
+		strictEqual(withdrawn.status, 200, JSON.stringify(withdrawn.body));
+		const after = (await call('alice', 'GET', target.id)).body.memory;
+		strictEqual(after.status, 'superseded');
+		strictEqual(after.supersededBy, replacement.body.memory.id);
+	});
+
+	test('a create superseding both ends of a chain does not deadlock with withdrawing the middle', async () => {
+		const shared = (key: string, content: string, supersedes?: string[]) =>
+			create('alice', { idempotencyKey: key, title: 'plover', content, visibility: 'shared', supersedes });
+		const target = await shared('plover-t', 'plover nest one');
+		const middle = await shared('plover-w', 'plover nest two', [target.id]);
+		const started = Date.now();
+		const results = await Promise.all([
+			call('alice', 'POST', '', {
+				idempotencyKey: 'plover-x',
+				title: 'plover',
+				content: 'plover nest three, embedded slowly',
+				visibility: 'shared',
+				supersedes: [target.id, middle.id],
+			}),
+			call('alice', 'POST', `${middle.id}/withdraw`, { expectedRevision: 1 }),
+		]);
+		ok(Date.now() - started < 10_000, 'both requests finished without waiting out a lock timeout');
+		// Whichever runs second sees the first one's change and is refused with a 409.
+		const [created, withdrawn] = results.map((result) => result.status);
+		ok(
+			(created === 201 && withdrawn === 409) || (created === 409 && withdrawn === 200),
+			JSON.stringify(results.map((result) => result.body)),
+		);
 	});
 
 	test('idempotent create: a retry returns the existing row, a different payload is a conflict', async () => {

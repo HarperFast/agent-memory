@@ -213,12 +213,14 @@ export function ensureEmbedder(Memory: any, settings: Settings): void {
 }
 
 /**
- * Serializes read-check-write against every other lifecycle operation on the same rows. Harper's record lock
- * excludes other lock() callers, and this plugin is the only writer of Memory. Sorted to keep a consistent
- * acquisition order across operations that lock several rows.
+ * Serializes read-check-write against every other lifecycle operation on the same rows: Harper's record lock
+ * excludes other lock() callers, and this plugin is the only writer of Memory. Sorted so operations that lock
+ * several rows acquire them in one global order. Node scope, because a cluster-scoped lock on a replicated
+ * database fails closed unless the cluster has opted into replicated record locks; across nodes, concurrent
+ * revisions are therefore not serialized (replication keeps the later write).
  */
 export async function lockRows(Memory: any, ids: Iterable<string>, context: object): Promise<void> {
-	for (const id of [...new Set(ids)].sort()) await Memory.lock(id, {}, context);
+	for (const id of [...new Set(ids)].sort()) await Memory.lock(id, { scope: 'node' }, context);
 }
 
 /**

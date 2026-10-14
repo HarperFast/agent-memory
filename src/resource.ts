@@ -18,10 +18,10 @@ function errorResponse(error: unknown, route: string): Response {
 		if (error.index !== undefined) body.index = error.index;
 		return json(body, error.statusCode);
 	}
-	// Harper's 503s (a derived index rebuilding or lagging) are retryable; the fixed message keeps their text,
-	// which is not vetted for callers, out of the response.
+	// Harper's 503s (an index rebuilding or lagging, a lock or database briefly unavailable) are retryable; the
+	// fixed message keeps their text, which is not vetted for callers, out of the response.
 	if ((error as any)?.statusCode === 503) {
-		return json({ error: 'Search index is unavailable; retry shortly', code: 'index_unavailable' }, 503);
+		return json({ error: 'Temporarily unavailable; retry shortly', code: 'unavailable' }, 503);
 	}
 	logger.error?.(`[agent-memory] ${route} failed`, error);
 	return json({ error: 'Internal error', code: 'internal_error' }, 500);

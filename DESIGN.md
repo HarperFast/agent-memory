@@ -129,10 +129,14 @@ prefix is reserved for import, so a native create cannot land on an imported row
 
 Every lifecycle operation runs in a transaction of its own (not the request's, which would commit
 whatever was staged before an error the resource turns into a response) and takes Harper's record
-lock (`Memory.lock`) on every row it will change, in sorted id order, before reading it. The plugin is
-the only writer of `Memory`, so a read-check-write is serialized: of N concurrent revisions at the
-same expected revision exactly one succeeds. Any status change, including supersede and restore,
-bumps the affected row's `revision`.
+lock (`Memory.lock`) on every row it will change, in sorted id order, before reading it. A withdrawal
+plans its lock set from the memory's `supersedes`, which never changes after create. The plugin is the
+only writer of `Memory`, so on one node a read-check-write is serialized: of N concurrent revisions at
+the same expected revision exactly one succeeds. The locks are node-scoped, because a cluster-scoped
+lock on a replicated database fails closed unless the cluster has opted into replicated record locks
+(`replication.recordLocks`); across nodes, two revisions at the same expected revision can both
+succeed and replication keeps the later write — the limit harper-eye documented for expected
+revisions. Any status change, including supersede and restore, bumps the affected row's `revision`.
 
 ### Supersession
 
@@ -179,7 +183,7 @@ Mounted at `urlPath` (default `Memory`); hidden from MCP and OpenAPI auto-export
 
 Errors are `{ error, code }` (plus `index` for an import row). Only errors the plugin creates carry
 their own message; anything else is a 500 `internal_error`, and a Harper 503 (an index rebuilding or
-lagging) is a 503 `index_unavailable` to retry.
+lagging, a lock or database briefly unavailable) is a 503 `unavailable` to retry.
 
 ## Search and bootstrap
 
@@ -192,7 +196,9 @@ lagging) is a 503 `index_unavailable` to retry.
 - **Searchable at commit**: both indexes are Harper derived indexes maintained after commit (`audit:
 true` puts `@embed`'s HNSW index on the native plane). Each lane passes `waitForIndexMilliseconds`,
   so a search covers every write committed before it began; an index that is already current does not
-  wait, otherwise a search waits about one index flush (~1 s).
+  wait, otherwise a search waits about one index flush (~1 s). A long-open write transaction (a large
+  import embedding its rows) holds back index coverage for everyone, so a search during one can wait
+  the full 5 s and return 503 `unavailable`.
 - **One vector space**: each row records the `embeddingModel` that embedded it, and the vector lane
   only compares rows of the configured model. Changing `embeddingModel` does not re-embed existing
   rows; they stay reachable through full-text until revised. A model whose dimensions differ from the

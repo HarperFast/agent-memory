@@ -48,8 +48,15 @@ async function resolveHarperUser(context: any): Promise<PrincipalResolution | un
 	};
 }
 
+// Grants are compiled on every request; warn once per pattern rather than once per request.
+const warnedPatterns = new Set<string>();
+const MAX_WARNED_PATTERNS = 1000;
+
 function warnRejectedPattern(pattern: unknown): void {
-	logger.warn?.(`[agent-memory] ignoring invalid scope grant pattern ${JSON.stringify(pattern)}`);
+	const key = JSON.stringify(pattern);
+	if (warnedPatterns.has(key) || warnedPatterns.size >= MAX_WARNED_PATTERNS) return;
+	warnedPatterns.add(key);
+	logger.warn?.(`[agent-memory] ignoring invalid scope grant pattern ${key}`);
 }
 
 export async function resolvePrincipal(context: any): Promise<Principal> {
