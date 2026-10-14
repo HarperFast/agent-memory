@@ -131,6 +131,31 @@ describe('searchMemories', () => {
 		assert.ok(hits.every((hit) => typeof hit.score === 'number' && hit.embedding === undefined));
 	});
 
+	it('serves full-text results when the configured model no longer matches the stored vectors', async () => {
+		const stored = await create(alice, 'disk gamma', { content: 'disk pressure on gamma' });
+		applySettings(parseSettings({ embeddingModel: 'wide' }));
+		const hits = await searchMemories(params('q=disk'), alice, context);
+		assert.deepEqual(
+			hits.map((hit) => hit.id),
+			[stored.id],
+		);
+	});
+
+	it('still fails a search when the vector lane fails for any other reason', async () => {
+		await create(alice, 'disk delta', { content: 'disk pressure on delta' });
+		const Memory = (await import('harper')).databases.memory.Memory;
+		const search = Memory.search;
+		Memory.search = function (query, ctx) {
+			if (query.sort?.target) throw Object.assign(new Error('backend down'), { statusCode: 503 });
+			return search.call(this, query, ctx);
+		};
+		try {
+			await assert.rejects(searchMemories(params('q=disk'), alice, context), /backend down/);
+		} finally {
+			Memory.search = search;
+		}
+	});
+
 	it('lists by recency when there is no query', async () => {
 		const first = await create(alice, 'first');
 		const second = await create(alice, 'second');

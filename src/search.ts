@@ -101,6 +101,17 @@ function filterConditions(params: SearchParams, principal: Principal): Condition
 	return conditions;
 }
 
+const rejectedModels = new Set<string>();
+
+function reportVectorLaneRejected(model: string, error: Error): void {
+	if (rejectedModels.has(model)) return;
+	rejectedModels.add(model);
+	logger.error?.(
+		`[agent-memory] vector search rejected for embeddingModel "${model}"; serving full-text results only`,
+		error,
+	);
+}
+
 async function collect(iterable: AsyncIterable<any>): Promise<any[]> {
 	const records = [];
 	for await (const record of iterable) records.push(record);
@@ -145,7 +156,7 @@ export async function searchMemories(params: SearchParams, principal: Principal,
 	}
 	const laneLimit = Math.min(params.limit * 2, 100);
 	const [vector] = await models.embed(params.q, { model: embeddingModel, inputType: 'query' });
-	const [vectorHits, textHits] = await Promise.all([
+	const vectorLane = async () =>
 		collect(
 			Memory.search(
 				{
@@ -157,7 +168,15 @@ export async function searchMemories(params: SearchParams, principal: Principal,
 				},
 				context,
 			),
-		),
+		);
+	const [vectorHits, textHits] = await Promise.all([
+		vectorLane().catch((error) => {
+			// Harper rejects a query vector whose size differs from the index's as a client error; that means the
+			// configured model no longer matches the stored vectors, and full-text results are still good.
+			if (error?.statusCode !== 400) throw error;
+			reportVectorLaneRejected(embeddingModel, error);
+			return [];
+		}),
 		collect(
 			Memory.search(
 				{

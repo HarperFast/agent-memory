@@ -111,6 +111,7 @@ describe('importMemories', () => {
 			[row(2, { id: 'f'.repeat(32) }), 'import_id_mismatch'],
 			[row(2, { idempotencyKey: 'flair:2' }), 'invalid_idempotencyKey'],
 			[row(2, { ownerId: 'has space' }), 'invalid_principal_id'],
+			[row(2, { ownerId: undefined }), 'ownerId_required'],
 			[row(2, { scopes: ['customer:*'] }), 'invalid_scopes'],
 			[row(2, { status: 'superseded' }), 'invalid_supersededBy'],
 			[row(2, { supersededBy: idOf(1) }), 'invalid_supersededBy'],

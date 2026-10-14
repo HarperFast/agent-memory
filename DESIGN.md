@@ -203,9 +203,9 @@ true` puts `@embed`'s HNSW index on the native plane). Each lane passes `waitFor
   only compares rows of the configured model. Changing `embeddingModel` does not re-embed existing
   rows; they stay reachable through full-text until revised. A model whose dimensions differ from the
   indexed vectors is not supported yet: Harper's HNSW plane fixes its dimensions at the first vector,
-  skips (and logs) vectors of another size, and rejects a query vector of another size, so search
-  fails until the model is reverted. Switching dimensions needs a re-embedding migration, which v0
-  does not provide.
+  skips (and logs) vectors of another size, and rejects a query vector of another size. Search then
+  serves the full-text lane alone and logs the rejection once per model. Switching dimensions needs a
+  re-embedding migration, which v0 does not provide.
 - `GET /Memory/bootstrap?q=&budget=` — pinned memories, then the caller's recent memories, then
   memories relevant to `q`, deduplicated and packed into a character budget (title + content; default
   8000). A memory that does not fit is skipped rather than ending the pack. Used at session start.
@@ -245,8 +245,9 @@ Three levels, built in order (none in the v0 core):
   `limits.{contentChars, titleChars}` (default 20000 / 200), and, once implemented,
   `supersession.{mode, similarity, judge}`. The schema's `@embed` names `default`; for any other
   `embeddingModel` the plugin installs a per-table embedder (`setEmbedAttribute`) that embeds with the
-  model recorded on the row. A changed option is validated before it applies; an invalid change is
-  logged and the previous configuration keeps serving. Changing `urlPath` mounts the new path and
+  model recorded on the row. A changed option is checked for well-formedness before it applies; a
+  malformed change is logged and the previous configuration keeps serving (model compatibility is not
+  checked — see "One vector space"). Changing `urlPath` mounts the new path and
   removes the old one if the plugin still owns it.
 
 ## Import

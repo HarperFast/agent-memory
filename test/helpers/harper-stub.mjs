@@ -114,6 +114,11 @@ class StubTable {
 		);
 		const sort = query.sort;
 		if (sort?.target) {
+			// Harper checks the target against the index's dimensions, whatever the conditions select.
+			const stored = [...this.#rows(context).values()].find((record) => Array.isArray(record[sort.attribute]));
+			if (stored && stored[sort.attribute].length !== sort.target.length) {
+				throw Object.assign(new Error('stub: query vector size differs from the index'), { statusCode: 400 });
+			}
 			results = results
 				.filter((record) => Array.isArray(record[sort.attribute]))
 				.map((record) => ({ ...record, $distance: cosineDistance(record[sort.attribute], sort.target) }))
@@ -162,7 +167,8 @@ export const models = {
 	calls: [],
 	async embed(input, options) {
 		this.calls.push({ input, options });
-		return (Array.isArray(input) ? input : [input]).map((text) => Float32Array.from(embedText(text)));
+		const dimensions = options?.model === 'wide' ? 64 : 32;
+		return (Array.isArray(input) ? input : [input]).map((text) => Float32Array.from(embedText(text, dimensions)));
 	},
 };
 

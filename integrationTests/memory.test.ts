@@ -409,11 +409,19 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 		});
 		const recent = await create('bob', { idempotencyKey: 'recent', title: 'recent', content: 'bob was here' });
 		const large = await create('bob', { idempotencyKey: 'large', title: 'large', content: 'x'.repeat(500) });
-		const response = await call('bob', 'GET', 'bootstrap?budget=200');
+		const relevant = await create('alice', {
+			idempotencyKey: 'puffin',
+			title: 'puffin',
+			content: 'puffin colony',
+			visibility: 'shared',
+		});
+		const response = await call('bob', 'GET', 'bootstrap?q=puffin&budget=200');
 		strictEqual(response.status, 200, JSON.stringify(response.body));
 		const sections = response.body.memories.map((memory: any) => [memory.id, memory.section]);
 		ok(sections.findIndex(([id]: any) => id === pinned.id) < sections.findIndex(([id]: any) => id === recent.id));
+		ok(sections.some(([id, section]: any) => id === relevant.id && section === 'relevant'));
 		ok(!sections.some(([id]: any) => id === large.id), 'a memory larger than the remaining budget is skipped');
+		ok(response.body.memories.every((memory: any) => !('score' in memory)));
 		ok(response.body.used <= 200);
 	});
 

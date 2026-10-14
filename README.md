@@ -5,7 +5,7 @@ Shared, permissioned, live memory for agents and people, as a Harper plugin.
 - Scoped visibility (`global`, `user:<id>`, `customer:<id>`, `team:<id>`) with grants on Harper users and roles
 - Hybrid search (vector + full-text, reciprocal rank fusion) that covers a memory as soon as its write commits
 - First-class supersession: replacing a memory hides the old one from default search, and withdrawing the replacement restores it
-- Atomic extension points for apps that mirror memories elsewhere (`registerMemorySink`, `setPrincipalResolver`)
+- Extension points: `registerMemorySink` runs inside the lifecycle transaction for apps that mirror memories elsewhere, `setPrincipalResolver` maps app-defined identities
 
 Status: pre-release (v0 core). Write-time supersession candidates and live updates are designed but not yet
 built. Design and contracts: [DESIGN.md](DESIGN.md).
@@ -77,14 +77,16 @@ rows with preserved owners and timestamps (`super_user` only); see [DESIGN.md](D
 ```js
 import { registerMemorySink, setPrincipalResolver } from '@harperfast/agent-memory';
 
-// Runs inside the lifecycle transaction: write Harper tables through `context` and they commit or roll
-// back with the memory. Throwing aborts the operation.
+// Runs inside the lifecycle transaction. Writes through `context` to a table declared in the `memory`
+// database (`@table(database: "memory")`) commit or roll back with the memory; a table in another database
+// commits separately and can lose a row on a crash. Throwing aborts the operation.
+const outbox = databases.memory.MemoryOutbox;
 registerMemorySink({
 	async write(memory, context) {
-		await tables.MemoryOutbox.put({ id: memory.id, revision: memory.revision }, context);
+		await outbox.put({ id: `${memory.id}:${memory.revision}`, memoryId: memory.id }, context);
 	},
 	async withdraw(memory, context) {
-		await tables.MemoryOutbox.put({ id: memory.id, withdrawn: true }, context);
+		await outbox.put({ id: `${memory.id}:${memory.revision}`, memoryId: memory.id, withdrawn: true }, context);
 	},
 });
 

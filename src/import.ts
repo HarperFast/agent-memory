@@ -62,6 +62,7 @@ function validateRow(input: unknown, index: number) {
 	try {
 		const row = rejectUnknownFields(input, ROW_FIELDS, 'import row');
 		const settings = getSettings();
+		if (typeof row.ownerId !== 'string' || !row.ownerId) throw badRequest('ownerId is required', 'ownerId_required');
 		const ownerId = requirePrincipalId(row.ownerId);
 		const idempotencyKey = boundedText(row.idempotencyKey, 'idempotencyKey', IDEMPOTENCY_KEY_MAX_CHARS, true)!;
 		if (!idempotencyKey.startsWith(IMPORT_KEY_PREFIX)) {
