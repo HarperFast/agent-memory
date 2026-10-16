@@ -24,8 +24,8 @@ async function readBody(data: unknown): Promise<unknown> {
 
 // Harper's retryable failures: 503 (an index rebuilding or lagging, a database closing), 423 (a record lock not
 // granted in time), the 409 a lock lease that lapsed before commit raises, and transient embedding backend
-// failures (429, 5xx, timeout) wrapped by Harper's embedHook. Any other 409 (a sink inserting a row that
-// exists) is a defect, not a reason to retry.
+// failures (429, 5xx, timeout, connection failure) wrapped by Harper's embedHook. Any other 409 (a sink
+// inserting a row that exists) is a defect, not a reason to retry.
 function isRetryable(error: any): boolean {
 	const status = error?.statusCode;
 	const message = String(error?.message ?? '');
@@ -33,7 +33,7 @@ function isRetryable(error: any): boolean {
 	const upstream = error?.upstreamStatus ?? error?.cause?.upstreamStatus ?? error?.cause?.status;
 	if (upstream === 429 || (typeof upstream === 'number' && upstream >= 500 && upstream <= 599)) return true;
 	if (error?.name === 'AbortError' || error?.name === 'TimeoutError') return true;
-	return /^Failed to compute embedding for attribute "embedding"(?: \[(?:AbortError|TimeoutError)\]|.*\(backend HTTP (?:429|5\d\d)\))/.test(
+	return /^Failed to compute embedding for attribute "embedding"(?: \[(?:AbortError|TimeoutError|TypeError)\]|.*\(backend HTTP (?:429|5\d\d)\))/.test(
 		message,
 	);
 }

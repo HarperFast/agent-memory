@@ -128,7 +128,7 @@ export function createPrincipal(input: PrincipalInput, onRejectedPattern?: (patt
 	});
 }
 
-/** Rule 1 of DESIGN.md. A withdrawn memory stays readable by its owner so it can be inspected and re-created. */
+/** Rule 1 of DESIGN.md. Withdrawn memories stay readable to their owner so the tombstone can be inspected; everyone else sees them as gone. */
 export function canRead(record: ScopedRecord, principal: Principal): boolean {
 	if (principal.superUser || record.ownerId === principal.id) return true;
 	if (record.status === 'withdrawn') return false;

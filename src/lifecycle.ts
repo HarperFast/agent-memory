@@ -614,50 +614,70 @@ export async function withdrawMemory(
 	const ifMatch = getHeader(requestContext, 'if-match');
 	const Memory = memoryTable();
 	// A withdrawal also changes the memories it superseded. `supersedes` never changes after create, so a
-	// pre-transaction read plans the lock set and lockRows is the first operation inside the transaction.
+	// pre-transaction read plans the lock set and lockRows is the first operation inside the transaction. If the
+	// row was created with `supersedes` between that pre-read and lockRows, abort and retry once with the observed
+	// `supersedes` list so every superseded target is locked before `reconcileSuperseded` runs.
 	const planned = await Memory.get(id, requestContext);
+	let plannedSupersedes: string[] = planned?.supersedes ?? [];
+	let retrySupersedes: string[] | undefined;
+	const retryLockPlan = Symbol('retryLockPlan');
 
-	return inOwnTransaction(requestContext, async (txn) => {
-		await lockRows(Memory, [id, ...(planned?.supersedes ?? [])], txn);
-		const existing = await Memory.get(id, txn);
-		if (!existing) throw notFound();
-		// A caller that cannot read the memory gets the same 404 as a missing one, so a write attempt does not
-		// confirm another principal's memory exists. One that can read it gets an informative 403.
-		if (existing.ownerId !== principal.id && !principal.superUser) {
-			if (!canRead(existing, principal)) throw notFound();
-			throw memoryError('Only the owner can modify this memory', 403, 'not_memory_owner');
-		}
-		if (ifMatch === undefined) {
-			throw memoryError('If-Match header is required to withdraw a memory', 428, 'if_match_required');
-		}
-		if (existing.status === STATUS_WITHDRAWN) {
-			throw memoryError('Memory has been withdrawn', 409, 'memory_withdrawn');
-		}
-		if (!matchesIfMatch(ifMatch, existing.revision)) {
-			throw memoryError(
-				`Stale write: If-Match ${ifMatch} does not match current revision ${existing.revision}`,
-				412,
-				'precondition_failed',
-			);
-		}
+	const runAttempt = () =>
+		inOwnTransaction(requestContext, async (txn) => {
+			await lockRows(Memory, [id, ...plannedSupersedes], txn);
+			const existing = await Memory.get(id, txn);
+			if (!existing) throw notFound();
+			if ((existing.supersedes ?? []).some((targetId: string) => !plannedSupersedes.includes(targetId))) {
+				retrySupersedes = existing.supersedes;
+				throw retryLockPlan;
+			}
+			// A caller that cannot read the memory gets the same 404 as a missing one, so a write attempt does not
+			// confirm another principal's memory exists. One that can read it gets an informative 403.
+			if (existing.ownerId !== principal.id && !principal.superUser) {
+				if (!canRead(existing, principal)) throw notFound();
+				throw memoryError('Only the owner can modify this memory', 403, 'not_memory_owner');
+			}
+			if (ifMatch === undefined) {
+				throw memoryError('If-Match header is required to withdraw a memory', 428, 'if_match_required');
+			}
+			if (existing.status === STATUS_WITHDRAWN) {
+				throw memoryError('Memory has been withdrawn', 409, 'memory_withdrawn');
+			}
+			if (!matchesIfMatch(ifMatch, existing.revision)) {
+				throw memoryError(
+					`Stale write: If-Match ${ifMatch} does not match current revision ${existing.revision}`,
+					412,
+					'precondition_failed',
+				);
+			}
 
-		// Withdrawal is exempt from assertWritable — locking an owner out of retracting would be worse.
-		const changes = {
-			status: STATUS_WITHDRAWN,
-			withdrawnAt: new Date(),
-			withdrawnReason: reason ?? null,
-			revision: existing.revision + 1,
-		};
-		const restored = await reconcileSuperseded(Memory, existing, txn);
-		// patch, not put: a put would echo @updatedTime back as a caller-supplied value.
-		await Memory.patch(existing.id, changes, txn);
-		const memory = toMemoryView(await Memory.get(existing.id, txn));
-		if (hasSinks()) {
-			await notifySinks('withdraw', memory, txn);
-			for (const targetId of restored) await notifySinks('write', toMemoryView(await Memory.get(targetId, txn)), txn);
-		}
-		return memory;
-	});
+			// Withdrawal is exempt from assertWritable — locking an owner out of retracting would be worse.
+			const changes = {
+				status: STATUS_WITHDRAWN,
+				withdrawnAt: new Date(),
+				withdrawnReason: reason ?? null,
+				revision: existing.revision + 1,
+			};
+			const restored = await reconcileSuperseded(Memory, existing, txn);
+			// patch, not put: a put would echo @updatedTime back as a caller-supplied value.
+			await Memory.patch(existing.id, changes, txn);
+			const memory = toMemoryView(await Memory.get(existing.id, txn));
+			if (hasSinks()) {
+				await notifySinks('withdraw', memory, txn);
+				for (const targetId of restored) {
+					await notifySinks('write', toMemoryView(await Memory.get(targetId, txn)), txn);
+				}
+			}
+			return memory;
+		});
+
+	try {
+		return await runAttempt();
+	} catch (error) {
+		if (error !== retryLockPlan) throw error;
+		plannedSupersedes = retrySupersedes ?? [];
+		return await runAttempt();
+	}
 }
 
 export async function pinMemory(id: unknown, input: unknown = {}, principal: Principal, requestContext: object = {}) {
@@ -723,9 +743,10 @@ export async function unpinMemory(id: unknown, input: unknown = {}, principal: P
 	const pinId = memoryPinIdFor(principal.id, id);
 	return inOwnTransaction(requestContext, async (txn) => {
 		await lockRows(MemoryPin, [principal.id, pinId], txn);
-		const record = await Memory.get(id, txn);
-		if (!record || !canRead(record, principal)) throw notFound();
 		await MemoryPin.delete(pinId, txn);
+		const record = await Memory.get(id, txn);
+		// Missing and unreadable both omit `memory`, so unpinning a descoped pin works without probing existence.
+		if (!record || !canRead(record, principal)) return { pinned: false, memoryId: id };
 		return { pinned: false, memoryId: id, memory: toMemoryView(record) };
 	});
 }

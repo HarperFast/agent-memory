@@ -124,7 +124,7 @@ describe('MEMORY_RESOURCES static surface', () => {
 		assert.equal(imported.status, 200);
 		assert.equal(imported.body.results[0].result, 'created');
 
-		// Removed POST routes must return 404/405.
+		// Unsupported POST routes must return 404/405.
 		assert.equal((await parse(await MemoryResource.post(queryTarget('', { rest: '' }), {}, context))).status, 405);
 		for (const removedAction of ['revise', 'scopes', 'withdraw', 'explode']) {
 			assert.equal(
@@ -203,6 +203,12 @@ describe('MemoryResource errors', () => {
 				);
 			};
 			assert.equal((await create('mem-embed-time-id')).status, 503);
+			Memory.put = async () => {
+				throw new Error(
+					'Failed to compute embedding for attribute "embedding" [TypeError] — see server log for details',
+				);
+			};
+			assert.equal((await create('mem-embed-conn-id')).status, 503);
 			Memory.put = async () => {
 				throw new Error(
 					'Failed to compute embedding for attribute "embedding" [Error] (backend HTTP 400) — see server log for details',

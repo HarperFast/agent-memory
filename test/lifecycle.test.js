@@ -479,7 +479,7 @@ describe('supersede', () => {
 describe('supersede bookkeeping at scale and under contention', () => {
 	const shared = (overrides = {}) => validInput({ visibility: 'shared', ...overrides });
 
-	it('takes every lock a withdrawal needs once, in sorted order', async () => {
+	it('takes every lock a withdrawal needs once, in sorted order, and retries if supersedes appeared after pre-read', async () => {
 		const old = (await putMemory(idFor('t'), shared(), alice, context)).memory;
 		const next = (await putMemory(idFor('n'), shared({ supersedes: [old.id] }), alice, context)).memory;
 		__test.lockLog.length = 0;
@@ -487,6 +487,29 @@ describe('supersede bookkeeping at scale and under contention', () => {
 		assert.deepEqual(
 			__test.lockLog.map((entry) => entry.id),
 			[old.id, next.id].sort(),
+		);
+
+		const old2 = (await putMemory(idFor('t2'), shared(), alice, context)).memory;
+		const next2 = (await putMemory(idFor('n2'), shared({ supersedes: [old2.id] }), alice, context)).memory;
+		const Memory = databases.memory.Memory;
+		const originalGet = Memory.get.bind(Memory);
+		let preRead = true;
+		Memory.get = async (id, ctx) => {
+			if (preRead && id === next2.id && !ctx?.transaction) {
+				preRead = false;
+				return undefined;
+			}
+			return originalGet(id, ctx);
+		};
+		__test.lockLog.length = 0;
+		try {
+			await withdrawMemory(next2.id, {}, alice, ifMatch(1));
+		} finally {
+			Memory.get = originalGet;
+		}
+		assert.deepEqual(
+			__test.lockLog.map((entry) => entry.id),
+			[next2.id, ...[old2.id, next2.id].sort()],
 		);
 	});
 
@@ -730,7 +753,7 @@ describe('pin and unpin', () => {
 		assert.equal(again.pinned, false);
 	});
 
-	it('returns the same 404 for an unreadable memory as for a missing id on pin and unpin', async () => {
+	it('returns the same 404 on pin and the same memory-less response on unpin for unreadable and missing ids, and unpins descoped pins', async () => {
 		const secret = (await putMemory(idFor('secret'), validInput(), alice, context)).memory;
 		const missingId = '0'.repeat(32);
 
@@ -738,10 +761,19 @@ describe('pin and unpin', () => {
 		const pinMissing = await rejection(pinMemory(missingId, {}, bob, context), 404, 'memory_not_found');
 		assert.equal(pinHidden.message, pinMissing.message);
 
-		const unpinHidden = await rejection(unpinMemory(secret.id, {}, bob, context), 404, 'memory_not_found');
-		const unpinMissing = await rejection(unpinMemory(missingId, {}, bob, context), 404, 'memory_not_found');
-		assert.equal(unpinHidden.message, unpinMissing.message);
+		const unpinHidden = await unpinMemory(secret.id, {}, bob, context);
+		const unpinMissing = await unpinMemory(missingId, {}, bob, context);
+		assert.deepEqual(unpinHidden, { pinned: false, memoryId: secret.id });
+		assert.deepEqual(unpinMissing, { pinned: false, memoryId: missingId });
 		assert.equal(pinRows().size, 0);
+
+		const shared = (await putMemory(idFor('shared'), validInput({ visibility: 'shared' }), alice, context)).memory;
+		await pinMemory(shared.id, {}, bob, context);
+		assert.equal(pinRows().has(`bob:${shared.id}`), true);
+		await putMemory(shared.id, validInput({ visibility: 'private' }), alice, ifMatch(1));
+		const unpinnedDescoped = await unpinMemory(shared.id, {}, bob, context);
+		assert.deepEqual(unpinnedDescoped, { pinned: false, memoryId: shared.id });
+		assert.equal(pinRows().has(`bob:${shared.id}`), false);
 	});
 
 	it('rejects unknown fields in pin and unpin payloads', async () => {

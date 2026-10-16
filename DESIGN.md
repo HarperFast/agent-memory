@@ -107,7 +107,8 @@ Rules:
 
 1. **Read**: `scopes ∩ readable(caller) ≠ ∅`, or the caller is the owner. A withdrawn memory is
    readable by its owner and `super_user` only. A memory the caller cannot read is indistinguishable
-   from one that does not exist (same 404 body) on `GET`, `DELETE`, pins and `supersedes` references;
+   from one that does not exist (same 404 body on `GET`, `DELETE`, `pin` and `supersedes` references,
+   and `{ pinned: false, memoryId }` with no `memory` field on `unpin`);
    on `PUT /Memory/<id>`, an existing unreadable id returns `409 id_unavailable` (see Identity).
 2. **Write scopes**: creating or revising with scopes `S` requires every label of `S` to be writable by
    the caller — the resulting scopes, so revising a memory that stays `global` needs `global` write.
@@ -126,13 +127,13 @@ Rules:
 
 ## Lifecycle
 
-| Operation           | Effect                                                                                                                                                                                                                                                                                |
-| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| create (`PUT`)      | client chooses `id` (`^[A-Za-z0-9_-]{16,64}$`); absent id creates at `revision: 1` and returns `201 { id, revision }`; `If-None-Match: *` makes `PUT` create-only (`412` if the id exists); an identical retry returns `200 { id, revision }`                                         |
-| revise (`PUT`)      | `PUT /Memory/<id>` on an owned memory whose editable fields (`title`, `content`, `tags`, `scopes`, `evidence`, `validUntil`) differ from the stored ones requires `If-Match: "<revision>"` (or `*`; missing → 428, stale → 412), bumps `revision`, and returns `200 { id, revision }` |
-| supersede           | create a memory via `PUT /Memory/<id>` with `supersedes: [ids]` (`supersedes` on a revise is 400 `supersedes_not_allowed`)                                                                                                                                                            |
-| withdraw (`DELETE`) | `DELETE /Memory/<id>?reason=` requires `If-Match: "<revision>"` (or `*`; missing → 428, stale → 412); sets `status = withdrawn`, keeps the row as a tombstone, never deletes it                                                                                                       |
-| pin / unpin         | records or deletes the caller's `MemoryPin` row (`<principalId>:<memoryId>`, up to 50 pins per principal; withdrawn pins are pruned on pin, 409 `pin_limit_exceeded` past 50); requires read access (same 404 when missing or unreadable)                                             |
+| Operation           | Effect                                                                                                                                                                                                                                                                                                                                  |
+| ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| create (`PUT`)      | client chooses `id` (`^[A-Za-z0-9_-]{16,64}$`); absent id creates at `revision: 1` and returns `201 { id, revision }`; `If-None-Match: *` makes `PUT` create-only (`412` if the id exists); an identical retry returns `200 { id, revision }`                                                                                           |
+| revise (`PUT`)      | `PUT /Memory/<id>` on an owned memory whose editable fields (`title`, `content`, `tags`, `scopes`, `evidence`, `validUntil`) differ from the stored ones requires `If-Match: "<revision>"` (or `*`; missing → 428, stale → 412), bumps `revision`, and returns `200 { id, revision }`                                                   |
+| supersede           | create a memory via `PUT /Memory/<id>` with `supersedes: [ids]` (`supersedes` on a revise is 400 `supersedes_not_allowed`)                                                                                                                                                                                                              |
+| withdraw (`DELETE`) | `DELETE /Memory/<id>?reason=` requires `If-Match: "<revision>"` (or `*`; missing → 428, stale → 412); sets `status = withdrawn`, keeps the row as a tombstone, never deletes it                                                                                                                                                         |
+| pin / unpin         | records or deletes the caller's `MemoryPin` row (`<principalId>:<memoryId>`, up to 50 pins per principal; withdrawn pins are pruned on pin, 409 `pin_limit_exceeded` past 50); `pin` requires read access (same 404 when missing or unreadable), while `unpin` always deletes the caller's pin and includes `memory` only when readable |
 
 `status` is `active | superseded | withdrawn`. Search returns `active` by default. Owners share one id
 namespace: `PUT /Memory/<id>` to an existing id owned by another principal returns `403
@@ -148,7 +149,7 @@ cannot probe existence), and their ids are stored deduplicated on `evidenceMemor
 Every lifecycle operation runs in a transaction of its own (not the request's, which would commit
 whatever was staged before an error the resource turns into a response) and takes Harper's record
 lock (`Memory.lock`) on every row it will change, in sorted id order, before reading it. A withdrawal
-plans its lock set from a pre-transaction read of the memory's `supersedes`, which never changes after create. The plugin is the
+plans its lock set from a pre-transaction read of the memory's `supersedes` (which never changes after create) and retries once if `supersedes` was populated between that read and lock acquisition. The plugin is the
 only writer of `Memory`, so on one node a read-check-write is serialized: of N concurrent revisions at
 the same `If-Match` revision exactly one succeeds. The locks are node-scoped, because a cluster-scoped
 lock on a replicated database fails closed unless the cluster has opted into replicated record locks
@@ -205,8 +206,9 @@ Mounted at `urlPath` (default `Memory`); hidden from MCP and OpenAPI auto-export
 
 Errors are `{ error, code }` (plus `index` for an import row). Only errors the plugin creates carry
 their own message; anything else is a 500 `internal_error`. Harper's retryable failures — 503 (an index
-rebuilding or lagging, a database closing), 423 (a record lock not granted within 30 s) and the 409 of
-a lock lease that lapsed before commit — become a 503 `unavailable` to retry, with a rate-limited warning
+rebuilding or lagging, a database closing), 423 (a record lock not granted within 30 s), the 409 of
+a lock lease that lapsed before commit, and transient embedding backend failures (429, 5xx, timeout,
+connection failure) on writes — become a 503 `unavailable` to retry, with a rate-limited warning
 in the log. Any other 409 from Harper (for example a sink inserting a row that exists) is a 500. Import
 holds its locks with a 5-minute lease, since a batch embeds every row inside its transaction.
 
@@ -214,7 +216,8 @@ holds its locks with a 5-minute lease, since a batch embeds every row inside its
 
 - `GET /Memory/?q=&tag=&scope=&limit=&includeSuperseded=&includeExpired=` — hybrid: HNSW over
   `embedding` (query embedded with the same model) and the `@fullText` index, fused with reciprocal
-  rank fusion (k = 60, `2 × limit` per lane). Both lanes carry the status, expiry (`validUntil` null
+  rank fusion (k = 60, `2 × limit` per lane). If embedding the query string fails, search and bootstrap
+  fall back to the full-text lane and log a rate-limited warning. Both lanes carry the status, expiry (`validUntil` null
   or `> now` unless `includeExpired=true`) and readable-scope conditions. `scope=` narrows within the
   readable set; it never widens it. Results include `supersededBy` when `includeSuperseded` is set;
   withdrawn memories never appear. The vector lane has no distance cutoff, so it contributes the
@@ -232,7 +235,7 @@ true` puts `@embed`'s HNSW index on the native plane). Each lane passes `waitFor
   rows; they stay reachable through full-text until revised. A model whose dimensions differ from the
   indexed vectors is not supported yet: Harper's HNSW plane fixes its dimensions at the first vector,
   skips (and logs) vectors of another size, and rejects a query vector of another size. Search then
-  serves the full-text lane alone and logs the rejection once per model. Switching dimensions needs a
+  serves the full-text lane alone and logs the rejection once per mismatch episode for that model. Switching dimensions needs a
   re-embedding migration, which v0 does not provide.
 - `GET /Memory/bootstrap?q=&budget=` — the caller's pinned memories (up to 50 `MemoryPin` rows for
   `principal.id`, newest pin first, whose target memory is active, unexpired and readable by the caller), then the caller's recent
