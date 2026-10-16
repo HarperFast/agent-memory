@@ -289,7 +289,7 @@ rebuilding or lagging, a database closing), 423 (a record lock not granted withi
 a lock lease that lapsed before commit, and transient embedding backend failures (429, 5xx, timeout,
 connection failure) on writes — become a 503 `unavailable` to retry, with a rate-limited warning
 in the log. Any other 409 from Harper (for example a sink inserting a row that exists) is a 500. Import
-embeds the rows it will create in one call before its transaction, and holds its locks with a 5-minute
+embeds the rows it will create before its transaction, in requests of at most 100,000 characters, and holds its locks with a 5-minute
 lease, since a batch writes up to 100 rows and flags their citers inside one transaction.
 
 ## Search and bootstrap
@@ -319,8 +319,9 @@ true` puts `@embed`'s HNSW index on the native plane). Each lane passes `waitFor
   re-embedding migration, which v0 does not provide.
 - `GET /Memory/bootstrap?q=&budget=` — the caller's pinned memories (up to 50 `MemoryPin` rows for
   `principal.id`, newest pin first, whose target memory is active, unexpired and readable by the caller), then the caller's own
-  memories that need review (up to 20, newest flag first, through the indexed `needsReviewSince`;
-  section `needsReview`, skipping a flag the caller may not see), then the caller's recent
+  memories that need review (section `needsReview`: up to 20 the caller may see, newest flag first,
+  through the indexed `needsReviewSince`, from at most the 100 newest flags, so hidden flags cannot make a
+  bootstrap scan without bound), then the caller's recent
   memories, then memories relevant to `q`, deduplicated and packed into a character budget (title +
   content; default 8000). Expired memories (`validUntil <= now`) are excluded from every section.
   A memory that does not fit is skipped rather than ending the pack. Used at session start.
