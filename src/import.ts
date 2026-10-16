@@ -192,7 +192,7 @@ export async function importMemories(input: unknown, principal: Principal, reque
 				const storedTargetIds = [...new Set(liveCreated.flatMap((row) => row.supersedes))].filter(
 					(targetId) => !createdIds.has(targetId),
 				);
-					const citers = new Map<string, string[]>();
+				const citers = new Map<string, string[]>();
 				for (const targetId of storedTargetIds) citers.set(targetId, await activeDependentIds(Memory, [targetId], txn));
 				locks.require([...citers.values()].flat());
 				const graphState = async (targetId: string) => {
