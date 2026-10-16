@@ -135,6 +135,14 @@ describe('MEMORY_RESOURCES static surface', () => {
 			);
 		}
 		assert.equal((await parse(await MemoryResource.get(queryTarget('', { rest: 'extra' }), context))).status, 404);
+		assert.equal(
+			(await parse(await MemoryBootstrapResource.get(queryTarget('', { pathname: 'extra' }), context))).status,
+			404,
+		);
+		assert.equal(
+			(await parse(await MemoryImportResource.post(queryTarget('', { pathname: 'extra' }), {}, context))).status,
+			404,
+		);
 	});
 
 	it('consumes the HTTP entry context.authorize flag so internal table reads do not inherit Resource authorization', async () => {
@@ -173,7 +181,7 @@ describe('MemoryResource errors', () => {
 		}
 	});
 
-	it('treats a lapsed lock lease as retryable but any other 409 as a defect', async () => {
+	it('treats a lapsed lock lease and transient embedding backend failures as retryable 503, and other 409/embed errors as 500', async () => {
 		const Memory = databases.memory.Memory;
 		const put = Memory.put;
 		const create = async (id) =>
@@ -183,6 +191,24 @@ describe('MemoryResource errors', () => {
 				throw Object.assign(new Error('Record lock lease expired'), { statusCode: 409 });
 			};
 			assert.equal((await create('mem-lease-lapsed1')).status, 503);
+			Memory.put = async () => {
+				throw new Error(
+					'Failed to compute embedding for attribute "embedding" [Error] (backend HTTP 429) — see server log for details',
+				);
+			};
+			assert.equal((await create('mem-embed-429-id1')).status, 503);
+			Memory.put = async () => {
+				throw new Error(
+					'Failed to compute embedding for attribute "embedding" [TimeoutError] — see server log for details',
+				);
+			};
+			assert.equal((await create('mem-embed-time-id')).status, 503);
+			Memory.put = async () => {
+				throw new Error(
+					'Failed to compute embedding for attribute "embedding" [Error] (backend HTTP 400) — see server log for details',
+				);
+			};
+			assert.equal((await create('mem-embed-400-id1')).status, 500);
 			Memory.put = async () => {
 				throw Object.assign(new Error('Record already exists'), { statusCode: 409 });
 			};

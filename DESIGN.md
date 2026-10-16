@@ -126,23 +126,24 @@ Rules:
 
 ## Lifecycle
 
-| Operation           | Effect                                                                                                                                                                                                                                                                        |
-| ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| create (`PUT`)      | client chooses `id` (`^[A-Za-z0-9_-]{16,64}$`); absent id creates at `revision: 1` and returns `201 { id, revision }`; `If-None-Match: *` makes `PUT` create-only (`412` if the id exists); an identical retry returns `200 { id, revision }`                                 |
-| revise (`PUT`)      | `PUT /Memory/<id>` on an owned memory whose editable fields (`title`, `content`, `tags`, `scopes`, `evidence`, `validUntil`) differ from the stored ones requires `If-Match: "<revision>"` (missing → 428, stale → 412), bumps `revision`, and returns `200 { id, revision }` |
-| supersede           | create a memory via `PUT /Memory/<id>` with `supersedes: [ids]` (`supersedes` on a revise is 400 `supersedes_not_allowed`)                                                                                                                                                    |
-| withdraw (`DELETE`) | `DELETE /Memory/<id>?reason=` requires `If-Match: "<revision>"` (missing → 428, stale → 412); sets `status = withdrawn`, keeps the row as a tombstone, never deletes it                                                                                                       |
-| pin / unpin         | records or deletes the caller's `MemoryPin` row (`<principalId>:<memoryId>`, up to 50 active pins per principal; stale pins are pruned on pin, 409 `pin_limit_exceeded` past 50); requires read access (same 404 when missing or unreadable)                                  |
+| Operation           | Effect                                                                                                                                                                                                                                                                                |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| create (`PUT`)      | client chooses `id` (`^[A-Za-z0-9_-]{16,64}$`); absent id creates at `revision: 1` and returns `201 { id, revision }`; `If-None-Match: *` makes `PUT` create-only (`412` if the id exists); an identical retry returns `200 { id, revision }`                                         |
+| revise (`PUT`)      | `PUT /Memory/<id>` on an owned memory whose editable fields (`title`, `content`, `tags`, `scopes`, `evidence`, `validUntil`) differ from the stored ones requires `If-Match: "<revision>"` (or `*`; missing → 428, stale → 412), bumps `revision`, and returns `200 { id, revision }` |
+| supersede           | create a memory via `PUT /Memory/<id>` with `supersedes: [ids]` (`supersedes` on a revise is 400 `supersedes_not_allowed`)                                                                                                                                                            |
+| withdraw (`DELETE`) | `DELETE /Memory/<id>?reason=` requires `If-Match: "<revision>"` (or `*`; missing → 428, stale → 412); sets `status = withdrawn`, keeps the row as a tombstone, never deletes it                                                                                                       |
+| pin / unpin         | records or deletes the caller's `MemoryPin` row (`<principalId>:<memoryId>`, up to 50 pins per principal; withdrawn pins are pruned on pin, 409 `pin_limit_exceeded` past 50); requires read access (same 404 when missing or unreadable)                                             |
 
 `status` is `active | superseded | withdrawn`. Search returns `active` by default. Owners share one id
 namespace: `PUT /Memory/<id>` to an existing id owned by another principal returns `403
 not_memory_owner` when readable by the caller and `409 id_unavailable` when unreadable (with random
 122-bit UUIDs, that only reveals existence to a caller who already knows the id).
 
-Each `evidence` item is `{ kind, ref, note? }` with `kind` one of `memory | doc | pr | commit | url | text`.
-`memory`-kind items must name a valid memory id readable by the writer on `create` and `revise`
-(missing, unreadable or malformed → 400 `invalid_evidence`, so citing cannot probe existence), and their
-ids are stored deduplicated on `evidenceMemoryIds`.
+Each `evidence` item is `{ kind, ref, note? }` with `kind` one of `memory | doc | pr | commit | url | text`,
+stored in caller-supplied order (order is significant for idempotent retry equality, whereas `tags`,
+`scopes`, and `supersedes` are set-normalized). `memory`-kind items must name a valid memory id readable by
+the writer on `create` and `revise` (missing, unreadable or malformed → 400 `invalid_evidence`, so citing
+cannot probe existence), and their ids are stored deduplicated on `evidenceMemoryIds`.
 
 Every lifecycle operation runs in a transaction of its own (not the request's, which would commit
 whatever was staged before an error the resource turns into a response) and takes Harper's record

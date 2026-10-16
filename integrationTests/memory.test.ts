@@ -666,7 +666,31 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 				Accept: 'application/json',
 			},
 		});
-		deepStrictEqual(await response.json(), { statusCode: 400 });
+		deepStrictEqual(await response.json(), { statusCode: 400, startsWithSearchTarget: true });
+	});
+
+	test('transient embedding failure returns 503 on write and degrades search and bootstrap to full-text', async () => {
+		const stored = await create('alice', 'bittern-ok', {
+			title: 'bittern',
+			content: 'bittern reedbed observation',
+			visibility: 'shared',
+		});
+		const failedId = memId('embed-fail');
+		const failedWrite = await call('alice', 'PUT', failedId, {
+			title: 'bittern',
+			content: 'EMBED-FAIL bittern write',
+		});
+		strictEqual(failedWrite.status, 503, JSON.stringify(failedWrite.body));
+		strictEqual(failedWrite.body.code, 'unavailable');
+		strictEqual((await call('alice', 'GET', failedId)).status, 404);
+
+		const searched = await call('alice', 'GET', '?q=EMBED-FAIL%20bittern');
+		strictEqual(searched.status, 200, JSON.stringify(searched.body));
+		ok(searched.body.memories.some((m: any) => m.id === stored.id));
+
+		const boot = await call('alice', 'GET', 'bootstrap?q=EMBED-FAIL%20bittern');
+		strictEqual(boot.status, 200, JSON.stringify(boot.body));
+		ok(boot.body.memories.some((m: any) => m.id === stored.id));
 	});
 
 	test('rejects unauthenticated requests, removed POST routes, and unknown routes', async () => {

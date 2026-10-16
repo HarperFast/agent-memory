@@ -153,7 +153,7 @@ export function isSuperset(next: readonly string[], previous: readonly string[])
 
 /**
  * The scopes a write produces: explicit `scopes` wins over `visibility`; neither means private. Labels are
- * deduplicated and sorted so a retry with the same set in another order has the same fingerprint.
+ * deduplicated and sorted so a retry with the same set in another order produces an identical array.
  */
 export function normalizeScopes(scopes: unknown, visibility: unknown, principalId: string): string[] {
 	if (scopes !== undefined && scopes !== null) {

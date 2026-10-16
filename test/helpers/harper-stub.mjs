@@ -124,7 +124,12 @@ class StubTable {
 			// Harper checks the target against the index's dimensions, whatever the conditions select.
 			const stored = [...this.#rows(context).values()].find((record) => Array.isArray(record[sort.attribute]));
 			if (stored && stored[sort.attribute].length !== sort.target.length) {
-				throw Object.assign(new Error('stub: query vector size differs from the index'), { statusCode: 400 });
+				throw Object.assign(
+					new Error(
+						`Search target has ${sort.target.length} components, but this index stores ${stored[sort.attribute].length}.`,
+					),
+					{ statusCode: 400 },
+				);
 			}
 			results = results
 				.filter((record) => Array.isArray(record[sort.attribute]))

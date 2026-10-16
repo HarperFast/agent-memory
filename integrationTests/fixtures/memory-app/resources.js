@@ -21,10 +21,14 @@ models.registerBackend(
 	models.defineBackend({
 		name: 'test-bag-of-words',
 		async embed(input) {
+			const texts = Array.isArray(input) ? input : [input];
+			if (texts.some((text) => String(text).includes('EMBED-FAIL'))) {
+				throw Object.assign(new Error('embedding backend rate limited'), { upstreamStatus: 429 });
+			}
 			// Holds a write open between its revision check and its commit, so concurrent writers overlap.
-			if ([input].flat().some((text) => String(text).includes('slowly')))
+			if (texts.some((text) => String(text).includes('slowly')))
 				await new Promise((resolve) => setTimeout(resolve, 50));
-			return { status: 'completed', output: (Array.isArray(input) ? input : [input]).map((text) => embedText(text)) };
+			return { status: 'completed', output: texts.map((text) => embedText(text)) };
 		},
 	}),
 );
@@ -52,7 +56,7 @@ setPrincipalResolver((context, next) =>
 );
 
 // Runs a vector query whose size differs from the index's, as a model switch would; search's fallback to
-// full-text depends on Harper answering it with a 400.
+// full-text depends on Harper answering it with a 400 starting with "Search target has ".
 export class MismatchProbe extends Resource {
 	static loadAsInstance = false;
 	async get() {
@@ -62,9 +66,12 @@ export class MismatchProbe extends Resource {
 				select: ['id'],
 				limit: 1,
 			}));
-			return { statusCode: 200 };
+			return { statusCode: 200, startsWithSearchTarget: false };
 		} catch (error) {
-			return { statusCode: error?.statusCode };
+			return {
+				statusCode: error?.statusCode,
+				startsWithSearchTarget: String(error?.message).startsWith('Search target has '),
+			};
 		}
 	}
 }

@@ -120,12 +120,28 @@ function filterConditions(params: SearchParams, principal: Principal, now = new 
 }
 
 const rejectedModels = new Set<string>();
+const EMBED_WARN_INTERVAL_MS = 60_000;
+let lastEmbedWarning = 0;
+
+function isVectorDimensionMismatch(error: any): boolean {
+	return error?.statusCode === 400 && String(error?.message).startsWith('Search target has ');
+}
 
 function reportVectorLaneRejected(model: string, error: Error): void {
 	if (rejectedModels.has(model)) return;
 	rejectedModels.add(model);
 	logger.error?.(
 		`[agent-memory] vector search rejected for embeddingModel "${model}"; serving full-text results only`,
+		error,
+	);
+}
+
+function reportEmbedFailure(model: string, error: unknown): void {
+	const now = Date.now();
+	if (now - lastEmbedWarning < EMBED_WARN_INTERVAL_MS) return;
+	lastEmbedWarning = now;
+	logger.warn?.(
+		`[agent-memory] query embedding failed for embeddingModel "${model}"; serving full-text results only`,
 		error,
 	);
 }
@@ -173,9 +189,15 @@ export async function searchMemories(params: SearchParams, principal: Principal,
 		return assertReadable(recent, principal).map(toMemoryView);
 	}
 	const laneLimit = Math.min(params.limit * 2, 100);
-	const [vector] = await models.embed(params.q, { model: embeddingModel, inputType: 'query' });
-	const vectorLane = async () =>
-		collect(
+	let vector: ArrayLike<number> | undefined;
+	try {
+		[vector] = await models.embed(params.q, { model: embeddingModel, inputType: 'query' });
+	} catch (error) {
+		reportEmbedFailure(embeddingModel, error);
+	}
+	const vectorLane = async () => {
+		if (!vector) return [];
+		const hits = await collect(
 			Memory.search(
 				{
 					// Rows embedded by another model live in another vector space.
@@ -187,11 +209,14 @@ export async function searchMemories(params: SearchParams, principal: Principal,
 				context,
 			),
 		);
+		rejectedModels.delete(embeddingModel);
+		return hits;
+	};
 	const [vectorHits, textHits] = await Promise.all([
 		vectorLane().catch((error) => {
 			// Harper rejects a query vector whose size differs from the index's as a client error; that means the
 			// configured model no longer matches the stored vectors, and full-text results are still good.
-			if (error?.statusCode !== 400) throw error;
+			if (!isVectorDimensionMismatch(error)) throw error;
 			reportVectorLaneRejected(embeddingModel, error);
 			return [];
 		}),
@@ -251,14 +276,16 @@ export async function bootstrapMemories(params: BootstrapParams, principal: Prin
 			Memory.search(
 				{
 					conditions: [active, unexpired, pinIds, ...(readable ? [readable] : [])],
-					sort: recentFirst,
 					select: VIEW_FIELDS,
 					limit: BOOTSTRAP_PINNED_LIMIT,
 				},
 				context,
 			),
 		);
-		return assertReadable(records, principal).map(toMemoryView);
+		const byId = new Map(assertReadable(records, principal).map((record) => [record.id, toMemoryView(record)]));
+		return pins
+			.map((pin) => byId.get(pin.memoryId))
+			.filter((view): view is NonNullable<typeof view> => view !== undefined);
 	};
 	const [pinned, recent, relevant] = await Promise.all([
 		loadPinned(),

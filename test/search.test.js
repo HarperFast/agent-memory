@@ -184,7 +184,30 @@ describe('searchMemories', () => {
 		);
 	});
 
-	it('still fails a search when the vector lane fails for any other reason', async () => {
+	it('serves full-text results when query embedding fails', async () => {
+		const stored = await create(alice, 'disk outage', { content: 'disk pressure during embedder outage' });
+		const { models } = await import('harper');
+		const embed = models.embed;
+		models.embed = async () => {
+			throw Object.assign(new Error('embedding provider unavailable'), { upstreamStatus: 503 });
+		};
+		try {
+			const hits = await searchMemories(params('q=disk'), alice, context);
+			assert.deepEqual(
+				hits.map((hit) => hit.id),
+				[stored.id],
+			);
+			const boot = await bootstrapMemories({ q: 'disk', budget: 8000 }, alice, context);
+			assert.deepEqual(
+				boot.memories.map((m) => [m.id, m.section]),
+				[[stored.id, 'recent']],
+			);
+		} finally {
+			models.embed = embed;
+		}
+	});
+
+	it('still fails a search when the vector lane fails for any other reason, including non-mismatch 400', async () => {
 		await create(alice, 'disk delta', { content: 'disk pressure on delta' });
 		const Memory = (await import('harper')).databases.memory.Memory;
 		const search = Memory.search;
@@ -194,6 +217,11 @@ describe('searchMemories', () => {
 		};
 		try {
 			await assert.rejects(searchMemories(params('q=disk'), alice, context), /backend down/);
+			Memory.search = function (query, ctx) {
+				if (query.sort?.target) throw Object.assign(new Error('invalid query syntax'), { statusCode: 400 });
+				return search.call(this, query, ctx);
+			};
+			await assert.rejects(searchMemories(params('q=disk'), alice, context), /invalid query syntax/);
 		} finally {
 			Memory.search = search;
 		}
@@ -222,26 +250,33 @@ describe('searchMemories', () => {
 });
 
 describe('bootstrapMemories', () => {
-	it('orders pinned, recent, relevant; deduplicates; skips what does not fit', async () => {
-		const pinned = await create(root, 'pin', { content: 'pinned guidance', visibility: 'shared' });
-		await pinMemory(pinned.id, {}, alice, context);
+	it('orders pinned (newest pin first even when an older pin is revised), recent, relevant; deduplicates; skips what does not fit', async () => {
+		const olderPin = await create(root, 'pin-old', { content: 'older pin', visibility: 'shared' });
+		const newerPin = await create(root, 'pin-new', { content: 'newer pin', visibility: 'shared' });
+		await pinMemory(olderPin.id, {}, alice, context);
+		await new Promise((resolve) => setTimeout(resolve, 5));
+		await pinMemory(newerPin.id, {}, alice, context);
+		// Revise olderPin so its updatedAt is newer than newerPin's; pinned section must still rank newerPin first.
+		await putMemory(olderPin.id, { content: 'older pin revised' }, root, { headers: { 'if-match': '"1"' } });
+
 		const recent = await create(alice, 'mine', { content: 'my recent note' });
 		const large = await create(alice, 'big', { content: 'y'.repeat(500) });
 		const relevant = await create(root, 'tapir', { content: 'tapir facts', visibility: 'shared' });
-		const result = await bootstrapMemories({ q: 'tapir', budget: 120 }, alice, context);
+		const result = await bootstrapMemories({ q: 'tapir', budget: 200 }, alice, context);
 		const pinSearch = __test.searchLog.findLast((entry) => entry.table === 'MemoryPin');
 		assert.deepEqual(pinSearch.query.sort, { attribute: 'createdAt', descending: true });
 		assert.equal(pinSearch.query.limit, 50);
 		assert.deepEqual(
 			result.memories.map((memory) => [memory.id, memory.section]),
 			[
-				[pinned.id, 'pinned'],
+				[newerPin.id, 'pinned'],
+				[olderPin.id, 'pinned'],
 				[recent.id, 'recent'],
 				[relevant.id, 'relevant'],
 			],
 		);
 		assert.ok(!result.memories.some((memory) => memory.id === large.id));
-		assert.ok(result.used <= 120);
+		assert.ok(result.used <= 200);
 	});
 
 	it('isolates pins per reader and excludes expired memories from every bootstrap section', async () => {

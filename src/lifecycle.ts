@@ -41,7 +41,7 @@ function memoryPinIdFor(principalId: string, memoryId: string): string {
 	return `${principalId}:${memoryId}`;
 }
 
-export function getHeader(context: any, name: string): string | undefined {
+function getHeader(context: any, name: string): string | undefined {
 	const headers = context?.headers ?? context?.request?.headers;
 	if (!headers) return undefined;
 	const lower = name.toLowerCase();
@@ -63,7 +63,7 @@ function matchesIfMatch(header: string, revision: number): boolean {
 	return header
 		.split(',')
 		.map((part) => part.trim())
-		.includes(expected);
+		.some((part) => part === '*' || part === expected);
 }
 
 function matchesIfNoneMatch(header: string, revision: number): boolean {
@@ -616,10 +616,9 @@ export async function withdrawMemory(
 	// A withdrawal also changes the memories it superseded. `supersedes` never changes after create, so a
 	// pre-transaction read plans the lock set and lockRows is the first operation inside the transaction.
 	const planned = await Memory.get(id, requestContext);
-	if (!planned) throw notFound();
 
 	return inOwnTransaction(requestContext, async (txn) => {
-		await lockRows(Memory, [id, ...(planned.supersedes ?? [])], txn);
+		await lockRows(Memory, [id, ...(planned?.supersedes ?? [])], txn);
 		const existing = await Memory.get(id, txn);
 		if (!existing) throw notFound();
 		// A caller that cannot read the memory gets the same 404 as a missing one, so a write attempt does not
@@ -668,7 +667,9 @@ export async function pinMemory(id: unknown, input: unknown = {}, principal: Pri
 	const MemoryPin = memoryPinTable();
 	const pinId = memoryPinIdFor(principal.id, id);
 	return inOwnTransaction(requestContext, async (txn) => {
-		await lockRows(MemoryPin, [pinId], txn);
+		// Locking principal.id (which cannot contain ':') alongside pinId serializes concurrent pin checks
+		// for this principal so two parallel pins of different memories cannot both pass the 50-pin cap.
+		await lockRows(MemoryPin, [principal.id, pinId], txn);
 		const record = await Memory.get(id, txn);
 		// Same 404 whether missing or unreadable, so pinning cannot probe another principal's memory.
 		if (!record || !canRead(record, principal)) throw notFound();
@@ -685,18 +686,18 @@ export async function pinMemory(id: unknown, input: unknown = {}, principal: Pri
 				existingPins.push(pin);
 			}
 			if (existingPins.length >= BOOTSTRAP_PINNED_LIMIT) {
-				const now = Date.now();
-				let activeCount = 0;
+				let retainedCount = 0;
 				for (const pin of existingPins) {
 					const target = await Memory.get(pin.memoryId, txn);
-					const expired = target?.validUntil != null && new Date(target.validUntil).getTime() <= now;
-					if (!target || !canRead(target, principal) || target.status !== STATUS_ACTIVE || expired) {
+					// Only withdrawn (or missing) memories are terminal: supersession, expiry, and read access can all
+					// revert later, so their pins stay retained and hidden by bootstrap until explicitly unpinned.
+					if (!target || target.status === STATUS_WITHDRAWN) {
 						await MemoryPin.delete(pin.id, txn);
 					} else {
-						activeCount++;
+						retainedCount++;
 					}
 				}
-				if (activeCount >= BOOTSTRAP_PINNED_LIMIT) {
+				if (retainedCount >= BOOTSTRAP_PINNED_LIMIT) {
 					throw memoryError(`Principal may pin at most ${BOOTSTRAP_PINNED_LIMIT} memories`, 409, 'pin_limit_exceeded');
 				}
 			}
@@ -721,7 +722,7 @@ export async function unpinMemory(id: unknown, input: unknown = {}, principal: P
 	const MemoryPin = memoryPinTable();
 	const pinId = memoryPinIdFor(principal.id, id);
 	return inOwnTransaction(requestContext, async (txn) => {
-		await lockRows(MemoryPin, [pinId], txn);
+		await lockRows(MemoryPin, [principal.id, pinId], txn);
 		const record = await Memory.get(id, txn);
 		if (!record || !canRead(record, principal)) throw notFound();
 		await MemoryPin.delete(pinId, txn);

@@ -750,20 +750,33 @@ describe('pin and unpin', () => {
 		await rejection(unpinMemory(memory.id, { pinned: false }, alice, context), 400, 'unsupported_fields');
 	});
 
-	it('caps active pins per principal at 50 and evicts stale pins before rejecting', async () => {
+	it('caps pins per principal at 50, locks the principal key, and prunes only withdrawn pins before rejecting', async () => {
 		const memories = [];
 		for (let i = 0; i < BOOTSTRAP_PINNED_LIMIT; i++) {
 			const { memory } = await putMemory(idFor(`pin-${i}`), validInput(), alice, context);
 			memories.push(memory);
 			await pinMemory(memory.id, {}, alice, context);
 		}
+		// Supersede pin-1 and expire pin-2: neither is terminal, so neither may be silently pruned at the cap.
+		await putMemory(idFor('superseder'), validInput({ supersedes: [memories[1].id] }), alice, context);
+		await putMemory(memories[2].id, { validUntil: '2020-01-01T00:00:00.000Z' }, alice, {
+			headers: { 'if-match': '*' },
+		});
+
 		const extra = (await putMemory(idFor('pin-extra'), validInput(), alice, context)).memory;
 		await rejection(pinMemory(extra.id, {}, alice, context), 409, 'pin_limit_exceeded');
+		assert.equal(pinRows().has(`alice:${memories[1].id}`), true);
+		assert.equal(pinRows().has(`alice:${memories[2].id}`), true);
 
-		await withdrawMemory(memories[0].id, {}, alice, ifMatch(1));
+		await withdrawMemory(memories[0].id, {}, alice, { headers: { 'if-match': '*' } });
+		__test.lockLog.length = 0;
 		const pinnedExtra = await pinMemory(extra.id, {}, alice, context);
 		assert.equal(pinnedExtra.pinned, true);
 		assert.equal(pinRows().has(`alice:${memories[0].id}`), false);
 		assert.equal(pinRows().has(`alice:${extra.id}`), true);
+		assert.deepEqual(
+			__test.lockLog.map((entry) => entry.id),
+			['alice', `alice:${extra.id}`],
+		);
 	});
 });
