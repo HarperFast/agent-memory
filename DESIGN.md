@@ -214,7 +214,10 @@ first-class operation, and the write path proposes it.
   rows of the row's `embeddingModel`, and does not wait for index coverage: candidates are advice, so a
   memory committed within the index lag can be missed, and a failed search yields `[]` rather than
   failing a committed write. It never holds a record lock. `supersession.mode: off` searches nothing and
-  returns `[]`.
+  returns `[]`. Measured on Harper 5.3.2 (one node, local, CPU capped at 2 GHz, 300 memories, judge
+  stubbed): a create took 7.7 ms p50 / 10.2 ms p95 in `suggest` against 2.7 / 3.4 ms with `off`, and an
+  identical retry 6.1 / 7.6 ms against 1.9 / 2.4 ms. A real judge adds its model's latency, per candidate
+  and in parallel.
 - **Judge**: with `supersession.judge` (a `models.generate` model name), each candidate is classified
   `supersedes | refines | unrelated`. Only a complete one-word answer counts (at most 16 output tokens,
   20 s per candidate); anything else, or a failed call, leaves the candidate without a `verdict`. The
