@@ -183,7 +183,12 @@ export function fuse<T extends { id: string }>(lanes: readonly (readonly T[])[],
 	);
 }
 
-export async function searchMemories(params: SearchParams, principal: Principal, context: object) {
+export async function searchMemories(
+	params: SearchParams,
+	principal: Principal,
+	context: object,
+	access?: Map<string, Promise<any>>,
+) {
 	const { embeddingModel } = getSettings();
 	const Memory = memoryTable();
 	const conditions = filterConditions(params, principal);
@@ -194,7 +199,7 @@ export async function searchMemories(params: SearchParams, principal: Principal,
 				context,
 			),
 		);
-		return forReader(assertReadable(recent, principal).map(toMemoryView), principal, context);
+		return forReader(assertReadable(recent, principal).map(toMemoryView), principal, context, access);
 	}
 	const laneLimit = Math.min(params.limit * 2, 100);
 	let vector: ArrayLike<number> | undefined;
@@ -250,6 +255,7 @@ export async function searchMemories(params: SearchParams, principal: Principal,
 		ranked.map(({ record }) => toMemoryView(record)),
 		principal,
 		context,
+		access,
 	);
 	return views.map((view, index) => ({ ...view, score: ranked[index].score }));
 }
@@ -273,7 +279,7 @@ export async function bootstrapMemories(params: BootstrapParams, principal: Prin
 	const unexpired = unexpiredCondition(new Date());
 	const readable = readableCondition(principal);
 	const recentFirst = { attribute: 'updatedAt', descending: true };
-	// One lookup per flag source across the pinned, needsReview and recent sections.
+	// One lookup per flag source across every section.
 	const access = new Map<string, Promise<any>>();
 	const loadPinned = async () => {
 		const pins = await collect(
@@ -363,6 +369,7 @@ export async function bootstrapMemories(params: BootstrapParams, principal: Prin
 					},
 					principal,
 					context,
+					access,
 				).then((hits) => hits.map(({ score: _score, ...memory }) => memory))
 			: [],
 	]);

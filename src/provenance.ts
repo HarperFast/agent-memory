@@ -105,11 +105,12 @@ export async function forReader<T extends MemoryView>(
 			}
 			return records;
 		})();
-		for (const id of missing)
-			access.set(
-				id,
-				found.then((records) => records.get(id)),
-			);
+		for (const id of missing) {
+			const record = found.then((records) => records.get(id));
+			// A failed lookup rejects for whoever awaits it; an entry nobody awaits must not surface as unhandled.
+			record.catch(() => {});
+			access.set(id, record);
+		}
 	}
 	return Promise.all(
 		views.map(async (view) => {

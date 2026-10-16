@@ -478,6 +478,8 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 	const { supersession } = settings;
 
 	// Planning runs again when the transaction finds the pre-read overtaken; `reembed` then guarantees a vector.
+	const newCitations = (record: any): string[] =>
+		(parsedEvidenceMemoryIds ?? []).filter((refId) => !(record?.evidenceMemoryIds ?? []).includes(refId));
 	const plan = async (reembed: boolean) => {
 		// Planning runs only for what looks like a permitted write, so a refused or no-op PUT never pays for an
 		// embedding, a judge call or a citer fan-out. The transaction re-checks everything under its locks.
@@ -542,7 +544,8 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 				requestContext,
 			);
 		}
-		return { planningCreate, mayRevise, vector, proposals, autoTargets, plannedDependents };
+		const citedLocks = planningCreate || mayRevise ? newCitations(preExisting) : [];
+		return { planningCreate, vector, proposals, autoTargets, plannedDependents, citedLocks };
 	};
 
 	const write = (planned: Awaited<ReturnType<typeof plan>>) =>
@@ -552,9 +555,10 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 				id,
 				...(planned.planningCreate ? supersedes : []),
 				...planned.autoTargets.map((match) => match.id),
-				// Citing serializes with the cited memory's supersede or withdrawal, so a citer is either flagged by it
-				// or reads the source's new status. A write the cheap checks refuse locks none of them.
-				...(planned.planningCreate || planned.mayRevise ? (parsedEvidenceMemoryIds ?? []) : []),
+				// A new citation serializes with the cited memory's supersede or withdrawal, so a citer is either flagged
+				// by it or reads the source's new status. A citation the row already has is in the index, where a
+				// transition finds the citer and locks it. A write the cheap checks refuse locks none of them.
+				...planned.citedLocks,
 				...planned.plannedDependents,
 			],
 			async (txn, locks) => {
@@ -630,13 +634,12 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 					if (scopesRequested) await assertStillCoversSuperseded(Memory, existing, candidate.scopes, txn);
 					if (parsedEvidenceMemoryIds !== undefined) {
 						await assertReadableEvidence(Memory, parsedEvidenceMemoryIds, principal, txn);
-						locks.require(parsedEvidenceMemoryIds);
 					}
-
 					const contentChanged =
 						parsedContent !== undefined &&
 						(parsedContent !== existing.content || existing.embeddingModel !== settings.embeddingModel);
 					if (contentChanged && planned.vector === undefined) throw new VectorNeeded();
+					locks.require(newCitations(existing));
 					const changes: Record<string, any> = {
 						...(parsedTitle !== undefined && { title: parsedTitle }),
 						...(contentChanged && {
@@ -711,9 +714,9 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 				for (const { target } of transitions) {
 					citers.set(target.id, await activeDependentIds(Memory, [target.id], txn));
 				}
+				if (planned.vector === undefined) throw new VectorNeeded();
 				locks.require([...evidenceMemoryIds, ...supersedes, ...[...citers.values()].flat()]);
 
-				if (planned.vector === undefined) throw new VectorNeeded();
 				await Memory.put(
 					{
 						id,

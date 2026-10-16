@@ -334,6 +334,29 @@ describe('who sees a flag', () => {
 		assert.deepEqual(views[1][0].needsReview, views[0][0].needsReview);
 	});
 
+	it('fails a read cleanly when the lookup fails, leaving no unhandled rejection', async () => {
+		const { dependent } = await scenario();
+		const unhandled = [];
+		const onUnhandled = (reason) => unhandled.push(reason);
+		process.on('unhandledRejection', onUnhandled);
+		const Memory = databases.memory.Memory;
+		const search = Memory.search.bind(Memory);
+		Memory.search = (query, ctx) => {
+			if (query.select?.join() !== 'id,ownerId,scopes,status') return search(query, ctx);
+			return (async function* () {
+				throw Object.assign(new Error('index rebuilding'), { statusCode: 503 });
+			})();
+		};
+		try {
+			await assert.rejects(getMemory(dependent.id, erin, context), /index rebuilding/);
+			await new Promise((resolve) => setImmediate(resolve));
+		} finally {
+			Memory.search = search;
+			process.off('unhandledRejection', onUnhandled);
+		}
+		assert.deepEqual(unhandled, []);
+	});
+
 	it('shows a withdrawal to the source label readers even though the tombstone itself is hidden', async () => {
 		const source = await create(
 			'source',
@@ -417,6 +440,24 @@ describe('lock planning', () => {
 		assert.deepEqual(
 			__test.lockLog.map((entry) => entry.id),
 			[dependent.id, source.id].sort(),
+		);
+	});
+
+	it('a revise locks only the citations it adds', async () => {
+		const kept = await create('kept', memoryInput('vacuum runs nightly'));
+		const added = await create('added', memoryInput('analyze runs weekly'));
+		const citer = await create('citer', citing('maintenance window', kept.id), bob);
+		__test.lockLog.length = 0;
+		await putMemory(
+			citer.id,
+			{ ...citing('maintenance window', kept.id), title: 'maintenance window' },
+			bob,
+			ifMatch(1),
+		);
+		await putMemory(citer.id, citing('maintenance window', kept.id, added.id), bob, ifMatch(1));
+		assert.deepEqual(
+			__test.lockLog.map((entry) => entry.id),
+			[citer.id, ...[added.id, citer.id].sort()],
 		);
 	});
 

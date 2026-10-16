@@ -158,7 +158,7 @@ Every lifecycle operation runs in a transaction of its own (not the request's, w
 whatever was staged before an error the resource turns into a response) and takes Harper's record
 lock (`Memory.lock`) on every row it will change, in sorted id order, before reading it
 (`withLockPlan`, `src/lifecycle.ts`). An operation plans its whole lock set before the transaction:
-a `PUT` locks its id, its `supersedes`, the memories it cites, and the active citers of what it
+a `PUT` locks its id, its `supersedes`, the memories it newly cites, and the active citers of what it
 supersedes; a withdrawal locks its id, its `supersedes` (which never changes after create) and its
 active citers. Under the locks, before its first write, the operation re-reads every row it will
 change; one the plan missed (a citer that appeared, a `supersedes` populated after the pre-read)
@@ -253,8 +253,9 @@ one of its supports changing.
   later revisions; compare it with `lastEditor.revisedAt` to see which came last.
 - **Not its replacement**: a memory that lists X in `supersedes` (on create, or in the same import) is
   never flagged for X.
-- **Citing serializes with the transition**: a create or revise locks the memories it cites, so a citer
-  either commits first and is flagged, or reads X's new status. The lock is held for milliseconds, since
+- **Citing serializes with the transition**: a create or revise locks the memories it newly cites, so a
+  citer either commits first and is flagged, or reads X's new status. A citation the row already has is
+  in the index, where the transition finds the citer and locks it. The lock is held for milliseconds, since
   the citer's embedding happens before its transaction. Across nodes the same caveat as every other
   lock-based rule applies.
 - **Who sees a flag**: `needsReview` is shown to a reader who can read X through its labels or owns it,
