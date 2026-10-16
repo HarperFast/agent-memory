@@ -14,8 +14,6 @@ type Memory @table(database: "memory", audit: true) {
 	supersededBy: ID @indexed
 	evidence: Any
 	evidenceMemoryIds: [ID] @indexed
-	idempotencyKey: String
-	createFingerprint: String
 	author: Any
 	lastEditor: Any
 	validUntil: Date

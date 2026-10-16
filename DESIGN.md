@@ -22,8 +22,9 @@ rather than each defining their own memory tables and endpoints.
 | Document corpus, chunking, retrieval lanes, answers                  | Reflex — memory joins it as a lane (Reflex #543), not as copied source rows         |
 
 Seeded from the Agent Memory Interface in harper-eye (#178): server-derived ownership, strict payload
-allowlists, idempotent create, expected-revision edits, withdraw-as-tombstone, identical 404 for
-"missing" and "not yours". Those rules carry over unchanged unless a section below says otherwise.
+allowlists, idempotent `PUT` create/revise with `If-Match` revision preconditions, withdraw-as-tombstone
+(`DELETE` with `If-Match`), and identical 404 for "missing" and "not yours" on reads, `DELETE`, pins and
+`supersedes` references. Those rules carry over unchanged unless a section below says otherwise.
 
 ## Implementation status
 
@@ -50,9 +51,9 @@ See `schema/memory.graphql`. The table is not `@export`ed: every read and write 
 `Memory` resource so the rules below have exactly one enforcement point.
 
 Server-owned fields: `ownerId`, `status`, `revision`, `author`, `lastEditor`, `supersededBy`,
-`evidenceMemoryIds`, `createdAt`, `createFingerprint`, `embeddingModel`. `createdAt` is set by the
-lifecycle rather than `@createdTime`, because Harper's `@createdTime` overwrites a supplied value on
-insert and import must preserve it. `updatedAt` stays `@updatedTime`.
+`evidenceMemoryIds`, `createdAt`, `embeddingModel`. `createdAt` is set by the lifecycle rather than
+`@createdTime`, because Harper's `@createdTime` overwrites a supplied value on insert and import must
+preserve it. `updatedAt` stays `@updatedTime`.
 
 ## Identity
 
@@ -70,6 +71,12 @@ source? }`, or `undefined` for unauthenticated. `next()` is the default Harper-u
 
 Principal ids must not contain whitespace, `:` or `*`, and are capped at 122 characters, so that
 `user:<id>` fits a 128-character scope label.
+
+Memory ids are client-chosen (`^[A-Za-z0-9_-]{16,64}$`; clients normally generate a UUID) and share one
+table-wide namespace across all owners rather than per-owner id namespaces. Because `PUT /Memory/<id>`
+creates when the id is absent, a `PUT` to an existing id that the caller cannot read answers `409
+id_unavailable` rather than overwriting or returning 404; this reveals that the id is taken, which with
+122-bit random UUIDs only matters to a caller who already knows the id.
 
 ## Scopes and grants
 
@@ -100,13 +107,15 @@ Rules:
 
 1. **Read**: `scopes ∩ readable(caller) ≠ ∅`, or the caller is the owner. A withdrawn memory is
    readable by its owner and `super_user` only. A memory the caller cannot read is indistinguishable
-   from one that does not exist (same 404 body), on reads, writes, pins and `supersedes` references alike.
+   from one that does not exist (same 404 body) on `GET`, `DELETE`, pins and `supersedes` references;
+   on `PUT /Memory/<id>`, an existing unreadable id returns `409 id_unavailable` (see Identity).
 2. **Write scopes**: creating or revising with scopes `S` requires every label of `S` to be writable by
    the caller — the resulting scopes, so revising a memory that stays `global` needs `global` write.
    `visibility: "private" | "shared"` is shorthand for `[user:<owner>]` / `[global]`; explicit
    `scopes` wins when both are given. Withdrawal is exempt.
-3. **Edit**: only the owner (or `super_user`) revises, changes scopes, or withdraws. Read access never
-   grants edit; a reader that is not the owner gets 403, a non-reader the 404 of rule 1.
+3. **Edit**: only the owner (or `super_user`) revises or withdraws. Read access never grants edit; a
+   reader that is not the owner gets 403 (`not_memory_owner`), and a non-reader gets 404 on `DELETE`
+   or 409 `id_unavailable` on `PUT`.
 4. **Supersede**: see below. It is the only write that touches another principal's memory, and it
    only changes status fields (`status`, `supersededBy`, `revision`).
 5. **Search pushes the readable set into the query**, applied before the limit in every lane, never
@@ -117,17 +126,18 @@ Rules:
 
 ## Lifecycle
 
-| Operation   | Effect                                                                                                                                                                                                                                       |
-| ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| create      | id = `sha256(memory:<owner>:<idempotencyKey>)[:32]`; a matching retry returns the existing row (200 vs 201), a different payload under the same key is 409                                                                                   |
-| revise      | requires `expectedRevision`; bumps `revision`; re-embeds via `@embed` when `content` changes                                                                                                                                                 |
-| scopes      | owner changes scopes (rule 2)                                                                                                                                                                                                                |
-| supersede   | create a memory with `supersedes: [ids]` (below)                                                                                                                                                                                             |
-| withdraw    | `status = withdrawn`, row kept as a tombstone, never deleted                                                                                                                                                                                 |
-| pin / unpin | records or deletes the caller's `MemoryPin` row (`<principalId>:<memoryId>`, up to 50 active pins per principal; stale pins are pruned on pin, 409 `pin_limit_exceeded` past 50); requires read access (same 404 when missing or unreadable) |
+| Operation           | Effect                                                                                                                                                                                                                                                                        |
+| ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| create (`PUT`)      | client chooses `id` (`^[A-Za-z0-9_-]{16,64}$`); absent id creates at `revision: 1` and returns `201 { id, revision }`; `If-None-Match: *` makes `PUT` create-only (`412` if the id exists); an identical retry returns `200 { id, revision }`                                 |
+| revise (`PUT`)      | `PUT /Memory/<id>` on an owned memory whose editable fields (`title`, `content`, `tags`, `scopes`, `evidence`, `validUntil`) differ from the stored ones requires `If-Match: "<revision>"` (missing → 428, stale → 412), bumps `revision`, and returns `200 { id, revision }` |
+| supersede           | create a memory via `PUT /Memory/<id>` with `supersedes: [ids]` (`supersedes` on a revise is 400 `supersedes_not_allowed`)                                                                                                                                                    |
+| withdraw (`DELETE`) | `DELETE /Memory/<id>?reason=` requires `If-Match: "<revision>"` (missing → 428, stale → 412); sets `status = withdrawn`, keeps the row as a tombstone, never deletes it                                                                                                       |
+| pin / unpin         | records or deletes the caller's `MemoryPin` row (`<principalId>:<memoryId>`, up to 50 active pins per principal; stale pins are pruned on pin, 409 `pin_limit_exceeded` past 50); requires read access (same 404 when missing or unreadable)                                  |
 
-`status` is `active | superseded | withdrawn`. Search returns `active` by default. The `import:` key
-prefix is reserved for import, so a native create cannot land on an imported row.
+`status` is `active | superseded | withdrawn`. Search returns `active` by default. Owners share one id
+namespace: `PUT /Memory/<id>` to an existing id owned by another principal returns `403
+not_memory_owner` when readable by the caller and `409 id_unavailable` when unreadable (with random
+122-bit UUIDs, that only reveals existence to a caller who already knows the id).
 
 Each `evidence` item is `{ kind, ref, note? }` with `kind` one of `memory | doc | pr | commit | url | text`.
 `memory`-kind items must name a valid memory id readable by the writer on `create` and `revise`
@@ -139,11 +149,11 @@ whatever was staged before an error the resource turns into a response) and take
 lock (`Memory.lock`) on every row it will change, in sorted id order, before reading it. A withdrawal
 plans its lock set from a pre-transaction read of the memory's `supersedes`, which never changes after create. The plugin is the
 only writer of `Memory`, so on one node a read-check-write is serialized: of N concurrent revisions at
-the same expected revision exactly one succeeds. The locks are node-scoped, because a cluster-scoped
+the same `If-Match` revision exactly one succeeds. The locks are node-scoped, because a cluster-scoped
 lock on a replicated database fails closed unless the cluster has opted into replicated record locks
-(`replication.recordLocks`); across nodes, two revisions at the same expected revision can both
-succeed and replication keeps the later write — the limit harper-eye documented for expected
-revisions. The same applies to derived status: a withdrawal's restore on one node and a supersede of the
+(`replication.recordLocks`); across nodes, two revisions at the same revision can both
+succeed and replication keeps the later write — the limit harper-eye documented for optimistic concurrency.
+The same applies to derived status: a withdrawal's restore on one node and a supersede of the
 same memory on another replicate as competing writes, so the memory can end up `active` beside a live
 superseder until a later operation recomputes it. Any status change, including supersede and restore, bumps the affected row's `revision`.
 
@@ -153,13 +163,13 @@ Measured on the team's previous memory store: only 8% of updates used an explici
 and 32% of sessions read a stale memory without ever seeing its replacement. So supersession is a
 first-class operation, and the write path proposes it.
 
-- **Explicit**: `supersedes: [oldId]` (up to 10) on create. Requires that the caller can read `old`,
+- **Explicit**: `supersedes: [oldId]` (up to 10) on create (`PUT` to a new id). Requires that the caller can read `old`,
   that `old` is not withdrawn (409), and that the new memory's scopes are a superset of `old.scopes`
   (403), so every label reader of the old memory can read its replacement. In the same transaction
   `old.status = superseded`, `old.supersededBy = newId`. An already superseded memory may be
   superseded again; `supersededBy` names the newest.
 - **The superset holds after the supersede, not only at it**: a superseded memory is frozen except
-  for withdrawal (revise/scopes → 409 `memory_superseded`), and a scope change on a memory that
+  for withdrawal (revising via `PUT` → 409 `memory_superseded`), and a scope change on a memory that
   supersedes others must still cover each non-withdrawn one.
 - **Owner-only readers are not covered**: an owner who reads the old memory only by ownership (none
   of its labels is in their readable set) sees `supersededBy` but may be unable to read the
@@ -182,15 +192,15 @@ similarity }]` on the response. With `supersession.judge` configured, `models.ge
 
 Mounted at `urlPath` (default `Memory`); hidden from MCP and OpenAPI auto-export until the MCP task.
 
-| Route                                                                   | Purpose                                     |
-| ----------------------------------------------------------------------- | ------------------------------------------- |
-| `POST /Memory/`                                                         | create                                      |
-| `GET /Memory/<id>`                                                      | read                                        |
-| `GET /Memory/?q=&tag=&scope=&limit=&includeSuperseded=&includeExpired=` | search (no `q`: newest first)               |
-| `GET /Memory/bootstrap?q=&budget=`                                      | session-start context                       |
-| `POST /Memory/<id>/revise` · `/scopes` · `/withdraw`                    | mutations, each with `expectedRevision`     |
-| `POST /Memory/<id>/pin` · `/unpin`                                      | per-reader pin / unpin (empty or `{}` body) |
-| `POST /Memory/import`                                                   | bulk import (`super_user`)                  |
+| Route                                                                   | Purpose                                                                                                    |
+| ----------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| `PUT /Memory/<id>`                                                      | create (`201 { id, revision }`), idempotent retry (`200`), or revise with `If-Match: "<revision>"` (`200`) |
+| `GET /Memory/<id>`                                                      | read (`{ memory }` + `ETag: "<revision>"`)                                                                 |
+| `DELETE /Memory/<id>?reason=`                                           | withdraw with `If-Match: "<revision>"` (tombstone, returns `{ memory }`)                                   |
+| `GET /Memory/?q=&tag=&scope=&limit=&includeSuperseded=&includeExpired=` | search (no `q`: newest first)                                                                              |
+| `GET /Memory/bootstrap?q=&budget=`                                      | session-start context                                                                                      |
+| `POST /Memory/<id>/pin` · `/unpin`                                      | per-reader pin / unpin (empty or `{}` body)                                                                |
+| `POST /Memory/import`                                                   | bulk import (`super_user`)                                                                                 |
 
 Errors are `{ error, code }` (plus `index` for an import row). Only errors the plugin creates carry
 their own message; anything else is a 500 `internal_error`. Harper's retryable failures — 503 (an index
@@ -250,14 +260,14 @@ Three levels, built in order (none in the v0 core):
 
 - `registerMemorySink({ write(memory, context), withdraw(memory, context) })` returns an unregister
   function. Sinks are awaited in order inside the lifecycle transaction for every row an operation
-  changes (create, revise, scopes, the supersede and restore side effects → `write`; withdraw →
+  changes (create, revise, the supersede and restore side effects → `write`; withdraw →
   `withdraw`; import calls `withdraw` for a row imported as withdrawn). A write the sink makes through
   `context` to a table in the `memory` database commits or rolls back with the memory, and a sink that
   throws aborts the operation. Harper commits each database separately, so a write to another database
   can be lost if the process dies between the two commits, and a create retry would not repair it.
   Anything that must not be lost goes through an outbox table declared in the `memory` database. A
   sink registered or unregistered during a dispatch takes effect from the next one. An idempotent
-  create retry calls no sink. harper-eye uses it for the interim Reflex source-row handoff until memory is a
+  `PUT` retry calls no sink. harper-eye uses it for the interim Reflex source-row handoff until memory is a
   Reflex lane.
 - `setPrincipalResolver(fn)` — see Identity.
 - Options (`config.yaml` under the plugin's key): `urlPath`, `embeddingModel` (default `default`),
@@ -272,22 +282,23 @@ Three levels, built in order (none in the v0 core):
 ## Import
 
 `POST /Memory/import` (`super_user` only) takes `{ rows: [...] }`, at most 100 rows, in one transaction:
-every row commits or none does. Each row: `{ id?, idempotencyKey: "import:<source>:<sourceId>",
-ownerId, title?, content, tags?, evidence?, scopes, status, supersedes?, supersededBy?, createdAt?,
-validUntil?, withdrawnAt?, withdrawnReason? }`.
+every row commits or none does. Each row: `{ id, ownerId, title?, content, tags?, evidence?, scopes,
+status, supersedes?, supersededBy?, createdAt?, validUntil?, withdrawnAt?, withdrawnReason? }`.
 
-- The id is the create formula `sha256(memory:<ownerId>:<idempotencyKey>)[:32]`. A client may send it
-  (so rows can reference each other); the server recomputes it and rejects a mismatch.
+- Rows carry the client-chosen `id` directly (`^[A-Za-z0-9_-]{16,64}$`; the Flair import client derives
+  `id` as the first 32 hex characters of `sha256('flair:' + flairId)`).
 - Owner, links and `createdAt` are preserved, and the superset rule is not applied, because the
   source's history is. Links are format-checked only, so a link may name a row in a later batch. A
   `withdrawn` row stays withdrawn; any other row's status and `supersededBy` are derived from the graph
   as it stands (stored rows plus this batch), and a stored row that a new row supersedes is marked
   superseded. So whatever the batch order, and however a run is interrupted or replayed, no memory is
   hidden behind a missing or withdrawn replacement. The client still sends successors first.
-- A re-run is idempotent: an existing id with the same import fingerprint is `unchanged`, a different
-  one is `conflict` and is not overwritten, so a native revision made after import survives. The
-  response is `{ results: [{ id, result: created | unchanged | conflict }] }`; an invalid row fails the
-  batch with 400 and its `index`.
+- A re-run is idempotent by the same identical-fields rule as `PUT`: an existing id with matching
+  `ownerId`, editable fields (`title`, `content`, `tags`, `scopes`, `evidence`, `validUntil`), and
+  `supersedes` (plus `withdrawnReason` when the import row is `withdrawn`) is `unchanged`; a row whose
+  `id` exists with different fields is reported as `conflict` and is not overwritten, so a native
+  revision made after import survives. The response is `{ results: [{ id, result: created | unchanged |
+conflict }] }`; an invalid row fails the batch with 400 and its `index`.
 
 The first source is the team's Flair instance: agent id → Harper username via a mapping file; Flair
 `private` → `user:<owner>`, shared → `global`; `supersedes` and `validTo` carried over.

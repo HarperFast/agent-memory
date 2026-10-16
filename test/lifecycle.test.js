@@ -3,15 +3,12 @@ import assert from 'node:assert/strict';
 import { __test, databases, models } from 'harper';
 import {
 	BOOTSTRAP_PINNED_LIMIT,
-	createMemory,
 	EVIDENCE_MAX_ITEMS,
 	EVIDENCE_NOTE_MAX_CHARS,
 	EVIDENCE_REF_MAX_CHARS,
 	getMemory,
-	memoryIdFor,
 	pinMemory,
-	reviseMemory,
-	setMemoryScopes,
+	putMemory,
 	unpinMemory,
 	withdrawMemory,
 } from '../dist/lifecycle.js';
@@ -26,6 +23,11 @@ const carol = grant('carol', ['customer:x'], ['customer:x']);
 const outsider = grant('mallory', [], []);
 const root = createPrincipal({ id: 'root', superUser: true });
 const context = { user: { username: 'request-user' } };
+const ifMatch = (revision) => ({ ...context, headers: { 'if-match': `"${revision}"` } });
+const ifNoneMatch = (value = '*') => ({ ...context, headers: { 'if-none-match': value } });
+
+const idFor = (tag = 'default') => `mem-${String(tag).replace(/[^A-Za-z0-9_-]/g, '_')}--`.padEnd(16, '_');
+const DEFAULT_ID = idFor('run-2026-09-28-a');
 
 const stored = (id) => __test.stores.get('Memory').get(id);
 const memoryRows = () => __test.stores.get('Memory');
@@ -35,7 +37,6 @@ const validInput = (overrides = {}) => ({
 	title: 'Disk saturation on the east cluster',
 	content: 'The database stalls when iowait passes 30%.',
 	evidence: [{ kind: 'url', ref: 'https://tickets.example/4821' }],
-	idempotencyKey: 'run-2026-09-28-a',
 	...overrides,
 });
 
@@ -55,9 +56,11 @@ beforeEach(() => {
 	applySettings(parseSettings({}));
 });
 
-describe('create', () => {
+describe('create via putMemory', () => {
 	it('defaults to private: one owner scope, revision 1, author provenance', async () => {
-		const { memory, created } = await createMemory(validInput(), alice, context);
+		const { id, revision, created, memory } = await putMemory(DEFAULT_ID, validInput(), alice, context);
+		assert.equal(id, DEFAULT_ID);
+		assert.equal(revision, 1);
 		assert.equal(created, true);
 		assert.deepEqual(memory.scopes, ['user:alice']);
 		assert.equal(memory.ownerId, 'alice');
@@ -72,12 +75,32 @@ describe('create', () => {
 		assert.equal(memory.embedding, undefined, 'the view never carries the vector');
 		assert.equal(memory.durability, undefined);
 		assert.equal(memory.pinned, undefined);
+		assert.equal(stored(memory.id).idempotencyKey, undefined);
+		assert.equal(stored(memory.id).createFingerprint, undefined);
 	});
 
-	it('derives the id from the principal and idempotency key, not the payload', async () => {
-		const { memory } = await createMemory(validInput(), alice, context);
-		assert.equal(memory.id, memoryIdFor('alice', 'run-2026-09-28-a'));
-		assert.notEqual(memoryIdFor('bob', 'run-2026-09-28-a'), memory.id);
+	it('validates the client-chosen id against ^[A-Za-z0-9_-]{16,64}$', async () => {
+		for (const validId of [
+			'a'.repeat(16),
+			'Z'.repeat(64),
+			'550e8400-e29b-41d4-a716-446655440000',
+			'mem_id-0123456789',
+		]) {
+			const res = await putMemory(validId, validInput(), alice, context);
+			assert.equal(res.id, validId);
+			assert.equal(res.created, true);
+		}
+		for (const badId of [
+			'',
+			'short-id-15char',
+			'a'.repeat(65),
+			'invalid:character!',
+			'has space inside16',
+			null,
+			123,
+		]) {
+			await rejection(putMemory(badId, validInput(), alice, context), 400, 'invalid_id');
+		}
 	});
 
 	it('rejects server-derived and removed fields in the payload without echoing their names', async () => {
@@ -93,11 +116,14 @@ describe('create', () => {
 			'evidenceMemoryIds',
 			'durability',
 			'pinned',
+			'idempotencyKey',
+			'createFingerprint',
+			'expectedRevision',
 		]) {
-			await rejection(createMemory(validInput({ [field]: 'x' }), alice, context), 400, 'unsupported_fields');
+			await rejection(putMemory(DEFAULT_ID, validInput({ [field]: 'x' }), alice, context), 400, 'unsupported_fields');
 		}
 		const error = await rejection(
-			createMemory(validInput({ synthetic_private_token: 'x' }), alice, context),
+			putMemory(DEFAULT_ID, validInput({ synthetic_private_token: 'x' }), alice, context),
 			400,
 			'unsupported_fields',
 		);
@@ -105,254 +131,244 @@ describe('create', () => {
 		assert.equal(memoryRows().size, 0);
 	});
 
-	it('requires an idempotency key and refuses the reserved import prefix', async () => {
-		await rejection(
-			createMemory(validInput({ idempotencyKey: undefined }), alice, context),
-			400,
-			'idempotencyKey_required',
-		);
-		await rejection(
-			createMemory(validInput({ idempotencyKey: 'import:flair:1' }), alice, context),
-			400,
-			'reserved_idempotency_key',
-		);
-	});
-
 	it('bounds title, content and evidence before writing', async () => {
-		await rejection(createMemory(validInput({ title: 'x'.repeat(201) }), alice, context), 400, 'title_too_long');
-		await rejection(createMemory(validInput({ content: 'x'.repeat(20_001) }), alice, context), 400, 'content_too_long');
+		await rejection(
+			putMemory(DEFAULT_ID, validInput({ title: 'x'.repeat(201) }), alice, context),
+			400,
+			'title_too_long',
+		);
+		await rejection(
+			putMemory(DEFAULT_ID, validInput({ content: 'x'.repeat(20_001) }), alice, context),
+			400,
+			'content_too_long',
+		);
 		const evidence = Array.from({ length: EVIDENCE_MAX_ITEMS + 1 }, (_, i) => ({ kind: 'doc', ref: `ref-${i}` }));
-		await rejection(createMemory(validInput({ evidence }), alice, context), 400, 'evidence_too_many');
+		await rejection(putMemory(DEFAULT_ID, validInput({ evidence }), alice, context), 400, 'evidence_too_many');
 		assert.equal(memoryRows().size, 0);
 	});
 
 	it('shared maps to global; explicit scopes win; every label must be writable', async () => {
-		const shared = await createMemory(validInput({ visibility: 'shared' }), alice, context);
+		const shared = await putMemory(idFor('k1'), validInput({ visibility: 'shared' }), alice, context);
 		assert.deepEqual(shared.memory.scopes, ['global']);
 		assert.equal(shared.memory.ownerId, 'alice');
 
-		const explicit = await createMemory(
-			validInput({ idempotencyKey: 'k2', scopes: ['customer:x'], visibility: 'shared' }),
+		const explicit = await putMemory(
+			idFor('k2'),
+			validInput({ scopes: ['customer:x'], visibility: 'shared' }),
 			carol,
 			context,
 		);
 		assert.deepEqual(explicit.memory.scopes, ['customer:x']);
 
 		await rejection(
-			createMemory(validInput({ idempotencyKey: 'k3', scopes: ['customer:x'] }), alice, context),
+			putMemory(idFor('k3'), validInput({ scopes: ['customer:x'] }), alice, context),
 			403,
 			'scope_not_writable',
 		);
-		await rejection(createMemory(validInput({ idempotencyKey: 'k4', visibility: 'shared' }), outsider, context), 403);
-		await rejection(createMemory(validInput({ idempotencyKey: 'k5', visibility: 'public' }), alice, context), 400);
+		await rejection(putMemory(idFor('k4'), validInput({ visibility: 'shared' }), outsider, context), 403);
+		await rejection(putMemory(idFor('k5'), validInput({ visibility: 'public' }), alice, context), 400);
+	});
+
+	it('honours If-None-Match: * for create-only PUT and rejects If-Match on an absent id', async () => {
+		await rejection(putMemory(DEFAULT_ID, validInput(), alice, ifMatch(1)), 412, 'precondition_failed');
+		const created = await putMemory(DEFAULT_ID, validInput(), alice, ifNoneMatch('*'));
+		assert.equal(created.created, true);
+		assert.equal(created.revision, 1);
+		await rejection(putMemory(DEFAULT_ID, validInput(), alice, ifNoneMatch('*')), 412, 'precondition_failed');
 	});
 });
 
-describe('idempotent create', () => {
-	it('returns the existing row on a matching retry, without a second row or sink call', async () => {
+describe('idempotent retry and collisions on putMemory', () => {
+	it('returns 200 with no write or sink call when editable fields equal the stored ones', async () => {
 		const writes = [];
 		const unregister = registerMemorySink({ write: (memory) => writes.push(memory.id) });
 		try {
-			const first = await createMemory(validInput({ tags: ['b', 'a'] }), alice, context);
-			const retry = await createMemory(validInput({ tags: ['a', 'b'] }), alice, context);
+			const first = await putMemory(DEFAULT_ID, validInput({ tags: ['b', 'a'] }), alice, context);
+			const retry = await putMemory(DEFAULT_ID, validInput({ tags: ['a', 'b'] }), alice, context);
 			assert.equal(retry.created, false);
-			assert.equal(retry.memory.id, first.memory.id);
+			assert.equal(retry.id, first.id);
+			assert.equal(retry.revision, 1);
 			assert.deepEqual(retry.memory.tags, ['a', 'b']);
 			assert.equal(memoryRows().size, 1);
-			assert.deepEqual(writes, [first.memory.id]);
+			assert.deepEqual(writes, [first.id]);
 		} finally {
 			unregister();
 		}
 	});
 
-	it('fails a conflicting retry with 409 and leaves the row alone', async () => {
-		const first = await createMemory(validInput(), alice, context);
-		await rejection(
-			createMemory(validInput({ content: 'Something else' }), alice, context),
-			409,
-			'idempotency_conflict',
-		);
-		await rejection(createMemory(validInput({ visibility: 'shared' }), alice, context), 409, 'idempotency_conflict');
-		assert.equal(stored(first.memory.id).content, validInput().content);
-	});
+	it('accepts supersedes on an identical retry of a create that had the same supersedes, and rejects it on a revise', async () => {
+		const old = await putMemory(idFor('old'), validInput({ visibility: 'shared' }), alice, context);
+		const createPayload = validInput({ visibility: 'shared', supersedes: [old.id] });
+		const first = await putMemory(idFor('next'), createPayload, alice, context);
+		assert.equal(first.created, true);
 
-	it('still matches a late retry of the original create after a revision', async () => {
-		const first = await createMemory(validInput(), alice, context);
-		await reviseMemory(first.memory.id, { content: 'Revised body', expectedRevision: 1 }, alice, context);
-		const retry = await createMemory(validInput(), alice, context);
+		const retry = await putMemory(idFor('next'), createPayload, alice, context);
 		assert.equal(retry.created, false);
-		assert.equal(retry.memory.revision, 2);
-		assert.equal(retry.memory.content, 'Revised body');
+		assert.equal(retry.revision, 1);
+
+		await rejection(
+			putMemory(idFor('next'), { ...createPayload, content: 'Revised body' }, alice, ifMatch(1)),
+			400,
+			'supersedes_not_allowed',
+		);
+		await rejection(putMemory(idFor('next'), createPayload, alice, ifMatch(1)), 400, 'supersedes_not_allowed');
+		await rejection(
+			putMemory(idFor('next'), { ...validInput({ visibility: 'shared' }), supersedes: [DEFAULT_ID] }, alice, context),
+			400,
+			'supersedes_not_allowed',
+		);
 	});
 
-	it('is scoped per principal', async () => {
-		await createMemory(validInput(), alice, context);
-		await createMemory(validInput(), bob, context);
-		assert.equal(memoryRows().size, 2);
+	it('requires If-Match when editable fields differ from the stored ones', async () => {
+		const first = await putMemory(DEFAULT_ID, validInput(), alice, context);
+		await rejection(
+			putMemory(DEFAULT_ID, validInput({ content: 'Something else' }), alice, context),
+			428,
+			'if_match_required',
+		);
+		await rejection(
+			putMemory(DEFAULT_ID, validInput({ visibility: 'shared' }), alice, context),
+			428,
+			'if_match_required',
+		);
+		assert.equal(stored(first.id).content, validInput().content);
+	});
+
+	it('distinguishes 403 not_memory_owner (readable) from 409 id_unavailable (unreadable)', async () => {
+		await putMemory(idFor('shared-id'), validInput({ visibility: 'shared' }), alice, context);
+		await putMemory(idFor('private-id'), validInput(), alice, context);
+
+		await rejection(putMemory(idFor('shared-id'), validInput(), bob, context), 403, 'not_memory_owner');
+		await rejection(putMemory(idFor('private-id'), validInput(), bob, context), 409, 'id_unavailable');
 	});
 });
 
 describe('revise and scope changes', () => {
 	it('keeps scopes and ownership when omitted, allows clearing validUntil with null, and bumps the revision once', async () => {
-		const { memory } = await createMemory(
+		const { memory } = await putMemory(
+			DEFAULT_ID,
 			validInput({ visibility: 'shared', validUntil: '2099-01-01T00:00:00.000Z' }),
 			alice,
 			context,
 		);
 		assert.equal(memory.validUntil, '2099-01-01T00:00:00.000Z');
-		const revised = await reviseMemory(
+		const revised = await putMemory(
 			memory.id,
-			{ content: 'The stall starts at 25%.', validUntil: null, expectedRevision: 1 },
+			{ content: 'The stall starts at 25%.', validUntil: null },
 			alice,
-			context,
+			ifMatch(1),
 		);
+		assert.equal(revised.created, false);
 		assert.equal(revised.revision, 2);
-		assert.deepEqual(revised.scopes, ['global']);
-		assert.equal(revised.ownerId, 'alice');
-		assert.equal(revised.title, memory.title);
-		assert.equal(revised.validUntil, null);
-		assert.equal(revised.author.principalId, 'alice');
-		assert.equal(revised.lastEditor.principalId, 'alice');
-		assert.notEqual(revised.updatedAt, memory.updatedAt);
+		assert.deepEqual(revised.memory.scopes, ['global']);
+		assert.equal(revised.memory.ownerId, 'alice');
+		assert.equal(revised.memory.title, memory.title);
+		assert.equal(revised.memory.validUntil, null);
+		assert.equal(revised.memory.author.principalId, 'alice');
+		assert.equal(revised.memory.lastEditor.principalId, 'alice');
+		assert.notEqual(revised.memory.updatedAt, memory.updatedAt);
 		assert.equal(stored(memory.id).embeddingModel, 'default');
 	});
 
 	it('changes scopes only when asked, re-deriving rather than merging', async () => {
-		const { memory } = await createMemory(validInput(), alice, context);
-		const shared = await setMemoryScopes(memory.id, { visibility: 'shared', expectedRevision: 1 }, alice, context);
-		assert.deepEqual(shared.scopes, ['global']);
-		const back = await setMemoryScopes(memory.id, { visibility: 'private', expectedRevision: 2 }, alice, context);
-		assert.deepEqual(back.scopes, ['user:alice']);
+		const { memory } = await putMemory(DEFAULT_ID, validInput(), alice, context);
+		const shared = await putMemory(memory.id, { visibility: 'shared' }, alice, ifMatch(1));
+		assert.deepEqual(shared.memory.scopes, ['global']);
+		const back = await putMemory(memory.id, { visibility: 'private' }, alice, ifMatch(2));
+		assert.deepEqual(back.memory.scopes, ['user:alice']);
 	});
 
 	it('refuses a revision that would keep publishing to a label the owner can no longer write', async () => {
-		const { memory } = await createMemory(validInput({ visibility: 'shared' }), alice, context);
+		const { memory } = await putMemory(DEFAULT_ID, validInput({ visibility: 'shared' }), alice, context);
 		const demoted = grant('alice', ['global'], []);
-		await rejection(
-			reviseMemory(memory.id, { content: 'new', expectedRevision: 1 }, demoted, context),
-			403,
-			'scope_not_writable',
-		);
-		const narrowed = await setMemoryScopes(memory.id, { visibility: 'private', expectedRevision: 1 }, demoted, context);
-		assert.deepEqual(narrowed.scopes, ['user:alice']);
+		await rejection(putMemory(memory.id, { content: 'new' }, demoted, ifMatch(1)), 403, 'scope_not_writable');
+		const narrowed = await putMemory(memory.id, { visibility: 'private' }, demoted, ifMatch(1));
+		assert.deepEqual(narrowed.memory.scopes, ['user:alice']);
 	});
 
-	it('the scopes route accepts scopes, visibility and expectedRevision only', async () => {
-		const { memory } = await createMemory(validInput(), alice, context);
-		for (const forged of [{ ownerId: 'bob' }, { title: 'rewritten' }, { content: 'rewritten' }, { revision: 99 }]) {
-			await rejection(
-				setMemoryScopes(memory.id, { visibility: 'shared', expectedRevision: 1, ...forged }, alice, context),
-				400,
-				'unsupported_fields',
-			);
-		}
-		for (const bad of [null, 'shared', ['shared'], 7]) {
-			await rejection(setMemoryScopes(memory.id, bad, alice, context), 400, 'invalid_payload');
-		}
-		assert.equal(stored(memory.id).revision, 1);
-	});
-
-	it('refuses to blank out a title or content, null scopes/visibility, and an empty revision', async () => {
-		const { memory } = await createMemory(validInput(), alice, context);
+	it('refuses to blank out a title or content, null scopes/visibility, and an empty payload', async () => {
+		const { memory } = await putMemory(DEFAULT_ID, validInput(), alice, context);
 		for (const field of ['title', 'content']) {
-			await rejection(
-				reviseMemory(memory.id, { [field]: '   ', expectedRevision: 1 }, alice, context),
-				400,
-				`${field}_required`,
-			);
+			await rejection(putMemory(memory.id, { [field]: '   ' }, alice, ifMatch(1)), 400, `${field}_required`);
 		}
-		await rejection(
-			reviseMemory(memory.id, { scopes: null, expectedRevision: 1 }, alice, context),
-			400,
-			'invalid_scopes',
-		);
-		await rejection(
-			reviseMemory(memory.id, { visibility: null, expectedRevision: 1 }, alice, context),
-			400,
-			'invalid_visibility',
-		);
-		await rejection(reviseMemory(memory.id, { expectedRevision: 1 }, alice, context), 400, 'empty_revision');
+		await rejection(putMemory(memory.id, { scopes: null }, alice, ifMatch(1)), 400, 'invalid_scopes');
+		await rejection(putMemory(memory.id, { visibility: null }, alice, ifMatch(1)), 400, 'invalid_visibility');
+		await rejection(putMemory(memory.id, {}, alice, ifMatch(1)), 400, 'empty_payload');
 		assert.equal(stored(memory.id).revision, 1);
 	});
 });
 
-describe('expected revision', () => {
-	it('rejects a stale revision and leaves the row unchanged', async () => {
-		const { memory } = await createMemory(validInput(), alice, context);
-		await reviseMemory(memory.id, { content: 'first edit', expectedRevision: 1 }, alice, context);
-		await rejection(
-			reviseMemory(memory.id, { content: 'stale', expectedRevision: 1 }, alice, context),
-			409,
-			'revision_conflict',
-		);
+describe('If-Match preconditions', () => {
+	it('rejects a stale revision with 412 and leaves the row unchanged', async () => {
+		const { memory } = await putMemory(DEFAULT_ID, validInput(), alice, context);
+		await putMemory(memory.id, { content: 'first edit' }, alice, ifMatch(1));
+		await rejection(putMemory(memory.id, { content: 'stale' }, alice, ifMatch(1)), 412, 'precondition_failed');
+		await rejection(withdrawMemory(memory.id, {}, alice, ifMatch(1)), 412, 'precondition_failed');
 		assert.equal(stored(memory.id).content, 'first edit');
 	});
 
-	it('is required on every mutation', async () => {
-		const { memory } = await createMemory(validInput(), alice, context);
-		for (const bad of [undefined, null, 0, -1, '1', 1.5]) {
+	it('requires If-Match on every revise and withdrawal (428 if_match_required)', async () => {
+		const { memory } = await putMemory(DEFAULT_ID, validInput(), alice, context);
+		await rejection(putMemory(memory.id, { content: 'x' }, alice, context), 428, 'if_match_required');
+		await rejection(withdrawMemory(memory.id, {}, alice, context), 428, 'if_match_required');
+		for (const badHeader of ['1', 'W/"1"', '"2"', '"0"', 'invalid']) {
 			await rejection(
-				reviseMemory(memory.id, { content: 'x', expectedRevision: bad }, alice, context),
-				400,
-				'expected_revision_required',
+				putMemory(memory.id, { content: 'x' }, alice, { ...context, headers: { 'if-match': badHeader } }),
+				412,
+				'precondition_failed',
 			);
 			await rejection(
-				withdrawMemory(memory.id, { expectedRevision: bad }, alice, context),
-				400,
-				'expected_revision_required',
+				withdrawMemory(memory.id, {}, alice, { ...context, headers: { 'if-match': badHeader } }),
+				412,
+				'precondition_failed',
 			);
 		}
 	});
 
-	it('serialized concurrent writers: the second sees the first and gets 409', async () => {
-		const { memory } = await createMemory(validInput(), alice, context);
+	it('serialized concurrent writers: the second sees the first and gets 412', async () => {
+		const { memory } = await putMemory(DEFAULT_ID, validInput(), alice, context);
 		const results = await Promise.allSettled([
-			reviseMemory(memory.id, { content: 'writer A', expectedRevision: 1 }, alice, context),
-			reviseMemory(memory.id, { content: 'writer B', expectedRevision: 1 }, alice, context),
+			putMemory(memory.id, { content: 'writer A' }, alice, ifMatch(1)),
+			putMemory(memory.id, { content: 'writer B' }, alice, ifMatch(1)),
 		]);
 		assert.deepEqual(results.map((result) => result.status).sort(), ['fulfilled', 'rejected']);
-		assert.equal(results.find((result) => result.status === 'rejected').reason.code, 'revision_conflict');
+		const rejected = results.find((result) => result.status === 'rejected').reason;
+		assert.equal(rejected.statusCode, 412);
+		assert.equal(rejected.code, 'precondition_failed');
 	});
 
 	it('locks the row inside the lifecycle transaction before reading it', async () => {
-		const { memory } = await createMemory(validInput(), alice, context);
+		const { memory } = await putMemory(DEFAULT_ID, validInput(), alice, context);
 		__test.lockLog.length = 0;
-		await reviseMemory(memory.id, { content: 'locked', expectedRevision: 1 }, alice, context);
+		await putMemory(memory.id, { content: 'locked' }, alice, ifMatch(1));
 		assert.deepEqual(__test.lockLog, [{ table: 'Memory', id: memory.id, inTransaction: true }]);
 	});
 });
 
 describe('ownership', () => {
-	it('a reader who is not the owner gets 403; a non-reader gets the same 404 as a missing id', async () => {
-		const { memory } = await createMemory(validInput({ visibility: 'shared' }), alice, context);
-		await rejection(
-			reviseMemory(memory.id, { content: 'bob was here', expectedRevision: 1 }, bob, context),
-			403,
-			'not_memory_owner',
-		);
-		await rejection(withdrawMemory(memory.id, { expectedRevision: 1 }, bob, context), 403, 'not_memory_owner');
-		const hidden = await rejection(
-			withdrawMemory(memory.id, { expectedRevision: 1 }, outsider, context),
-			404,
-			'memory_not_found',
-		);
-		const missing = await rejection(withdrawMemory('0'.repeat(32), { expectedRevision: 1 }, outsider, context), 404);
+	it('a reader who is not the owner gets 403; a non-reader gets 404 on withdraw and 409 on PUT', async () => {
+		const { memory } = await putMemory(DEFAULT_ID, validInput({ visibility: 'shared' }), alice, context);
+		await rejection(putMemory(memory.id, { content: 'bob was here' }, bob, ifMatch(1)), 403, 'not_memory_owner');
+		await rejection(withdrawMemory(memory.id, {}, bob, ifMatch(1)), 403, 'not_memory_owner');
+		await rejection(putMemory(memory.id, { content: 'outsider' }, outsider, ifMatch(1)), 409, 'id_unavailable');
+		const hidden = await rejection(withdrawMemory(memory.id, {}, outsider, ifMatch(1)), 404, 'memory_not_found');
+		const missing = await rejection(withdrawMemory('0'.repeat(32), {}, outsider, ifMatch(1)), 404);
 		assert.equal(hidden.message, missing.message);
 		assert.equal(stored(memory.id).revision, 1);
 	});
 
 	it('super_user edits any memory; a private shorthand resolves to the owner', async () => {
-		const { memory } = await createMemory(validInput({ visibility: 'shared' }), alice, context);
-		const revised = await setMemoryScopes(memory.id, { visibility: 'private', expectedRevision: 1 }, root, context);
-		assert.deepEqual(revised.scopes, ['user:alice']);
-		assert.equal(revised.ownerId, 'alice');
+		const { memory } = await putMemory(DEFAULT_ID, validInput({ visibility: 'shared' }), alice, context);
+		const revised = await putMemory(memory.id, { visibility: 'private' }, root, ifMatch(1));
+		assert.deepEqual(revised.memory.scopes, ['user:alice']);
+		assert.equal(revised.memory.ownerId, 'alice');
 	});
 });
 
 describe('withdraw', () => {
 	it('leaves a tombstone instead of deleting the row', async () => {
-		const { memory } = await createMemory(validInput(), alice, context);
-		const withdrawn = await withdrawMemory(memory.id, { expectedRevision: 1, reason: 'obsolete' }, alice, context);
+		const { memory } = await putMemory(DEFAULT_ID, validInput(), alice, context);
+		const withdrawn = await withdrawMemory(memory.id, { reason: 'obsolete' }, alice, ifMatch(1));
 		assert.equal(withdrawn.status, 'withdrawn');
 		assert.equal(withdrawn.revision, 2);
 		assert.ok(withdrawn.withdrawnAt);
@@ -361,30 +377,26 @@ describe('withdraw', () => {
 	});
 
 	it('refuses further mutation of a withdrawn memory', async () => {
-		const { memory } = await createMemory(validInput(), alice, context);
-		await withdrawMemory(memory.id, { expectedRevision: 1 }, alice, context);
-		await rejection(
-			reviseMemory(memory.id, { content: 'x', expectedRevision: 2 }, alice, context),
-			409,
-			'memory_withdrawn',
-		);
-		await rejection(withdrawMemory(memory.id, { expectedRevision: 2 }, alice, context), 409, 'memory_withdrawn');
+		const { memory } = await putMemory(DEFAULT_ID, validInput(), alice, context);
+		await withdrawMemory(memory.id, {}, alice, ifMatch(1));
+		await rejection(putMemory(memory.id, { content: 'x' }, alice, ifMatch(2)), 409, 'memory_withdrawn');
+		await rejection(withdrawMemory(memory.id, {}, alice, ifMatch(2)), 409, 'memory_withdrawn');
 	});
 
 	it('hides a withdrawn shared memory from everyone but its owner', async () => {
-		const { memory } = await createMemory(validInput({ visibility: 'shared' }), alice, context);
-		await withdrawMemory(memory.id, { expectedRevision: 1 }, alice, context);
+		const { memory } = await putMemory(DEFAULT_ID, validInput({ visibility: 'shared' }), alice, context);
+		await withdrawMemory(memory.id, {}, alice, ifMatch(1));
 		assert.equal(await getMemory(memory.id, bob), undefined);
 		assert.equal((await getMemory(memory.id, alice)).status, 'withdrawn');
 	});
 });
 
 describe('supersede', () => {
-	const shared = (key, overrides = {}) => validInput({ idempotencyKey: key, visibility: 'shared', ...overrides });
+	const shared = (overrides = {}) => validInput({ visibility: 'shared', ...overrides });
 
 	it('marks the old memory superseded in the same transaction', async () => {
-		const old = (await createMemory(shared('v1'), alice, context)).memory;
-		const next = (await createMemory(shared('v2', { supersedes: [old.id] }), bob, context)).memory;
+		const old = (await putMemory(idFor('v1'), shared(), alice, context)).memory;
+		const next = (await putMemory(idFor('v2'), shared({ supersedes: [old.id] }), bob, context)).memory;
 		assert.deepEqual(next.supersedes, [old.id]);
 		const after = await getMemory(old.id, alice);
 		assert.equal(after.status, 'superseded');
@@ -393,51 +405,45 @@ describe('supersede', () => {
 	});
 
 	it('requires reading the old memory (identical 404) and covering its scopes', async () => {
-		const secret = (await createMemory(validInput({ idempotencyKey: 'secret' }), alice, context)).memory;
-		await rejection(createMemory(shared('probe', { supersedes: [secret.id] }), bob, context), 404, 'memory_not_found');
-		const customer = (await createMemory(validInput({ idempotencyKey: 'cx', scopes: ['customer:x'] }), carol, context))
-			.memory;
-		const root2 = await rejection(createMemory(shared('narrow', { supersedes: [customer.id] }), root, context), 403);
+		const secret = (await putMemory(idFor('secret'), validInput(), alice, context)).memory;
+		await rejection(
+			putMemory(idFor('probe'), shared({ supersedes: [secret.id] }), bob, context),
+			404,
+			'memory_not_found',
+		);
+		const customer = (await putMemory(idFor('cx'), validInput({ scopes: ['customer:x'] }), carol, context)).memory;
+		const root2 = await rejection(
+			putMemory(idFor('narrow'), shared({ supersedes: [customer.id] }), root, context),
+			403,
+		);
 		assert.equal(root2.code, 'supersede_scope_narrowing');
 		assert.equal((await getMemory(customer.id, carol)).status, 'active');
 	});
 
 	it('refuses to supersede a withdrawn memory', async () => {
-		const old = (await createMemory(shared('v1'), alice, context)).memory;
-		await withdrawMemory(old.id, { expectedRevision: 1 }, alice, context);
-		await rejection(createMemory(shared('v2', { supersedes: [old.id] }), root, context), 409, 'memory_withdrawn');
+		const old = (await putMemory(idFor('v1'), shared(), alice, context)).memory;
+		await withdrawMemory(old.id, {}, alice, ifMatch(1));
+		await rejection(putMemory(idFor('v2'), shared({ supersedes: [old.id] }), root, context), 409, 'memory_withdrawn');
 	});
 
 	it('freezes a superseded memory except for withdrawal', async () => {
-		const old = (await createMemory(shared('v1'), alice, context)).memory;
-		await createMemory(shared('v2', { supersedes: [old.id] }), bob, context);
-		await rejection(
-			reviseMemory(old.id, { content: 'edit', expectedRevision: 2 }, alice, context),
-			409,
-			'memory_superseded',
-		);
-		await rejection(
-			setMemoryScopes(old.id, { visibility: 'private', expectedRevision: 2 }, alice, context),
-			409,
-			'memory_superseded',
-		);
-		assert.equal((await withdrawMemory(old.id, { expectedRevision: 2 }, alice, context)).status, 'withdrawn');
+		const old = (await putMemory(idFor('v1'), shared(), alice, context)).memory;
+		await putMemory(idFor('v2'), shared({ supersedes: [old.id] }), bob, context);
+		await rejection(putMemory(old.id, { content: 'edit' }, alice, ifMatch(2)), 409, 'memory_superseded');
+		await rejection(putMemory(old.id, { visibility: 'private' }, alice, ifMatch(2)), 409, 'memory_superseded');
+		assert.equal((await withdrawMemory(old.id, {}, alice, ifMatch(2))).status, 'withdrawn');
 	});
 
 	it('keeps the superseder covering what it superseded', async () => {
-		const old = (await createMemory(shared('v1'), alice, context)).memory;
-		const next = (await createMemory(shared('v2', { supersedes: [old.id] }), alice, context)).memory;
-		await rejection(
-			setMemoryScopes(next.id, { visibility: 'private', expectedRevision: 1 }, alice, context),
-			403,
-			'supersede_scope_narrowing',
-		);
+		const old = (await putMemory(idFor('v1'), shared(), alice, context)).memory;
+		const next = (await putMemory(idFor('v2'), shared({ supersedes: [old.id] }), alice, context)).memory;
+		await rejection(putMemory(next.id, { visibility: 'private' }, alice, ifMatch(1)), 403, 'supersede_scope_narrowing');
 	});
 
 	it('withdrawing the only superseder restores the old memory', async () => {
-		const old = (await createMemory(shared('v1'), alice, context)).memory;
-		const next = (await createMemory(shared('v2', { supersedes: [old.id] }), bob, context)).memory;
-		await withdrawMemory(next.id, { expectedRevision: 1 }, bob, context);
+		const old = (await putMemory(idFor('v1'), shared(), alice, context)).memory;
+		const next = (await putMemory(idFor('v2'), shared({ supersedes: [old.id] }), bob, context)).memory;
+		await withdrawMemory(next.id, {}, bob, ifMatch(1));
 		const restored = await getMemory(old.id, alice);
 		assert.equal(restored.status, 'active');
 		assert.equal(restored.supersededBy, null);
@@ -445,39 +451,39 @@ describe('supersede', () => {
 	});
 
 	it('stays superseded while another non-withdrawn memory supersedes it, newest first', async () => {
-		const old = (await createMemory(shared('t'), alice, context)).memory;
-		const b = (await createMemory(shared('b', { supersedes: [old.id] }), bob, context)).memory;
-		const c = (await createMemory(shared('c', { supersedes: [old.id] }), bob, context)).memory;
+		const old = (await putMemory(idFor('t'), shared(), alice, context)).memory;
+		const b = (await putMemory(idFor('b'), shared({ supersedes: [old.id] }), bob, context)).memory;
+		const c = (await putMemory(idFor('c'), shared({ supersedes: [old.id] }), bob, context)).memory;
 		assert.equal((await getMemory(old.id, alice)).supersededBy, c.id);
 		// c is itself superseded by d: it still carries the chain, so withdrawing b must not restore old.
-		await createMemory(shared('d', { supersedes: [c.id] }), bob, context);
-		await withdrawMemory(b.id, { expectedRevision: 1 }, bob, context);
+		await putMemory(idFor('d'), shared({ supersedes: [c.id] }), bob, context);
+		await withdrawMemory(b.id, {}, bob, ifMatch(1));
 		const afterB = await getMemory(old.id, alice);
 		assert.equal(afterB.status, 'superseded');
 		assert.equal(afterB.supersededBy, c.id);
-		await withdrawMemory(c.id, { expectedRevision: 2 }, bob, context);
+		await withdrawMemory(c.id, {}, bob, ifMatch(2));
 		assert.equal((await getMemory(old.id, alice)).status, 'active');
 	});
 
 	it('recomputes a target whose pointer names a different superseder', async () => {
-		const old = (await createMemory(shared('t'), alice, context)).memory;
-		const b = (await createMemory(shared('b', { supersedes: [old.id] }), bob, context)).memory;
-		const c = (await createMemory(shared('c', { supersedes: [old.id] }), bob, context)).memory;
-		await withdrawMemory(c.id, { expectedRevision: 1 }, bob, context);
+		const old = (await putMemory(idFor('t'), shared(), alice, context)).memory;
+		const b = (await putMemory(idFor('b'), shared({ supersedes: [old.id] }), bob, context)).memory;
+		const c = (await putMemory(idFor('c'), shared({ supersedes: [old.id] }), bob, context)).memory;
+		await withdrawMemory(c.id, {}, bob, ifMatch(1));
 		assert.equal((await getMemory(old.id, alice)).supersededBy, b.id);
-		await withdrawMemory(b.id, { expectedRevision: 1 }, bob, context);
+		await withdrawMemory(b.id, {}, bob, ifMatch(1));
 		assert.equal((await getMemory(old.id, alice)).status, 'active');
 	});
 });
 
 describe('supersede bookkeeping at scale and under contention', () => {
-	const shared = (key, overrides = {}) => validInput({ idempotencyKey: key, visibility: 'shared', ...overrides });
+	const shared = (overrides = {}) => validInput({ visibility: 'shared', ...overrides });
 
 	it('takes every lock a withdrawal needs once, in sorted order', async () => {
-		const old = (await createMemory(shared('t'), alice, context)).memory;
-		const next = (await createMemory(shared('n', { supersedes: [old.id] }), alice, context)).memory;
+		const old = (await putMemory(idFor('t'), shared(), alice, context)).memory;
+		const next = (await putMemory(idFor('n'), shared({ supersedes: [old.id] }), alice, context)).memory;
 		__test.lockLog.length = 0;
-		await withdrawMemory(next.id, { expectedRevision: 1 }, alice, context);
+		await withdrawMemory(next.id, {}, alice, ifMatch(1));
 		assert.deepEqual(
 			__test.lockLog.map((entry) => entry.id),
 			[old.id, next.id].sort(),
@@ -485,15 +491,15 @@ describe('supersede bookkeeping at scale and under contention', () => {
 	});
 
 	it('keeps a target superseded while any of more than 100 superseders remains', async () => {
-		const old = (await createMemory(shared('t'), alice, context)).memory;
+		const old = (await putMemory(idFor('t'), shared(), alice, context)).memory;
 		const holders = [];
 		for (let i = 0; i < 101; i++)
-			holders.push((await createMemory(shared(`h${i}`, { supersedes: [old.id] }), bob, context)).memory);
-		for (const holder of holders.slice(0, 100)) await withdrawMemory(holder.id, { expectedRevision: 1 }, bob, context);
+			holders.push((await putMemory(idFor(`h${i}`), shared({ supersedes: [old.id] }), bob, context)).memory);
+		for (const holder of holders.slice(0, 100)) await withdrawMemory(holder.id, {}, bob, ifMatch(1));
 		const still = await getMemory(old.id, alice);
 		assert.equal(still.status, 'superseded');
 		assert.equal(still.supersededBy, holders[100].id);
-		await withdrawMemory(holders[100].id, { expectedRevision: 1 }, bob, context);
+		await withdrawMemory(holders[100].id, {}, bob, ifMatch(1));
 		assert.equal((await getMemory(old.id, alice)).status, 'active');
 	});
 });
@@ -507,16 +513,11 @@ describe('sinks', () => {
 				calls.push(['withdraw', memory.id, memory.status, Boolean(txnContext.transaction)]),
 		});
 		try {
-			const old = (await createMemory(validInput({ idempotencyKey: 'o', visibility: 'shared' }), alice, context))
-				.memory;
+			const old = (await putMemory(idFor('o'), validInput({ visibility: 'shared' }), alice, context)).memory;
 			const next = (
-				await createMemory(
-					validInput({ idempotencyKey: 'n', visibility: 'shared', supersedes: [old.id] }),
-					bob,
-					context,
-				)
+				await putMemory(idFor('n'), validInput({ visibility: 'shared', supersedes: [old.id] }), bob, context)
 			).memory;
-			await withdrawMemory(next.id, { expectedRevision: 1 }, bob, context);
+			await withdrawMemory(next.id, {}, bob, ifMatch(1));
 			assert.deepEqual(calls, [
 				['write', old.id, 'active', true],
 				['write', next.id, 'active', true],
@@ -541,7 +542,7 @@ describe('sinks', () => {
 		});
 		const unregisterB = registerMemorySink({ write: () => calls.push('b') });
 		try {
-			const pending = createMemory(validInput(), alice, context);
+			const pending = putMemory(DEFAULT_ID, validInput(), alice, context);
 			await new Promise((resolve) => setImmediate(resolve));
 			unregisterA();
 			release();
@@ -554,7 +555,7 @@ describe('sinks', () => {
 	});
 
 	it('a throwing sink rolls back the memory and its supersede side effect', async () => {
-		const old = (await createMemory(validInput({ idempotencyKey: 'o', visibility: 'shared' }), alice, context)).memory;
+		const old = (await putMemory(idFor('o'), validInput({ visibility: 'shared' }), alice, context)).memory;
 		const unregister = registerMemorySink({
 			write() {
 				throw new Error('handoff rejected');
@@ -562,7 +563,7 @@ describe('sinks', () => {
 		});
 		try {
 			await assert.rejects(
-				createMemory(validInput({ idempotencyKey: 'n', visibility: 'shared', supersedes: [old.id] }), bob, context),
+				putMemory(idFor('n'), validInput({ visibility: 'shared', supersedes: [old.id] }), bob, context),
 				/handoff rejected/,
 			);
 		} finally {
@@ -575,11 +576,11 @@ describe('sinks', () => {
 
 describe('embedding model', () => {
 	it('installs the override only for a non-default model, and tags each row with the model that embedded it', async () => {
-		await createMemory(validInput(), alice, context);
+		await putMemory(DEFAULT_ID, validInput(), alice, context);
 		assert.equal(__test.setEmbedCalls.length, 0);
 
 		applySettings(parseSettings({ embeddingModel: 'local:small' }));
-		const { memory } = await createMemory(validInput({ idempotencyKey: 'k2' }), alice, context);
+		const { memory } = await putMemory(idFor('k2'), validInput(), alice, context);
 		assert.deepEqual(__test.setEmbedCalls, [{ table: 'Memory', attribute: 'embedding' }]);
 		assert.equal(stored(memory.id).embeddingModel, 'local:small');
 		assert.deepEqual(models.calls.at(-1).options, { model: 'local:small', inputType: 'document', signal: undefined });
@@ -589,8 +590,8 @@ describe('embedding model', () => {
 
 describe('typed evidence and evidenceMemoryIds', () => {
 	it('accepts all six kinds, derives deduplicated evidenceMemoryIds, and indexes them for search', async () => {
-		const m1 = (await createMemory(validInput({ idempotencyKey: 'm1', visibility: 'shared' }), alice, context)).memory;
-		const m2 = (await createMemory(validInput({ idempotencyKey: 'm2' }), bob, context)).memory;
+		const m1 = (await putMemory(idFor('m1'), validInput({ visibility: 'shared' }), alice, context)).memory;
+		const m2 = (await putMemory(idFor('m2'), validInput(), bob, context)).memory;
 		const evidence = [
 			{ kind: 'memory', ref: m1.id, note: 'shared antecedent' },
 			{ kind: 'memory', ref: m1.id, note: 'duplicate ref still deduplicates evidenceMemoryIds' },
@@ -601,7 +602,7 @@ describe('typed evidence and evidenceMemoryIds', () => {
 			{ kind: 'url', ref: 'https://tickets.example/4821' },
 			{ kind: 'text', ref: 'observed in staging logs', note: 'east-1' },
 		];
-		const { memory } = await createMemory(validInput({ idempotencyKey: 'citing', evidence }), bob, context);
+		const { memory } = await putMemory(idFor('citing'), validInput({ evidence }), bob, context);
 		assert.deepEqual(memory.evidence, evidence);
 		assert.deepEqual(memory.evidenceMemoryIds, [m1.id, m2.id]);
 		assert.deepEqual(stored(memory.id).evidenceMemoryIds, [m1.id, m2.id]);
@@ -614,57 +615,35 @@ describe('typed evidence and evidenceMemoryIds', () => {
 		}
 		assert.deepEqual(dependents, [memory.id]);
 
-		const revised = await reviseMemory(
-			memory.id,
-			{ evidence: [{ kind: 'memory', ref: m2.id }], expectedRevision: 1 },
-			bob,
-			context,
-		);
-		assert.deepEqual(revised.evidenceMemoryIds, [m2.id]);
+		const revised = await putMemory(memory.id, { evidence: [{ kind: 'memory', ref: m2.id }] }, bob, ifMatch(1));
+		assert.deepEqual(revised.memory.evidenceMemoryIds, [m2.id]);
 		assert.deepEqual(stored(memory.id).evidenceMemoryIds, [m2.id]);
 	});
 
 	it('rejects unreadable, missing, or malformed memory-kind refs with the same 400 invalid_evidence on create and revise', async () => {
-		const secret = (await createMemory(validInput({ idempotencyKey: 'secret' }), alice, context)).memory;
-		const withdrawn = (
-			await createMemory(validInput({ idempotencyKey: 'withdrawn', visibility: 'shared' }), alice, context)
-		).memory;
-		await withdrawMemory(withdrawn.id, { expectedRevision: 1 }, alice, context);
+		const secret = (await putMemory(idFor('secret'), validInput(), alice, context)).memory;
+		const withdrawn = (await putMemory(idFor('withdrawn'), validInput({ visibility: 'shared' }), alice, context))
+			.memory;
+		await withdrawMemory(withdrawn.id, {}, alice, ifMatch(1));
 		const missingId = '0'.repeat(32);
 
 		const unreadableErr = await rejection(
-			createMemory(
-				validInput({ idempotencyKey: 'probe-1', evidence: [{ kind: 'memory', ref: secret.id }] }),
-				bob,
-				context,
-			),
+			putMemory(idFor('probe-1'), validInput({ evidence: [{ kind: 'memory', ref: secret.id }] }), bob, context),
 			400,
 			'invalid_evidence',
 		);
 		const missingErr = await rejection(
-			createMemory(
-				validInput({ idempotencyKey: 'probe-2', evidence: [{ kind: 'memory', ref: missingId }] }),
-				bob,
-				context,
-			),
+			putMemory(idFor('probe-2'), validInput({ evidence: [{ kind: 'memory', ref: missingId }] }), bob, context),
 			400,
 			'invalid_evidence',
 		);
 		const withdrawnErr = await rejection(
-			createMemory(
-				validInput({ idempotencyKey: 'probe-3', evidence: [{ kind: 'memory', ref: withdrawn.id }] }),
-				bob,
-				context,
-			),
+			putMemory(idFor('probe-3'), validInput({ evidence: [{ kind: 'memory', ref: withdrawn.id }] }), bob, context),
 			400,
 			'invalid_evidence',
 		);
 		const malformedErr = await rejection(
-			createMemory(
-				validInput({ idempotencyKey: 'probe-4', evidence: [{ kind: 'memory', ref: 'not-a-hex-id' }] }),
-				bob,
-				context,
-			),
+			putMemory(idFor('probe-4'), validInput({ evidence: [{ kind: 'memory', ref: 'short' }] }), bob, context),
 			400,
 			'invalid_evidence',
 		);
@@ -672,14 +651,14 @@ describe('typed evidence and evidenceMemoryIds', () => {
 		assert.equal(withdrawnErr.message, missingErr.message);
 		assert.equal(malformedErr.message, missingErr.message);
 
-		const bobs = (await createMemory(validInput({ idempotencyKey: 'bobs' }), bob, context)).memory;
+		const bobs = (await putMemory(idFor('bobs'), validInput(), bob, context)).memory;
 		const reviseUnreadable = await rejection(
-			reviseMemory(bobs.id, { evidence: [{ kind: 'memory', ref: secret.id }], expectedRevision: 1 }, bob, context),
+			putMemory(bobs.id, { evidence: [{ kind: 'memory', ref: secret.id }] }, bob, ifMatch(1)),
 			400,
 			'invalid_evidence',
 		);
 		const reviseMissing = await rejection(
-			reviseMemory(bobs.id, { evidence: [{ kind: 'memory', ref: missingId }], expectedRevision: 1 }, bob, context),
+			putMemory(bobs.id, { evidence: [{ kind: 'memory', ref: missingId }] }, bob, ifMatch(1)),
 			400,
 			'invalid_evidence',
 		);
@@ -697,10 +676,11 @@ describe('typed evidence and evidenceMemoryIds', () => {
 			[{ kind: 'url', ref: 'https://example.com', note: '   ' }],
 			[{ kind: 'url', ref: 'https://example.com', extra: true }],
 		]) {
-			await rejection(createMemory(validInput({ evidence: bad }), alice, context), 400, 'invalid_evidence');
+			await rejection(putMemory(DEFAULT_ID, validInput({ evidence: bad }), alice, context), 400, 'invalid_evidence');
 		}
 		await rejection(
-			createMemory(
+			putMemory(
+				DEFAULT_ID,
 				validInput({ evidence: [{ kind: 'url', ref: 'x'.repeat(EVIDENCE_REF_MAX_CHARS + 1) }] }),
 				alice,
 				context,
@@ -709,7 +689,8 @@ describe('typed evidence and evidenceMemoryIds', () => {
 			'evidence_too_long',
 		);
 		await rejection(
-			createMemory(
+			putMemory(
+				DEFAULT_ID,
 				validInput({
 					evidence: [{ kind: 'url', ref: 'https://example.com', note: 'x'.repeat(EVIDENCE_NOTE_MAX_CHARS + 1) }],
 				}),
@@ -724,7 +705,7 @@ describe('typed evidence and evidenceMemoryIds', () => {
 
 describe('pin and unpin', () => {
 	it('records a per-reader MemoryPin row, is idempotent, and unpins without touching other readers', async () => {
-		const { memory } = await createMemory(validInput({ visibility: 'shared' }), alice, context);
+		const { memory } = await putMemory(DEFAULT_ID, validInput({ visibility: 'shared' }), alice, context);
 		const first = await pinMemory(memory.id, {}, bob, context);
 		assert.equal(first.pinned, true);
 		assert.equal(first.memoryId, memory.id);
@@ -750,7 +731,7 @@ describe('pin and unpin', () => {
 	});
 
 	it('returns the same 404 for an unreadable memory as for a missing id on pin and unpin', async () => {
-		const secret = (await createMemory(validInput({ idempotencyKey: 'secret' }), alice, context)).memory;
+		const secret = (await putMemory(idFor('secret'), validInput(), alice, context)).memory;
 		const missingId = '0'.repeat(32);
 
 		const pinHidden = await rejection(pinMemory(secret.id, {}, bob, context), 404, 'memory_not_found');
@@ -764,7 +745,7 @@ describe('pin and unpin', () => {
 	});
 
 	it('rejects unknown fields in pin and unpin payloads', async () => {
-		const { memory } = await createMemory(validInput(), alice, context);
+		const { memory } = await putMemory(DEFAULT_ID, validInput(), alice, context);
 		await rejection(pinMemory(memory.id, { pinned: true }, alice, context), 400, 'unsupported_fields');
 		await rejection(unpinMemory(memory.id, { pinned: false }, alice, context), 400, 'unsupported_fields');
 	});
@@ -772,14 +753,14 @@ describe('pin and unpin', () => {
 	it('caps active pins per principal at 50 and evicts stale pins before rejecting', async () => {
 		const memories = [];
 		for (let i = 0; i < BOOTSTRAP_PINNED_LIMIT; i++) {
-			const { memory } = await createMemory(validInput({ idempotencyKey: `pin-${i}` }), alice, context);
+			const { memory } = await putMemory(idFor(`pin-${i}`), validInput(), alice, context);
 			memories.push(memory);
 			await pinMemory(memory.id, {}, alice, context);
 		}
-		const extra = (await createMemory(validInput({ idempotencyKey: 'pin-extra' }), alice, context)).memory;
+		const extra = (await putMemory(idFor('pin-extra'), validInput(), alice, context)).memory;
 		await rejection(pinMemory(extra.id, {}, alice, context), 409, 'pin_limit_exceeded');
 
-		await withdrawMemory(memories[0].id, { expectedRevision: 1 }, alice, context);
+		await withdrawMemory(memories[0].id, {}, alice, ifMatch(1));
 		const pinnedExtra = await pinMemory(extra.id, {}, alice, context);
 		assert.equal(pinnedExtra.pinned, true);
 		assert.equal(pinRows().has(`alice:${memories[0].id}`), false);

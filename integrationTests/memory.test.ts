@@ -28,12 +28,25 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 		return JSON.parse(text);
 	}
 
-	async function call(user: string, method: string, path: string, body?: unknown) {
+	const memId = (tag: string) => `mem-${tag}--`.padEnd(16, '_');
+
+	async function call(
+		user: string,
+		method: string,
+		path: string,
+		body?: unknown,
+		extraHeaders?: Record<string, string>,
+	) {
 		const authorization =
 			user === 'admin' ? basic(ctx.harper.admin.username, ctx.harper.admin.password) : basic(user, PASSWORD);
 		const response = await fetch(`${ctx.harper.httpURL}/Memory/${path}`, {
 			method,
-			headers: { 'Content-Type': 'application/json', Accept: 'application/json', Authorization: authorization },
+			headers: {
+				'Content-Type': 'application/json',
+				Accept: 'application/json',
+				Authorization: authorization,
+				...extraHeaders,
+			},
 			body: body === undefined ? undefined : JSON.stringify(body),
 		});
 		const text = await response.text();
@@ -43,13 +56,19 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 		} catch {
 			parsed = text;
 		}
-		return { status: response.status, body: parsed };
+		return { status: response.status, etag: response.headers.get('etag'), body: parsed };
 	}
 
-	const create = async (user: string, input: Record<string, unknown>) => {
-		const response = await call(user, 'POST', '', input);
+	const create = async (user: string, key: string, input: Record<string, unknown>) => {
+		const id = memId(key);
+		const response = await call(user, 'PUT', id, input);
 		strictEqual(response.status, 201, JSON.stringify(response.body));
-		return response.body.memory;
+		strictEqual(response.body.id, id);
+		strictEqual(response.body.revision, 1);
+		const fetched = await call(user, 'GET', id);
+		strictEqual(fetched.status, 200, JSON.stringify(fetched.body));
+		strictEqual(fetched.etag, '"1"');
+		return fetched.body.memory;
 	};
 	const search = async (user: string, query: string) => {
 		const response = await call(user, 'GET', `?${query}`);
@@ -93,20 +112,25 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 		await teardownHarper(ctx);
 	});
 
-	test('a private memory is invisible to another user: same 404 as a missing id, absent from search', async () => {
-		const memory = await create('alice', {
-			idempotencyKey: 'private-1',
+	test('a private memory is invisible to another user: same 404 as a missing id, 409 on PUT, absent from search', async () => {
+		const memory = await create('alice', 'private-1', {
 			title: 'Alice private note',
 			content: 'zebra migration patterns observed in the northern valley',
 		});
 		deepStrictEqual(memory.scopes, ['user:alice']);
-		strictEqual((await call('alice', 'GET', memory.id)).status, 200);
+		const aliceGet = await call('alice', 'GET', memory.id);
+		strictEqual(aliceGet.status, 200);
+		strictEqual(aliceGet.etag, '"1"');
 
 		const unreadable = await call('bob', 'GET', memory.id);
 		const missing = await call('bob', 'GET', '0'.repeat(32));
 		strictEqual(unreadable.status, 404);
 		deepStrictEqual(unreadable, missing);
-		deepStrictEqual(await call('bob', 'POST', `${memory.id}/withdraw`, { expectedRevision: 1 }), missing);
+		deepStrictEqual(await call('bob', 'DELETE', memory.id, undefined, { 'If-Match': '"1"' }), missing);
+
+		const putCollision = await call('bob', 'PUT', memory.id, { title: 'bob', content: 'collision' });
+		strictEqual(putCollision.status, 409);
+		strictEqual(putCollision.body.code, 'id_unavailable');
 
 		ok((await search('alice', 'q=zebra')).some((hit) => hit.id === memory.id));
 		deepStrictEqual(await search('bob', 'q=zebra'), []);
@@ -114,14 +138,12 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 
 	test('the readable set is applied inside the vector lane, before its limit', async () => {
 		for (let i = 0; i < 5; i++) {
-			await create('alice', {
-				idempotencyKey: `okapi-${i}`,
+			await create('alice', `okapi-${i}`, {
 				title: 'okapi',
 				content: `okapi okapi okapi sighting ${i}`,
 			});
 		}
-		const bobs = await create('bob', {
-			idempotencyKey: 'giraffe',
+		const bobs = await create('bob', 'giraffe', {
 			title: 'giraffe',
 			content: 'giraffe feeding schedule',
 			visibility: 'shared',
@@ -135,8 +157,7 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 	});
 
 	test('a customer:x memory is visible only to customer:x and customer:* holders', async () => {
-		const denied = await call('alice', 'POST', '', {
-			idempotencyKey: 'not-allowed',
+		const denied = await call('alice', 'PUT', memId('not-allowed'), {
 			title: 'nope',
 			content: 'alice holds no customer grant',
 			scopes: ['customer:x'],
@@ -144,14 +165,12 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 		strictEqual(denied.status, 403);
 		strictEqual(denied.body.code, 'scope_not_writable');
 
-		const memory = await create('carol', {
-			idempotencyKey: 'cx-1',
+		const memory = await create('carol', 'cx-1', {
 			title: 'Customer X quirk',
 			content: 'tapir replication lag appears after nightly compaction',
 			scopes: ['customer:x'],
 		});
-		const hiddenFromY = await create('admin', {
-			idempotencyKey: 'cy-1',
+		const hiddenFromY = await create('admin', 'cy-1', {
 			title: 'Customer Y quirk',
 			content: 'tapir caches warm slowly on customer y',
 			scopes: ['customer:y'],
@@ -160,6 +179,16 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 			strictEqual((await call(reader, 'GET', memory.id)).status, 200, reader);
 		for (const outsider of ['alice', 'bob'])
 			strictEqual((await call(outsider, 'GET', memory.id)).status, 404, outsider);
+
+		const nonOwnerPut = await call(
+			'dave',
+			'PUT',
+			memory.id,
+			{ title: 'dave edit', content: 'dave can read but does not own', scopes: ['customer:x'] },
+			{ 'If-Match': '"1"' },
+		);
+		strictEqual(nonOwnerPut.status, 403);
+		strictEqual(nonOwnerPut.body.code, 'not_memory_owner');
 
 		// The vector lane returns the nearest readable memories whatever their distance, so assert membership.
 		const ids = async (user: string) => (await search(user, 'q=tapir')).map((hit) => hit.id);
@@ -172,20 +201,17 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 	});
 
 	test('tag= and scope= narrow results; scope= never widens them', async () => {
-		const tagged = await create('alice', {
-			idempotencyKey: 'lynx-tagged',
+		const tagged = await create('alice', 'lynx-tagged', {
 			title: 'lynx',
 			content: 'lynx den location',
 			tags: ['wildlife'],
 			visibility: 'shared',
 		});
-		const untagged = await create('alice', {
-			idempotencyKey: 'lynx-private',
+		const untagged = await create('alice', 'lynx-private', {
 			title: 'lynx',
 			content: 'lynx den notes',
 		});
-		const hidden = await create('carol', {
-			idempotencyKey: 'lynx-cx',
+		const hidden = await create('carol', 'lynx-cx', {
 			title: 'lynx',
 			content: 'lynx den customer',
 			scopes: ['customer:x'],
@@ -205,8 +231,7 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 	});
 
 	test('revoking a grant hides the memory on the next request', async () => {
-		const memory = await create('carol', {
-			idempotencyKey: 'cx-revoke',
+		const memory = await create('carol', 'cx-revoke', {
 			title: 'revocation',
 			content: 'narwhal tusk telemetry',
 			scopes: ['customer:x'],
@@ -227,14 +252,12 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 	});
 
 	test('supersede hides the old memory from default search; withdrawing the superseder restores it', async () => {
-		const old = await create('alice', {
-			idempotencyKey: 'heron-v1',
+		const old = await create('alice', 'heron-v1', {
 			title: 'heron threshold',
 			content: 'heron alert threshold is 30 percent',
 			visibility: 'shared',
 		});
-		const narrowing = await call('bob', 'POST', '', {
-			idempotencyKey: 'heron-narrow',
+		const narrowing = await call('bob', 'PUT', memId('heron-narrow'), {
 			title: 'heron threshold',
 			content: 'heron alert threshold is 25 percent',
 			supersedes: [old.id],
@@ -242,14 +265,15 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 		strictEqual(narrowing.status, 403);
 		strictEqual(narrowing.body.code, 'supersede_scope_narrowing');
 
-		const replacement = await create('bob', {
-			idempotencyKey: 'heron-v2',
+		const replacement = await create('bob', 'heron-v2', {
 			title: 'heron threshold',
 			content: 'heron alert threshold is 25 percent',
 			visibility: 'shared',
 			supersedes: [old.id],
 		});
-		const superseded = (await call('alice', 'GET', old.id)).body.memory;
+		const supersededGet = await call('alice', 'GET', old.id);
+		strictEqual(supersededGet.etag, '"2"');
+		const superseded = supersededGet.body.memory;
 		strictEqual(superseded.status, 'superseded');
 		strictEqual(superseded.supersededBy, replacement.id);
 		strictEqual(superseded.revision, 2);
@@ -259,13 +283,32 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 		ok(!defaultHits.includes(old.id));
 		ok((await search('alice', 'q=heron&includeSuperseded=true')).some((hit) => hit.id === old.id));
 
-		const frozen = await call('alice', 'POST', `${old.id}/revise`, { expectedRevision: 2, content: 'edited' });
+		const frozen = await call(
+			'alice',
+			'PUT',
+			old.id,
+			{ title: 'heron threshold', content: 'edited', visibility: 'shared' },
+			{ 'If-Match': '"2"' },
+		);
 		strictEqual(frozen.status, 409);
 		strictEqual(frozen.body.code, 'memory_superseded');
 
-		const withdrawn = await call('bob', 'POST', `${replacement.id}/withdraw`, { expectedRevision: 1, reason: 'wrong' });
+		const missingIfMatch = await call('bob', 'DELETE', `${replacement.id}?reason=wrong`);
+		strictEqual(missingIfMatch.status, 428);
+		strictEqual(missingIfMatch.body.code, 'if_match_required');
+
+		const staleIfMatch = await call('bob', 'DELETE', `${replacement.id}?reason=wrong`, undefined, {
+			'If-Match': '"9"',
+		});
+		strictEqual(staleIfMatch.status, 412);
+		strictEqual(staleIfMatch.body.code, 'precondition_failed');
+
+		const withdrawn = await call('bob', 'DELETE', `${replacement.id}?reason=wrong`, undefined, {
+			'If-Match': '"1"',
+		});
 		strictEqual(withdrawn.status, 200, JSON.stringify(withdrawn.body));
 		strictEqual(withdrawn.body.memory.status, 'withdrawn');
+		strictEqual(withdrawn.body.memory.withdrawnReason, 'wrong');
 		const restored = (await call('alice', 'GET', old.id)).body.memory;
 		strictEqual(restored.status, 'active');
 		strictEqual(restored.supersededBy, null);
@@ -277,35 +320,44 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 		strictEqual((await call('bob', 'GET', replacement.id)).body.memory.status, 'withdrawn');
 	});
 
-	test('concurrent revisions at the same expected revision: exactly one succeeds, the rest get revision_conflict', async () => {
-		const memory = await create('alice', { idempotencyKey: 'race', title: 'race', content: 'ibis count 3' });
+	test('concurrent revisions at the same If-Match revision: exactly one succeeds, the rest get 412 precondition_failed', async () => {
+		const memory = await create('alice', 'race', { title: 'race', content: 'ibis count 3' });
 		const results = await Promise.all(
 			Array.from({ length: 8 }, (_, i) =>
-				call('alice', 'POST', `${memory.id}/revise`, {
-					expectedRevision: 1,
-					content: `ibis count ${i + 4}, embedded slowly`,
-				}),
+				call(
+					'alice',
+					'PUT',
+					memory.id,
+					{
+						title: 'race',
+						content: `ibis count ${i + 4}, embedded slowly`,
+					},
+					{ 'If-Match': '"1"' },
+				),
 			),
 		);
 		deepStrictEqual(
 			results.map((result) => result.status).sort(),
-			[200, 409, 409, 409, 409, 409, 409, 409],
+			[200, 412, 412, 412, 412, 412, 412, 412],
 			JSON.stringify(results.map((result) => result.body)),
 		);
-		ok(results.filter((result) => result.status === 409).every((result) => result.body.code === 'revision_conflict'));
-		strictEqual((await call('alice', 'GET', memory.id)).body.memory.revision, 2);
+		ok(results.filter((result) => result.status === 412).every((result) => result.body.code === 'precondition_failed'));
+		const after = await call('alice', 'GET', memory.id);
+		strictEqual(after.body.memory.revision, 2);
+		strictEqual(after.etag, '"2"');
 	});
 
-	test('concurrent withdrawals at the same expected revision: exactly one succeeds, the rest get 409', async () => {
-		const memory = await create('alice', { idempotencyKey: 'withdraw-race', title: 'race', content: 'stork count 3' });
+	test('concurrent withdrawals at the same If-Match revision: exactly one succeeds, the rest get 409 or 412', async () => {
+		const memory = await create('alice', 'withdraw-race', { title: 'race', content: 'stork count 3' });
 		const results = await Promise.all(
 			Array.from({ length: 8 }, () =>
-				call('alice', 'POST', `${memory.id}/withdraw`, { expectedRevision: 1, reason: 'duplicate' }),
+				call('alice', 'DELETE', `${memory.id}?reason=duplicate`, undefined, { 'If-Match': '"1"' }),
 			),
 		);
-		deepStrictEqual(
-			results.map((result) => result.status).sort(),
-			[200, 409, 409, 409, 409, 409, 409, 409],
+		const statuses = results.map((result) => result.status).sort();
+		strictEqual(statuses[0], 200, JSON.stringify(results.map((result) => result.body)));
+		ok(
+			statuses.slice(1).every((status) => status === 409 || status === 412),
 			JSON.stringify(results.map((result) => result.body)),
 		);
 		strictEqual((await call('alice', 'GET', memory.id)).body.memory.revision, 2);
@@ -313,63 +365,84 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 
 	test('a supersede racing the withdrawal of an earlier superseder leaves the newest one in charge', async () => {
 		const shared = (key: string, content: string, supersedes?: string[]) =>
-			create('alice', { idempotencyKey: key, title: 'egret', content, visibility: 'shared', supersedes });
+			create('alice', key, { title: 'egret', content, visibility: 'shared', supersedes });
 		const target = await shared('egret-t', 'egret roost one');
 		const first = await shared('egret-w', 'egret roost two', [target.id]);
 		const [replacement, withdrawn] = await Promise.all([
-			call('alice', 'POST', '', {
-				idempotencyKey: 'egret-n',
+			call('alice', 'PUT', memId('egret-n'), {
 				title: 'egret',
 				content: 'egret roost three, embedded slowly',
 				visibility: 'shared',
 				supersedes: [target.id],
 			}),
-			call('alice', 'POST', `${first.id}/withdraw`, { expectedRevision: 1 }),
+			call('alice', 'DELETE', first.id, undefined, { 'If-Match': '"1"' }),
 		]);
 		strictEqual(replacement.status, 201, JSON.stringify(replacement.body));
 		strictEqual(withdrawn.status, 200, JSON.stringify(withdrawn.body));
 		const after = (await call('alice', 'GET', target.id)).body.memory;
 		strictEqual(after.status, 'superseded');
-		strictEqual(after.supersededBy, replacement.body.memory.id);
+		strictEqual(after.supersededBy, replacement.body.id);
 	});
 
 	test('a create superseding both ends of a chain does not deadlock with withdrawing the middle', async () => {
 		const shared = (key: string, content: string, supersedes?: string[]) =>
-			create('alice', { idempotencyKey: key, title: 'plover', content, visibility: 'shared', supersedes });
+			create('alice', key, { title: 'plover', content, visibility: 'shared', supersedes });
 		const target = await shared('plover-t', 'plover nest one');
 		const middle = await shared('plover-w', 'plover nest two', [target.id]);
 		const started = Date.now();
 		const results = await Promise.all([
-			call('alice', 'POST', '', {
-				idempotencyKey: 'plover-x',
+			call('alice', 'PUT', memId('plover-x'), {
 				title: 'plover',
 				content: 'plover nest three, embedded slowly',
 				visibility: 'shared',
 				supersedes: [target.id, middle.id],
 			}),
-			call('alice', 'POST', `${middle.id}/withdraw`, { expectedRevision: 1 }),
+			call('alice', 'DELETE', middle.id, undefined, { 'If-Match': '"1"' }),
 		]);
 		ok(Date.now() - started < 10_000, 'both requests finished without waiting out a lock timeout');
-		// Whichever runs second sees the first one's change and is refused with a 409.
+		// Whichever runs second sees the first one's change and is refused with 412 (stale If-Match) or 409 (withdrawn).
 		const [created, withdrawn] = results.map((result) => result.status);
 		ok(
-			(created === 201 && withdrawn === 409) || (created === 409 && withdrawn === 200),
+			(created === 201 && withdrawn === 412) || (created === 409 && withdrawn === 200),
 			JSON.stringify(results.map((result) => result.body)),
 		);
 	});
 
-	test('idempotent create: a retry returns the existing row, a different payload is a conflict', async () => {
-		const input = { idempotencyKey: 'retry', title: 'retry', content: 'pelican nesting begins in march' };
-		const first = await call('alice', 'POST', '', input);
-		const retry = await call('alice', 'POST', '', input);
+	test('PUT idempotency, If-None-Match: *, If-Match revise, and supersedes_not_allowed on revise', async () => {
+		const id = memId('retry');
+		const input = { title: 'retry', content: 'pelican nesting begins in march' };
+		const first = await call('alice', 'PUT', id, input);
+		const retry = await call('alice', 'PUT', id, input);
 		strictEqual(first.status, 201);
+		deepStrictEqual(first.body, { id, revision: 1 });
 		strictEqual(retry.status, 200);
-		strictEqual(retry.body.memory.id, first.body.memory.id);
-		strictEqual((await call('alice', 'POST', '', { ...input, content: 'other' })).body.code, 'idempotency_conflict');
-		strictEqual(
-			(await call('alice', 'POST', '', { ...input, idempotencyKey: 'import:x:1' })).body.code,
-			'reserved_idempotency_key',
+		deepStrictEqual(retry.body, { id, revision: 1 });
+
+		const createOnly = await call('alice', 'PUT', id, input, { 'If-None-Match': '*' });
+		strictEqual(createOnly.status, 412);
+		strictEqual(createOnly.body.code, 'precondition_failed');
+
+		const missingIfMatch = await call('alice', 'PUT', id, { ...input, content: 'other' });
+		strictEqual(missingIfMatch.status, 428);
+		strictEqual(missingIfMatch.body.code, 'if_match_required');
+
+		const staleIfMatch = await call('alice', 'PUT', id, { ...input, content: 'other' }, { 'If-Match': '"9"' });
+		strictEqual(staleIfMatch.status, 412);
+		strictEqual(staleIfMatch.body.code, 'precondition_failed');
+
+		const revised = await call('alice', 'PUT', id, { ...input, content: 'other' }, { 'If-Match': '"1"' });
+		strictEqual(revised.status, 200);
+		deepStrictEqual(revised.body, { id, revision: 2 });
+
+		const reviseWithSupersedes = await call(
+			'alice',
+			'PUT',
+			id,
+			{ ...input, content: 'third', supersedes: [memId('other')] },
+			{ 'If-Match': '"2"' },
 		);
+		strictEqual(reviseWithSupersedes.status, 400);
+		strictEqual(reviseWithSupersedes.body.code, 'supersedes_not_allowed');
 	});
 
 	test('a host-registered sink writes in the same transaction, and its failure rolls its write back with the memory', async () => {
@@ -383,24 +456,22 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 					get_attributes: ['*'],
 				})
 			)[0];
-		const memory = await create('alice', { idempotencyKey: 'sink-ok', title: 'sink', content: 'osprey dive depth' });
+		const memory = await create('alice', 'sink-ok', { title: 'sink', content: 'osprey dive depth' });
 		strictEqual((await sinkLog(`${memory.id}:1`))?.kind, 'write');
 
-		const failed = await call('alice', 'POST', '', {
-			idempotencyKey: 'sink-fail',
+		const failedId = memId('sink-fail');
+		const failed = await call('alice', 'PUT', failedId, {
 			title: 'sink',
 			content: 'SINK-FAIL',
 		});
 		strictEqual(failed.status, 500);
 		deepStrictEqual(failed.body, { error: 'Internal error', code: 'internal_error' });
-		const failedId = createHash('sha256').update('memory:alice:sink-fail').digest('hex').slice(0, 32);
 		strictEqual(await sinkLog(`${failedId}:1`), undefined, 'the sink row rolled back');
 		strictEqual((await call('alice', 'GET', failedId)).status, 404, 'the memory rolled back');
 	});
 
 	test('a host-installed principal resolver replaces identity and grants, deferring other users to next()', async () => {
-		const memory = await create('erin', {
-			idempotencyKey: 'resolved',
+		const memory = await create('erin', 'resolved', {
 			title: 'resolved',
 			content: 'agent principal memory',
 			visibility: 'shared',
@@ -408,13 +479,12 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 		strictEqual(memory.ownerId, 'agent-erin');
 		deepStrictEqual(memory.author.source, 'fixture-resolver');
 		strictEqual((await call('alice', 'GET', memory.id)).status, 200);
-		const alicePrivate = await create('alice', { idempotencyKey: 'not-for-erin', title: 'p', content: 'private' });
+		const alicePrivate = await create('alice', 'not-for-erin', { title: 'p', content: 'private' });
 		strictEqual((await call('erin', 'GET', alicePrivate.id)).status, 404);
 	});
 
 	test('bootstrap: pinned, then recent, then relevant, packed into the character budget', async () => {
-		const pinned = await create('bob', {
-			idempotencyKey: 'pinned',
+		const pinned = await create('bob', 'pinned', {
 			title: 'pin',
 			content: 'always load this',
 			visibility: 'shared',
@@ -424,10 +494,9 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 		strictEqual(pinResponse.body.pinned, true);
 		strictEqual(pinResponse.body.memoryId, pinned.id);
 
-		const recent = await create('bob', { idempotencyKey: 'recent', title: 'recent', content: 'bob was here' });
-		const large = await create('bob', { idempotencyKey: 'large', title: 'large', content: 'x'.repeat(500) });
-		const relevant = await create('alice', {
-			idempotencyKey: 'puffin',
+		const recent = await create('bob', 'recent', { title: 'recent', content: 'bob was here' });
+		const large = await create('bob', 'large', { title: 'large', content: 'x'.repeat(500) });
+		const relevant = await create('alice', 'puffin', {
 			title: 'puffin',
 			content: 'puffin colony',
 			visibility: 'shared',
@@ -448,8 +517,7 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 			'pins are per-reader and never leak to another principal',
 		);
 
-		const alicePrivate = await create('alice', {
-			idempotencyKey: 'alice-private-pin-target',
+		const alicePrivate = await create('alice', 'alice-private-pin-target', {
 			title: 'secret',
 			content: 'alice private note',
 		});
@@ -464,14 +532,12 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 	});
 
 	test('validUntil excludes expired memories by default and includeExpired=true restores them', async () => {
-		const expired = await create('alice', {
-			idempotencyKey: 'expired-gannet',
+		const expired = await create('alice', 'expired-gannet', {
 			title: 'expired gannet',
 			content: 'gannet rookery expired note',
 			validUntil: '2020-01-01T00:00:00.000Z',
 		});
-		const active = await create('alice', {
-			idempotencyKey: 'active-gannet',
+		const active = await create('alice', 'active-gannet', {
 			title: 'active gannet',
 			content: 'gannet rookery active note',
 			validUntil: '2099-01-01T00:00:00.000Z',
@@ -496,26 +562,22 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 	});
 
 	test('typed evidence validates readable memory refs and indexes evidenceMemoryIds', async () => {
-		const source = await create('alice', {
-			idempotencyKey: 'evidence-source',
+		const source = await create('alice', 'evidence-source', {
 			title: 'source',
 			content: 'curlew migration observation',
 			visibility: 'shared',
 		});
-		const bobPrivate = await create('bob', {
-			idempotencyKey: 'evidence-bob-private',
+		const bobPrivate = await create('bob', 'evidence-bob-private', {
 			title: 'bob secret',
 			content: 'bob private observation',
 		});
 
-		const unreadableRef = await call('alice', 'POST', '', {
-			idempotencyKey: 'evidence-unreadable',
+		const unreadableRef = await call('alice', 'PUT', memId('evidence-unreadable'), {
 			title: 'unreadable',
 			content: 'citing unreadable memory',
 			evidence: [{ kind: 'memory', ref: bobPrivate.id }],
 		});
-		const missingRef = await call('alice', 'POST', '', {
-			idempotencyKey: 'evidence-missing',
+		const missingRef = await call('alice', 'PUT', memId('evidence-missing'), {
 			title: 'missing',
 			content: 'citing missing memory',
 			evidence: [{ kind: 'memory', ref: '0'.repeat(32) }],
@@ -524,8 +586,7 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 		strictEqual(unreadableRef.body.code, 'invalid_evidence');
 		deepStrictEqual(unreadableRef.body, missingRef.body);
 
-		const citing = await create('alice', {
-			idempotencyKey: 'evidence-citing',
+		const citing = await create('alice', 'evidence-citing', {
 			title: 'citing',
 			content: 'curlew synthesis',
 			evidence: [
@@ -546,10 +607,11 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 		deepStrictEqual(indexed, [{ id: citing.id }]);
 	});
 
-	test('import (super_user): preserves owner and createdAt, is idempotent, and reports conflicts', async () => {
+	test('import (super_user): preserves client id, owner and createdAt, is idempotent, and reports conflicts', async () => {
 		const createdAt = '2025-01-02T03:04:05.000Z';
+		const flairId = createHash('sha256').update('flair:42').digest('hex').slice(0, 32);
 		const row = {
-			idempotencyKey: 'import:flair:42',
+			id: flairId,
 			ownerId: 'alice',
 			content: 'imported kestrel observation',
 			scopes: ['user:alice'],
@@ -557,17 +619,18 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 			createdAt,
 		};
 		strictEqual((await call('alice', 'POST', 'import', { rows: [row] })).status, 403);
-		const mismatch = await call('admin', 'POST', 'import', {
-			rows: [row, { ...row, idempotencyKey: 'import:flair:43', id: 'f'.repeat(32) }],
+		const invalidId = await call('admin', 'POST', 'import', {
+			rows: [row, { ...row, id: 'short' }],
 		});
-		strictEqual(mismatch.status, 400);
-		strictEqual(mismatch.body.code, 'import_id_mismatch');
-		strictEqual(mismatch.body.index, 1);
+		strictEqual(invalidId.status, 400);
+		strictEqual(invalidId.body.code, 'invalid_id');
+		strictEqual(invalidId.body.index, 1);
 
 		const first = await call('admin', 'POST', 'import', { rows: [row] });
 		strictEqual(first.status, 200, JSON.stringify(first.body));
 		strictEqual(first.body.results[0].result, 'created');
-		const imported = (await call('alice', 'GET', first.body.results[0].id)).body.memory;
+		strictEqual(first.body.results[0].id, flairId);
+		const imported = (await call('alice', 'GET', flairId)).body.memory;
 		strictEqual(imported.ownerId, 'alice');
 		strictEqual(imported.createdAt, createdAt);
 		strictEqual(imported.title, null);
@@ -582,7 +645,7 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 	});
 
 	test("never touches the host app's own Memory table in its data database", async () => {
-		await create('alice', { idempotencyKey: 'isolation', title: 'isolation', content: 'heron isolation check' });
+		await create('alice', 'isolation', { title: 'isolation', content: 'heron isolation check' });
 		deepStrictEqual(
 			await operation({
 				operation: 'search_by_value',
@@ -606,11 +669,17 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 		deepStrictEqual(await response.json(), { statusCode: 400 });
 	});
 
-	test('rejects unauthenticated requests and unknown routes', async () => {
+	test('rejects unauthenticated requests, removed POST routes, and unknown routes', async () => {
 		const anonymous = await fetch(`${ctx.harper.httpURL}/Memory/?q=anything`, {
 			headers: { Accept: 'application/json' },
 		});
 		strictEqual(anonymous.status, 401);
-		strictEqual((await call('alice', 'POST', `${'a'.repeat(32)}/explode`, {})).status, 404);
+		const id = 'a'.repeat(32);
+		const postRoot = await call('alice', 'POST', '', { title: 'x', content: 'y' });
+		strictEqual(postRoot.status, 405);
+		strictEqual((await call('alice', 'POST', `${id}/revise`, {})).status, 404);
+		strictEqual((await call('alice', 'POST', `${id}/scopes`, {})).status, 404);
+		strictEqual((await call('alice', 'POST', `${id}/withdraw`, {})).status, 404);
+		strictEqual((await call('alice', 'POST', `${id}/explode`, {})).status, 404);
 	});
 });

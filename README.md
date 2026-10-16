@@ -53,28 +53,29 @@ Requires Harper 5.3.1 or later on RocksDB (the default).
 3. Use it as any Harper user:
 
    ```sh
-   # create (private by default; `visibility: "shared"` means global, or pass `scopes`)
-   curl -u carol:pass -X POST localhost:9926/Memory/ -H 'Content-Type: application/json' -d '{
-     "idempotencyKey": "run-42", "title": "Disk saturation", "content": "Stalls above 30% iowait.",
+   # create (client-chosen id, 16-64 URL-safe chars; private by default, `visibility: "shared"` means global, or pass `scopes`)
+   curl -u carol:pass -X PUT localhost:9926/Memory/<id> -H 'Content-Type: application/json' -d '{
+     "title": "Disk saturation", "content": "Stalls above 30% iowait.",
      "scopes": ["customer:acme"], "tags": ["ops"] }'
 
    curl -u carol:pass 'localhost:9926/Memory/?q=iowait&limit=5'          # hybrid search
    curl -u carol:pass 'localhost:9926/Memory/bootstrap?q=disk&budget=8000' # session-start context
-   curl -u carol:pass localhost:9926/Memory/<id>                          # read
+   curl -u carol:pass -i localhost:9926/Memory/<id>                       # read (returns ETag: "<revision>")
 
-   # revise, change scopes, withdraw: each takes the revision you read
-   curl -u carol:pass -X POST localhost:9926/Memory/<id>/revise -H 'Content-Type: application/json' \
-     -d '{ "expectedRevision": 1, "content": "Stalls above 25%." }'
-   curl -u carol:pass -X POST localhost:9926/Memory/<id>/withdraw -H 'Content-Type: application/json' \
-     -d '{ "expectedRevision": 2, "reason": "obsolete" }'
+   # revise, change scopes, or withdraw: pass If-Match with the revision ETag you read
+   curl -u carol:pass -X PUT localhost:9926/Memory/<id> \
+     -H 'Content-Type: application/json' -H 'If-Match: "1"' \
+     -d '{ "content": "Stalls above 25%." }'
+   curl -u carol:pass -X DELETE 'localhost:9926/Memory/<id>?reason=obsolete' \
+     -H 'If-Match: "2"'
 
    # pin or unpin a readable memory for your own bootstrap
    curl -u carol:pass -X POST localhost:9926/Memory/<id>/pin -H 'Content-Type: application/json' -d '{}'
    curl -u carol:pass -X POST localhost:9926/Memory/<id>/unpin -H 'Content-Type: application/json' -d '{}'
 
    # replace a memory: everyone who reads the old one through its labels must be able to read the replacement
-   curl -u carol:pass -X POST localhost:9926/Memory/ -H 'Content-Type: application/json' -d '{
-     "idempotencyKey": "run-43", "title": "Disk saturation",
+   curl -u carol:pass -X PUT localhost:9926/Memory/<new-id> -H 'Content-Type: application/json' -d '{
+     "title": "Disk saturation",
      "content": "Stalls above 20% iowait on the new kernel.", "scopes": ["customer:acme"], "supersedes": ["<id>"] }'
    ```
 

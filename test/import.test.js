@@ -1,8 +1,9 @@
 import { beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { __test } from 'harper';
 import { importMemories } from '../dist/import.js';
-import { createMemory, getMemory, memoryIdFor, withdrawMemory } from '../dist/lifecycle.js';
+import { getMemory, putMemory, withdrawMemory } from '../dist/lifecycle.js';
 import { createPrincipal } from '../dist/scopes.js';
 import { registerMemorySink } from '../dist/sinks.js';
 import { applySettings, parseSettings } from '../dist/settings.js';
@@ -12,8 +13,10 @@ const alice = createPrincipal({ id: 'alice' });
 const context = {};
 const rows = () => __test.stores.get('Memory');
 
+const idOf = (sourceId) => createHash('sha256').update(`flair:${sourceId}`).digest('hex').slice(0, 32);
+
 const row = (sourceId, overrides = {}) => ({
-	idempotencyKey: `import:flair:${sourceId}`,
+	id: idOf(sourceId),
 	ownerId: 'alice',
 	content: `imported ${sourceId}`,
 	scopes: ['user:alice'],
@@ -21,7 +24,6 @@ const row = (sourceId, overrides = {}) => ({
 	createdAt: '2025-01-02T03:04:05.000Z',
 	...overrides,
 });
-const idOf = (sourceId) => memoryIdFor('alice', `import:flair:${sourceId}`);
 
 async function rejection(promise, statusCode, code, index) {
 	const error = await promise.then(
@@ -52,7 +54,7 @@ describe('importMemories', () => {
 		const result = await importMemories(
 			{
 				rows: [
-					row(2, { id: idOf(2), supersedes: [idOf(1)], scopes: ['global'], evidence }),
+					row(2, { supersedes: [idOf(1)], scopes: ['global'], evidence }),
 					row(1, { status: 'superseded', supersededBy: idOf(2) }),
 				],
 			},
@@ -77,7 +79,7 @@ describe('importMemories', () => {
 
 	it('never publishes a memory hidden behind a withdrawn replacement', async () => {
 		await importMemories({ rows: [row(2, { supersedes: [idOf(1)] })] }, root, context);
-		await withdrawMemory(idOf(2), { expectedRevision: 1 }, alice, context);
+		await withdrawMemory(idOf(2), {}, alice, { headers: { 'if-match': '"1"' } });
 		const replay = await importMemories(
 			{ rows: [row(2, { supersedes: [idOf(1)] }), row(1, { status: 'superseded', supersededBy: idOf(2) })] },
 			root,
@@ -108,8 +110,9 @@ describe('importMemories', () => {
 			root,
 			context,
 		);
-		await createMemory(
-			{ idempotencyKey: 'native', title: 'n', content: 'native replacement', supersedes: [idOf(1)] },
+		await putMemory(
+			idOf('native'),
+			{ title: 'n', content: 'native replacement', supersedes: [idOf(1)] },
 			alice,
 			context,
 		);
@@ -124,13 +127,17 @@ describe('importMemories', () => {
 		assert.deepEqual((await importMemories({ rows: [row(1, { content: 'changed' })] }, root, context)).results, [
 			{ id: idOf(1), result: 'conflict' },
 		]);
+		assert.deepEqual((await importMemories({ rows: [row(1, { ownerId: 'bob' })] }, root, context)).results, [
+			{ id: idOf(1), result: 'conflict' },
+		]);
 		assert.equal(rows().get(idOf(1)).content, 'imported 1');
 	});
 
 	it('rejects the whole batch, naming the row, when any row is invalid', async () => {
 		const cases = [
-			[row(2, { id: 'f'.repeat(32) }), 'import_id_mismatch'],
-			[row(2, { idempotencyKey: 'flair:2' }), 'invalid_idempotencyKey'],
+			[row(2, { id: 'short' }), 'invalid_id'],
+			[row(2, { id: undefined }), 'invalid_id'],
+			[row(2, { idempotencyKey: 'import:flair:2' }), 'unsupported_fields'],
 			[row(2, { ownerId: 'has space' }), 'invalid_principal_id'],
 			[row(2, { ownerId: undefined }), 'ownerId_required'],
 			[row(2, { scopes: ['customer:*'] }), 'invalid_scopes'],
@@ -143,7 +150,7 @@ describe('importMemories', () => {
 			[row(2, { pinned: true }), 'unsupported_fields'],
 			[row(2, { evidenceMemoryIds: [idOf(1)] }), 'unsupported_fields'],
 			[row(2, { evidence: ['legacy-string'] }), 'invalid_evidence'],
-			[row(2, { evidence: [{ kind: 'memory', ref: 'not-a-hex-id' }] }), 'invalid_evidence'],
+			[row(2, { evidence: [{ kind: 'memory', ref: 'short' }] }), 'invalid_evidence'],
 			[row(2, { content: undefined }), 'content_required'],
 		];
 		for (const [bad, code] of cases) {

@@ -4,13 +4,9 @@ import {
 	compareNewest,
 	deriveEvidenceMemoryIds,
 	ensureEmbedder,
-	fingerprint,
 	inOwnTransaction,
-	IDEMPOTENCY_KEY_MAX_CHARS,
-	IMPORT_KEY_PREFIX,
 	isMemoryId,
 	lockRows,
-	memoryIdFor,
 	memoryTable,
 	newestSuperseder,
 	normalizeEvidence,
@@ -18,6 +14,8 @@ import {
 	normalizeTags,
 	optionalDate,
 	rejectUnknownFields,
+	sameEditableFields,
+	sameStringArray,
 	STATUS_ACTIVE,
 	STATUS_SUPERSEDED,
 	STATUS_WITHDRAWN,
@@ -34,7 +32,6 @@ const IMPORT_LOCK_LEASE_MS = 5 * 60_000;
 const IMPORT_SUPERSEDES_MAX_ITEMS = 100;
 const ROW_FIELDS = [
 	'id',
-	'idempotencyKey',
 	'ownerId',
 	'title',
 	'content',
@@ -57,16 +54,12 @@ function validateRow(input: unknown, index: number) {
 	try {
 		const row = rejectUnknownFields(input, ROW_FIELDS, 'import row');
 		const settings = getSettings();
+		if (!isMemoryId(row.id)) {
+			throw badRequest('id must be 16-64 URL-safe characters (^[A-Za-z0-9_-]{16,64}$)', 'invalid_id');
+		}
+		const id = row.id;
 		if (typeof row.ownerId !== 'string' || !row.ownerId) throw badRequest('ownerId is required', 'ownerId_required');
 		const ownerId = requirePrincipalId(row.ownerId);
-		const idempotencyKey = boundedText(row.idempotencyKey, 'idempotencyKey', IDEMPOTENCY_KEY_MAX_CHARS, true)!;
-		if (!idempotencyKey.startsWith(IMPORT_KEY_PREFIX)) {
-			throw badRequest(`import idempotencyKey must start with "${IMPORT_KEY_PREFIX}"`, 'invalid_idempotencyKey');
-		}
-		const id = memoryIdFor(ownerId, idempotencyKey);
-		if (row.id !== undefined && row.id !== id) {
-			throw badRequest('id does not match sha256(memory:<ownerId>:<idempotencyKey>)', 'import_id_mismatch');
-		}
 		if (!Array.isArray(row.scopes) || row.scopes.length === 0 || !row.scopes.every(isScopeLabel)) {
 			throw badRequest('scopes must be a non-empty array of scope labels', 'invalid_scopes');
 		}
@@ -92,9 +85,8 @@ function validateRow(input: unknown, index: number) {
 			throw badRequest('withdrawnAt and withdrawnReason require status withdrawn', 'invalid_status');
 		}
 		const evidence = normalizeEvidence(row.evidence);
-		const record = {
+		return {
 			id,
-			idempotencyKey,
 			ownerId,
 			title: boundedText(row.title, 'title', settings.titleChars, false) ?? null,
 			content: boundedText(row.content, 'content', settings.contentChars, true)!,
@@ -110,23 +102,6 @@ function validateRow(input: unknown, index: number) {
 			withdrawnAt: withdrawnAt ?? null,
 			withdrawnReason: withdrawnReason ?? null,
 		};
-		const createFingerprint = fingerprint([
-			'import',
-			record.ownerId,
-			record.title,
-			record.content,
-			record.tags,
-			record.evidence,
-			record.scopes,
-			record.status,
-			record.supersedes,
-			record.supersededBy,
-			record.createdAt?.toISOString() ?? null,
-			record.validUntil?.toISOString() ?? null,
-			record.withdrawnAt?.toISOString() ?? null,
-			record.withdrawnReason,
-		]);
-		return { ...record, createFingerprint };
 	} catch (error) {
 		if (isCallerSafe(error)) throw memoryError(error.message, error.statusCode, error.code, index);
 		throw error;
@@ -161,8 +136,13 @@ export async function importMemories(input: unknown, principal: Principal, reque
 		for (const row of rows) {
 			const existing = await Memory.get(row.id, txn);
 			if (existing) {
-				const result = existing.createFingerprint === row.createFingerprint ? 'unchanged' : 'conflict';
-				results.push({ id: row.id, result });
+				const same =
+					existing.ownerId === row.ownerId &&
+					sameEditableFields(existing, row) &&
+					sameStringArray(existing.supersedes ?? [], row.supersedes) &&
+					(row.status !== STATUS_WITHDRAWN ||
+						(existing.status === STATUS_WITHDRAWN && (existing.withdrawnReason ?? null) === row.withdrawnReason));
+				results.push({ id: row.id, result: same ? 'unchanged' : 'conflict' });
 			} else {
 				created.push({ ...row, createdAt: row.createdAt ?? now });
 				results.push({ id: row.id, result: 'created' });

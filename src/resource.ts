@@ -1,22 +1,17 @@
-// Memory ids are 32 hex characters, so the `bootstrap` and `import` path segments cannot collide with one.
+// Memory ids are 16-64 characters, so the 9-char `bootstrap` and 6-char `import` path segments cannot collide with one.
 import { logger, Resource } from 'harper';
-import { badRequest, isCallerSafe, notFound } from './errors.ts';
+import { badRequest, isCallerSafe, memoryError, notFound } from './errors.ts';
 import { importMemories } from './import.ts';
-import {
-	createMemory,
-	getMemory,
-	pinMemory,
-	reviseMemory,
-	setMemoryScopes,
-	unpinMemory,
-	withdrawMemory,
-} from './lifecycle.ts';
+import { getMemory, pinMemory, putMemory, unpinMemory, withdrawMemory } from './lifecycle.ts';
 import { resolvePrincipal } from './principal.ts';
 import type { Principal } from './scopes.ts';
 import { bootstrapMemories, parseBootstrapParams, parseSearchParams, searchMemories } from './search.ts';
 
-function json(data: unknown, status = 200): Response {
-	return new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json' } });
+function json(data: unknown, status = 200, extraHeaders?: Record<string, string>): Response {
+	return new Response(JSON.stringify(data), {
+		status,
+		headers: { 'Content-Type': 'application/json', ...extraHeaders },
+	});
 }
 
 async function readBody(data: unknown): Promise<unknown> {
@@ -75,11 +70,40 @@ async function handle(
 	}
 }
 
+function rejectUnsupportedVerb(target: any): never {
+	if (target?.rest || target?.pathname) throw notFound();
+	if (target?.action !== undefined && target.action !== 'pin' && target.action !== 'unpin') throw notFound();
+	throw memoryError('Method not allowed', 405, 'method_not_allowed');
+}
+
 // @ts-expect-error — Resource's static verb types carry transactional()'s reliesOnPrototype brand
-export class MemoryResource extends Resource {
-	static path = '/Memory/*rest';
+class MemoryEndpoint extends Resource {
 	// Kept out of MCP and OpenAPI auto-export: the generic verbs would not express these routes.
 	static hidden = true;
+
+	static async get(target: any, context: object) {
+		return handle('get', context, async () => rejectUnsupportedVerb(target));
+	}
+
+	static async post(target: any, _data: any, context: object) {
+		return handle('post', context, async () => rejectUnsupportedVerb(target));
+	}
+
+	static async put(target: any, _data: any, context: object) {
+		return handle('put', context, async () => rejectUnsupportedVerb(target));
+	}
+
+	static async delete(target: any, context: object) {
+		return handle('delete', context, async () => rejectUnsupportedVerb(target));
+	}
+
+	static async patch(target: any, _data: any, context: object) {
+		return handle('patch', context, async () => rejectUnsupportedVerb(target));
+	}
+}
+
+export class MemoryResource extends MemoryEndpoint {
+	static path = '/Memory/*rest';
 
 	static async get(target: any, context: object) {
 		return handle('get', context, async (principal, ctx) => {
@@ -87,20 +111,10 @@ export class MemoryResource extends Resource {
 			return json({ memories: await searchMemories(parseSearchParams(target), principal, ctx) });
 		});
 	}
-
-	static async post(target: any, data: any, context: object) {
-		return handle('post', context, async (principal, ctx) => {
-			if (target?.rest) throw notFound();
-			const { memory, created } = await createMemory(await readBody(data), principal, ctx);
-			return json({ memory, created }, created ? 201 : 200);
-		});
-	}
 }
 
-// @ts-expect-error — see MemoryResource
-export class MemoryBootstrapResource extends Resource {
+export class MemoryBootstrapResource extends MemoryEndpoint {
 	static path = '/Memory/bootstrap';
-	static hidden = true;
 
 	static async get(target: any, context: object) {
 		return handle('get', context, async (principal, ctx) => {
@@ -110,10 +124,8 @@ export class MemoryBootstrapResource extends Resource {
 	}
 }
 
-// @ts-expect-error — see MemoryResource
-export class MemoryImportResource extends Resource {
+export class MemoryImportResource extends MemoryEndpoint {
 	static path = '/Memory/import';
-	static hidden = true;
 
 	static async post(target: any, data: any, context: object) {
 		return handle('post', context, async (principal, ctx) => {
@@ -123,36 +135,41 @@ export class MemoryImportResource extends Resource {
 	}
 }
 
-// @ts-expect-error — see MemoryResource
-export class MemoryItemResource extends Resource {
+export class MemoryItemResource extends MemoryEndpoint {
 	static path = '/Memory/:id';
-	static hidden = true;
 
 	static async get(target: any, context: object) {
 		return handle('get', context, async (principal, ctx) => {
 			const memory = await getMemory(String(target?.id ?? ''), principal, ctx);
 			if (!memory) throw notFound();
-			return json({ memory });
+			return json({ memory }, 200, { ETag: `"${memory.revision}"` });
+		});
+	}
+
+	static async put(target: any, data: any, context: object) {
+		return handle('put', context, async (principal, ctx) => {
+			const { id, revision, created } = await putMemory(String(target?.id ?? ''), await readBody(data), principal, ctx);
+			return json({ id, revision }, created ? 201 : 200);
+		});
+	}
+
+	static async delete(target: any, context: object) {
+		return handle('delete', context, async (principal, ctx) => {
+			const reason = target?.get?.('reason');
+			const input = reason === undefined ? {} : { reason };
+			return json({ memory: await withdrawMemory(String(target?.id ?? ''), input, principal, ctx) });
 		});
 	}
 }
 
-// @ts-expect-error — see MemoryResource
-export class MemoryActionResource extends Resource {
+export class MemoryActionResource extends MemoryEndpoint {
 	static path = '/Memory/:id/:action';
-	static hidden = true;
 
 	static async post(target: any, data: any, context: object) {
 		return handle('post', context, async (principal, ctx) => {
 			const id = String(target?.id ?? '');
 			const input = await readBody(data);
 			switch (target?.action) {
-				case 'revise':
-					return json({ memory: await reviseMemory(id, input, principal, ctx) });
-				case 'scopes':
-					return json({ memory: await setMemoryScopes(id, input, principal, ctx) });
-				case 'withdraw':
-					return json({ memory: await withdrawMemory(id, input, principal, ctx) });
 				case 'pin':
 					return json(await pinMemory(id, input, principal, ctx));
 				case 'unpin':

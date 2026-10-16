@@ -1,7 +1,7 @@
 import { beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { __test } from 'harper';
-import { createMemory, pinMemory, unpinMemory, withdrawMemory } from '../dist/lifecycle.js';
+import { pinMemory, putMemory, unpinMemory, withdrawMemory } from '../dist/lifecycle.js';
 import { createPrincipal } from '../dist/scopes.js';
 import { applySettings, parseSettings } from '../dist/settings.js';
 import { bootstrapMemories, fuse, parseBootstrapParams, parseSearchParams, searchMemories } from '../dist/search.js';
@@ -13,8 +13,10 @@ const root = createPrincipal({ id: 'root', superUser: true });
 const context = {};
 const params = (query) => parseSearchParams(new URLSearchParams(query));
 
+const idFor = (principal, key) =>
+	`mem-${principal.id}-${key.replace(/[^A-Za-z0-9_-]/g, '_')}--`.slice(0, 64).padEnd(16, '_');
 const create = async (principal, key, overrides = {}) =>
-	(await createMemory({ idempotencyKey: key, title: key, content: `${key} content`, ...overrides }, principal, context))
+	(await putMemory(idFor(principal, key), { title: key, content: `${key} content`, ...overrides }, principal, context))
 		.memory;
 
 beforeEach(() => {
@@ -166,7 +168,7 @@ describe('searchMemories', () => {
 		const shared = await create(root, 'disk beta', { content: 'disk pressure on beta', visibility: 'shared' });
 		await create(root, 'disk secret', { content: 'disk pressure secret', scopes: ['customer:x'] });
 		const gone = await create(alice, 'disk gone', { content: 'disk pressure gone' });
-		await withdrawMemory(gone.id, { expectedRevision: 1 }, alice, context);
+		await withdrawMemory(gone.id, {}, alice, { headers: { 'if-match': '"1"' } });
 		const hits = await searchMemories(params('q=disk'), alice, context);
 		assert.deepEqual(hits.map((hit) => hit.id).sort(), [mine.id, shared.id].sort());
 		assert.ok(hits.every((hit) => typeof hit.score === 'number' && hit.embedding === undefined));
