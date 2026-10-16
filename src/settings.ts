@@ -54,7 +54,6 @@ function parseSupersession(options: unknown): SupersessionSettings {
 	if (judge !== undefined && judge !== null && (typeof judge !== 'string' || !judge)) {
 		throw new Error('@harperfast/agent-memory: supersession.judge must be a non-empty model name');
 	}
-	// Without a judge there is no verdict to apply, so auto would silently behave as suggest.
 	if (mode === 'auto' && !judge) {
 		throw new Error('@harperfast/agent-memory: supersession.mode auto requires supersession.judge');
 	}

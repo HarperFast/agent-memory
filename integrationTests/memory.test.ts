@@ -636,7 +636,6 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 		ok(similarity >= 0.82 && similarity <= 1 + 1e-6, String(similarity));
 		strictEqual((await call('alice', 'GET', original.id)).body.memory.status, 'active');
 
-		// A revise reports candidates for the vector its own write computed.
 		const note = await create('alice', 'grebe-note', {
 			title: 'note',
 			content: 'shoreline survey',

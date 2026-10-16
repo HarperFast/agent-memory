@@ -648,6 +648,16 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 				const supersededBy = current && compareNewest(current, { id, createdAt: now }) > 0 ? current.id : id;
 				pointers.push({ target, supersededBy });
 			}
+			// Superseding an already superseded memory is not a transition: its citers were flagged the first time.
+			const transitions = pointers.filter(({ target }) => target.status === STATUS_ACTIVE);
+			// Every citer is locked before the first write, so a stale plan restarts once, not once per target.
+			locks.require(
+				await activeDependentIds(
+					Memory,
+					transitions.map(({ target }) => target.id),
+					txn,
+				),
+			);
 
 			await Memory.put(
 				{
@@ -680,9 +690,7 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 				await Memory.patch(target.id, { status: STATUS_SUPERSEDED, supersededBy, revision: target.revision + 1 }, txn);
 			}
 			const flagged: string[] = [];
-			for (const { target, supersededBy } of pointers) {
-				// Superseding an already superseded memory is not a transition: its citers were flagged the first time.
-				if (target.status !== STATUS_ACTIVE) continue;
+			for (const { target, supersededBy } of transitions) {
 				flagged.push(
 					...(await flagDependents(
 						Memory,
@@ -734,7 +742,6 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 	return { id, revision: memory.revision as number, created: outcome.created, memory, candidates };
 }
 
-/** Read inside the transaction, kept for the post-commit candidate search. */
 function captureWritten(record: any) {
 	return {
 		memory: toMemoryView(record),
@@ -862,6 +869,7 @@ export async function withdrawMemory(
 	const mayWithdraw =
 		planned !== undefined &&
 		ifMatch !== undefined &&
+		matchesIfMatch(ifMatch, planned.revision) &&
 		planned.status !== STATUS_WITHDRAWN &&
 		(planned.ownerId === principal.id || principal.superUser);
 	const plan = [
@@ -889,7 +897,7 @@ export async function withdrawMemory(
 				throw memoryError('Memory has been withdrawn', 409, 'memory_withdrawn');
 			}
 			if (!matchesIfMatch(ifMatch, existing.revision)) throw staleWrite(ifMatch, existing.revision);
-			locks.require(existing.supersedes ?? []);
+			locks.require([...(existing.supersedes ?? []), ...(await activeDependentIds(Memory, [id], txn))]);
 
 			const now = new Date();
 			const restored = await reconcileSuperseded(Memory, existing, txn);
@@ -905,11 +913,19 @@ export async function withdrawMemory(
 				},
 				txn,
 			);
-			const flagged = await flagDependents(Memory, { id: existing.id }, 'withdrawn', locks, txn, now);
+			const flagged = await flagDependents(
+				Memory,
+				{ id: existing.id, replacementId: existing.supersededBy ?? undefined },
+				'withdrawn',
+				locks,
+				txn,
+				now,
+			);
 			const memory = toMemoryView(await Memory.get(existing.id, txn));
 			if (hasSinks()) {
 				await notifySinks('withdraw', memory, txn);
-				for (const changedId of [...restored, ...flagged]) {
+				// A restored memory can also cite this one, and then is flagged too: one call per changed row.
+				for (const changedId of new Set([...restored, ...flagged])) {
 					await notifySinks('write', toMemoryView(await Memory.get(changedId, txn)), txn);
 				}
 			}

@@ -154,6 +154,12 @@ export async function importMemories(input: unknown, principal: Principal, reque
 				}
 			}
 			const liveCreated = created.filter((row) => row.status !== STATUS_WITHDRAWN);
+			const createdIds = new Set(created.map((row) => row.id));
+			const storedTargetIds = [...new Set(liveCreated.flatMap((row) => row.supersedes))].filter(
+				(targetId) => !createdIds.has(targetId),
+			);
+			// Every stored citer is locked before the first write, so a stale plan restarts once, not once per target.
+			locks.require(await activeDependentIds(Memory, storedTargetIds, txn));
 			const graphState = async (targetId: string) => {
 				let newest = await newestSuperseder(Memory, targetId, txn);
 				for (const row of liveCreated) {
@@ -186,11 +192,9 @@ export async function importMemories(input: unknown, principal: Principal, reque
 			}
 
 			// Rows stored earlier that this batch supersedes (an import that arrived predecessor-first).
-			const createdIds = new Set(created.map((row) => row.id));
 			const changed: string[] = [];
 			const transitions = [];
-			for (const targetId of new Set(liveCreated.flatMap((row) => row.supersedes))) {
-				if (createdIds.has(targetId)) continue;
+			for (const targetId of storedTargetIds) {
 				const target = await Memory.get(targetId, txn);
 				if (!target || target.status === STATUS_WITHDRAWN) continue;
 				const next = await graphState(targetId);

@@ -302,23 +302,27 @@ export async function bootstrapMemories(params: BootstrapParams, principal: Prin
 	};
 	// The caller's own flagged memories; the indexed mirror of the flag's date keeps this off a scan of every owned row.
 	const loadNeedsReview = async () => {
-		const records = await collect(
-			Memory.search(
-				{
-					conditions: [
-						active,
-						unexpired,
-						{ attribute: 'ownerId', comparator: 'equals', value: principal.id },
-						{ attribute: 'needsReviewSince', comparator: 'greater_than', value: new Date(0) },
-					],
-					sort: { attribute: 'needsReviewSince', descending: true },
-					select: VIEW_FIELDS,
-					limit: BOOTSTRAP_REVIEW_LIMIT,
-				},
-				context,
-			),
-		);
-		return (await forReader(records.map(toMemoryView), principal, context)).filter((view) => view.needsReview);
+		const visible = [];
+		// Flags the caller may not see are skipped, so the limit counts only visible ones.
+		for await (const record of Memory.search(
+			{
+				conditions: [
+					active,
+					unexpired,
+					{ attribute: 'ownerId', comparator: 'equals', value: principal.id },
+					{ attribute: 'needsReviewSince', comparator: 'greater_than', value: new Date(0) },
+				],
+				sort: { attribute: 'needsReviewSince', descending: true },
+				select: VIEW_FIELDS,
+			},
+			context,
+		)) {
+			const [view] = await forReader([toMemoryView(record)], principal, context);
+			if (!view.needsReview) continue;
+			visible.push(view);
+			if (visible.length === BOOTSTRAP_REVIEW_LIMIT) break;
+		}
+		return visible;
 	};
 	const [pinned, needsReview, recent, relevant] = await Promise.all([
 		loadPinned(),

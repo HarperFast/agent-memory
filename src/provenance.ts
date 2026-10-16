@@ -32,8 +32,7 @@ export async function activeDependentIds(Memory: any, sourceIds: Iterable<string
 }
 
 /**
- * Flags each active memory citing `source.id` because the source just became `cause`. One hop: nothing here
- * flags the citers of a flagged memory. `extraIds` adds citers the index cannot show yet (rows created in the
+ * One hop: nothing here flags the citers of a flagged memory. `extraIds` adds citers the index cannot show yet (rows created in the
  * same transaction). Returns the ids it changed; the caller hands them to sinks after every lock is confirmed.
  */
 export async function flagDependents(

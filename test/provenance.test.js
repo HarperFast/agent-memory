@@ -90,6 +90,16 @@ describe('flagging on supersede and withdraw', () => {
 		});
 		assert.equal(stored(inactive.id).needsReview, null);
 
+		const later = await create('later', memoryInput('cache eviction is lru'));
+		await create('later-repl', { ...memoryInput('cache eviction is lfu'), supersedes: [later.id] });
+		const laterCiter = await create('later-citer', citing('tune for lru eviction', later.id), bob);
+		await withdrawMemory(later.id, {}, alice, ifMatch(2));
+		assert.equal(
+			stored(laterCiter.id).needsReview.replacementId,
+			idFor('later-repl'),
+			'its replacement at that moment',
+		);
+
 		const older = await create('older', memoryInput('cache size is one gigabyte'));
 		const superseder = await create('superseder', {
 			...citing('cache size is two gigabytes', older.id),
@@ -121,6 +131,44 @@ describe('flagging on supersede and withdraw', () => {
 		await withdrawMemory(z.id, {}, alice, ifMatch(1));
 		assert.deepEqual(stored(dependent.id).needsReview, flag);
 		assert.equal(stored(dependent.id).revision, 2);
+	});
+
+	it('hands a memory both restored and flagged by one withdrawal to sinks once', async () => {
+		const restoredId = idFor('restored');
+		const withdrawnId = idFor('withdrawn');
+		await importMemories(
+			{
+				rows: [
+					{
+						id: withdrawnId,
+						ownerId: 'alice',
+						content: 'replacement note',
+						scopes: ['global'],
+						supersedes: [restoredId],
+					},
+					{
+						id: restoredId,
+						ownerId: 'bob',
+						content: 'original note',
+						scopes: ['global'],
+						evidence: [{ kind: 'memory', ref: withdrawnId }],
+					},
+				],
+			},
+			root,
+			context,
+		);
+		assert.equal(stored(restoredId).status, 'superseded');
+		const calls = [];
+		const unregister = registerMemorySink({ write: (memory) => calls.push(memory.id), withdraw: () => {} });
+		try {
+			await withdrawMemory(withdrawnId, {}, alice, ifMatch(1));
+		} finally {
+			unregister();
+		}
+		assert.deepEqual(calls, [restoredId]);
+		assert.equal(stored(restoredId).status, 'active');
+		assert.equal(stored(restoredId).needsReview.cause, 'withdrawn');
 	});
 
 	it('runs flagged rows through sinks inside the transaction, and a failing sink rolls the whole write back', async () => {
@@ -297,6 +345,30 @@ describe('bootstrap', () => {
 		);
 		assert.equal(memories[1].needsReview.sourceId, source.id);
 	});
+
+	it('fills the section with flags the caller can see, past newer ones it cannot', async () => {
+		const visibleSource = await create('visible-src', memoryInput('ledger closes monthly'));
+		const visible = await create('visible', citing('reconcile at month end', visibleSource.id), dave);
+		await create('visible-repl', { ...memoryInput('ledger closes weekly'), supersedes: [visibleSource.id] });
+		await new Promise((resolve) => setTimeout(resolve, 5));
+		for (let i = 0; i < 20; i++) {
+			const source = await create(
+				`hidden-src-${i}`,
+				memoryInput(`acme ledger rule ${i}`, { scopes: ['customer:x'] }),
+				carol,
+			);
+			await create(`hidden-${i}`, citing(`acme reconciliation ${i}`, source.id), dave);
+			await create(
+				`hidden-repl-${i}`,
+				{ ...memoryInput(`acme ledger rule ${i}, revised`, { scopes: ['customer:x'] }), supersedes: [source.id] },
+				carol,
+			);
+		}
+		const revoked = grant('dave', ['global'], ['global']);
+		const { memories } = await bootstrapMemories({ budget: 100_000 }, revoked, context);
+		const section = memories.filter((memory) => memory.section === 'needsReview').map((memory) => memory.id);
+		assert.deepEqual(section, [visible.id]);
+	});
 });
 
 describe('lock planning', () => {
@@ -322,10 +394,40 @@ describe('lock planning', () => {
 		__test.lockLog.length = 0;
 		await rejection(withdrawMemory(source.id, {}, bob, ifMatch(1)), 403, 'not_memory_owner');
 		await rejection(withdrawMemory(source.id, {}, alice, context), 428, 'if_match_required');
+		await rejection(withdrawMemory(source.id, {}, alice, ifMatch(9)), 412, 'precondition_failed');
 		assert.deepEqual(
 			__test.lockLog.map((entry) => entry.id),
-			[source.id, source.id],
+			[source.id, source.id, source.id],
 		);
+	});
+
+	it('locks the unplanned citers of every superseded memory in one restart', async () => {
+		const targets = [];
+		for (const n of [1, 2, 3]) {
+			const target = await create(`target-${n}`, memoryInput(`replica lag budget ${n}`));
+			await create(`citer-${n}`, citing(`alert on replica lag ${n}`, target.id), bob);
+			targets.push(target.id);
+		}
+		const Memory = databases.memory.Memory;
+		const original = Memory.search.bind(Memory);
+		Memory.search = (query, ctx) => {
+			const citers = query.conditions?.some((condition) => condition.attribute === 'evidenceMemoryIds');
+			return citers && !ctx?.transaction ? (async function* () {})() : original(query, ctx);
+		};
+		__test.lockLog.length = 0;
+		try {
+			await putMemory(
+				idFor('all'),
+				{ ...memoryInput('replica lag budget, unified'), supersedes: targets },
+				alice,
+				context,
+			);
+		} finally {
+			Memory.search = original;
+		}
+		const attempts = __test.lockLog.filter((entry) => entry.id === idFor('all')).length;
+		assert.equal(attempts, 2);
+		for (const n of [1, 2, 3]) assert.equal(stored(idFor(`citer-${n}`)).needsReview.cause, 'superseded');
 	});
 
 	it('retries with a dependent that appeared after planning, and gives up with 503 before any sink runs', async () => {
