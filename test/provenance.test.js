@@ -387,6 +387,25 @@ describe('import', () => {
 		...overrides,
 	});
 
+	it('never flags a citer the same batch supersedes', async () => {
+		const source = await create('source', memoryInput('compaction runs hourly'));
+		const citer = await create('citer', citing('schedule backups between compactions', source.id), bob);
+		await importMemories(
+			{
+				rows: [
+					row(idFor('repl-source'), 'compaction runs every two hours', { supersedes: [source.id] }),
+					row(idFor('repl-citer'), 'backups run at midnight', { supersedes: [citer.id] }),
+				],
+			},
+			root,
+			context,
+		);
+		assert.equal(stored(citer.id).status, 'superseded');
+		assert.equal(stored(citer.id).needsReview, null);
+		assert.equal(stored(citer.id).needsReviewSince, null);
+		assert.equal(stored(citer.id).revision, 2);
+	});
+
 	for (const order of ['citer first', 'superseder first']) {
 		it(`flags stored and batch-created citers of a stored row the batch supersedes (${order}), never its superseders`, async () => {
 			const source = await create('source', memoryInput('index rebuilds take an hour'));

@@ -237,6 +237,8 @@ one of its supports changing.
   restoring a memory to `active` flag nothing, and a restore does not clear flags it left behind.
 - **First cause stands**: a memory already flagged keeps its first flag, unrewritten, until its owner
   revises it or calls `confirm`. A review should therefore re-check all of its memory evidence.
+- **`confirmed` is an event, not a state**: it records the latest confirmation `{ by, at }` and survives
+  later revisions; compare it with `lastEditor.revisedAt` to see which came last.
 - **Not its replacement**: a memory that lists X in `supersedes` (on create, or in the same import) is
   never flagged for X.
 - **Citing serializes with the transition**: a create or revise locks the memories it cites, so a citer

@@ -464,7 +464,14 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 		(supersession.mode === 'auto' || supersedes.length > 0)
 			? plannedCreateScopes(payload, principal)
 			: undefined;
-	const planningCreate = createScopes !== undefined && !(await Memory.get(id, requestContext));
+	const refused = (target: any) => supersedeRefusal(target, createScopes!, principal) !== undefined;
+	let explicitTargets: any[] = [];
+	let planningCreate = createScopes !== undefined && !(await Memory.get(id, requestContext));
+	if (planningCreate) {
+		const cited = await Promise.all((parsedEvidenceMemoryIds ?? []).map((refId) => Memory.get(refId, requestContext)));
+		explicitTargets = await Promise.all(supersedes.map((targetId) => Memory.get(targetId, requestContext)));
+		planningCreate = cited.every((record) => record && canRead(record, principal)) && !explicitTargets.some(refused);
+	}
 	// supersedes never changes after create, so auto verdicts must exist before the create commits.
 	const proposals =
 		planningCreate && supersession.mode === 'auto'
@@ -484,18 +491,15 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 	);
 	let plannedDependents: string[] = [];
 	if (planningCreate && supersedes.length + autoTargets.length > 0) {
-		const preTargets = await Promise.all(
-			[...supersedes, ...autoTargets.map((match) => match.id)].map((targetId) => Memory.get(targetId, requestContext)),
+		const autoPreTargets = await Promise.all(autoTargets.map((match) => Memory.get(match.id, requestContext)));
+		const transitioning = [...explicitTargets, ...autoPreTargets].filter(
+			(target) => target?.status === STATUS_ACTIVE && !refused(target),
 		);
-		const refused = (target: any) => supersedeRefusal(target, createScopes!, principal) !== undefined;
-		if (!preTargets.slice(0, supersedes.length).some(refused)) {
-			const transitioning = preTargets.filter((target) => target?.status === STATUS_ACTIVE && !refused(target));
-			plannedDependents = await activeDependentIds(
-				Memory,
-				transitioning.map((target) => target.id),
-				requestContext,
-			);
-		}
+		plannedDependents = await activeDependentIds(
+			Memory,
+			transitioning.map((target) => target.id),
+			requestContext,
+		);
 	}
 
 	const outcome = await withLockPlan(
@@ -704,8 +708,10 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 	);
 
 	const { memory } = outcome.written;
+	// A concurrent identical create can win the id after this request judged; its proposals then describe nothing.
+	const decided = 'applied' in outcome ? proposals : undefined;
 	const matches =
-		proposals ??
+		decided ??
 		(await judgeCandidates(
 			memory,
 			await findCandidates(
@@ -723,7 +729,7 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 		));
 	const candidates: Candidate[] = toCandidates(
 		matches,
-		proposals ? new Set('applied' in outcome ? outcome.applied : []) : undefined,
+		decided && 'applied' in outcome ? new Set(outcome.applied) : undefined,
 	);
 	return { id, revision: memory.revision as number, created: outcome.created, memory, candidates };
 }
@@ -928,7 +934,7 @@ export async function confirmMemory(
 	if (!isMemoryId(id)) throw notFound();
 	const ifMatch = getHeader(requestContext, 'if-match');
 	const Memory = memoryTable();
-	const memory = await withLockPlan(requestContext, [id], async (txn) => {
+	return withLockPlan(requestContext, [id], async (txn) => {
 		const existing = await Memory.get(id, txn);
 		if (!existing) throw notFound();
 		if (existing.ownerId !== principal.id && !principal.superUser) {
@@ -955,7 +961,6 @@ export async function confirmMemory(
 		if (hasSinks()) await notifySinks('write', memory, txn);
 		return memory;
 	});
-	return (await forReader([memory], principal, requestContext))[0];
 }
 
 export async function pinMemory(id: unknown, input: unknown = {}, principal: Principal, requestContext: object = {}) {

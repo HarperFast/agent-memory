@@ -12,7 +12,6 @@ export interface ReviewFlag {
 
 export const CLEARED_REVIEW = Object.freeze({ needsReview: null, needsReviewSince: null });
 
-/** Active memories citing any of `sourceIds`. */
 export async function activeDependentIds(Memory: any, sourceIds: Iterable<string>, context: object): Promise<string[]> {
 	const ids = new Set<string>();
 	for (const sourceId of new Set(sourceIds)) {
@@ -87,7 +86,7 @@ export async function forReader<T extends MemoryView>(
 	principal: Principal,
 	context?: object,
 ): Promise<T[]> {
-	if (principal.superUser) return [...views];
+	if (principal.superUser || !views.some((view) => view.needsReview)) return [...views];
 	const Memory = memoryTable();
 	const loaded = new Map<string, Promise<any>>();
 	const load = (id: string) => {

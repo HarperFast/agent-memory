@@ -324,10 +324,32 @@ describe('auto mode', () => {
 
 	it('spends no embedding or judge call on a create the transaction will refuse', async () => {
 		await putMemory(idFor('old'), shared(), alice, context);
+		const hidden = (await putMemory(idFor('hidden'), shared(DISK, { scopes: ['customer:x'] }), carol, context)).memory;
 		const embedsBefore = models.calls.length;
+		const generatesBefore = models.generateCalls.length;
 		await rejection(putMemory(idFor('denied'), shared(DISK, { scopes: ['customer:x'] }), alice, context), 403);
 		await rejection(putMemory(idFor('untitled'), { content: DISK, visibility: 'shared' }, alice, context), 400);
+		await rejection(putMemory(idFor('probe'), shared(DISK, { supersedes: [hidden.id] }), alice, context), 404);
+		await rejection(
+			putMemory(idFor('cites'), shared(DISK, { evidence: [{ kind: 'memory', ref: hidden.id }] }), alice, context),
+			400,
+			'invalid_evidence',
+		);
 		assert.equal(models.calls.length, embedsBefore);
-		assert.equal(models.generateCalls.length, 0);
+		assert.equal(models.generateCalls.length, generatesBefore);
+	});
+
+	it('reports nothing as applied when a concurrent identical create won the id after this request judged', async () => {
+		const old = (await putMemory(idFor('old'), shared(), alice, context)).memory;
+		const input = shared(`${DISK} REPLACES`);
+		const results = await Promise.all([
+			putMemory(idFor('new'), input, bob, context),
+			putMemory(idFor('new'), input, bob, context),
+		]);
+		const [winner, loser] = results[0].created ? results : [results[1], results[0]];
+		assert.equal(loser.created, false);
+		assert.equal(winner.candidates.find((candidate) => candidate.id === old.id).applied, true);
+		assert.ok(loser.candidates.every((candidate) => candidate.applied === undefined));
+		assert.equal(stored(old.id).supersededBy, idFor('new'));
 	});
 });

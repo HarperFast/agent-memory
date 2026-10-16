@@ -134,23 +134,24 @@ async function judgeOne(
 ): Promise<Verdict | undefined> {
 	const controller = new AbortController();
 	let timer: ReturnType<typeof setTimeout> | undefined;
-	const call = models.generate(
-		{
-			system: JUDGE_SYSTEM,
-			messages: [
-				{ role: 'user', content: `${describe('new_memory', written)}\n\n${describe('existing_memory', match)}` },
-			],
-		},
-		{ model: judge, maxTokens: JUDGE_MAX_TOKENS, signal: controller.signal },
-	);
-	// A backend that ignores the abort must not hold the write's response open.
-	const deadline = new Promise<'timeout'>((resolve) => {
-		timer = setTimeout(() => {
-			controller.abort();
-			resolve('timeout');
-		}, JUDGE_TIMEOUT_MS);
-	});
+	let call: Promise<unknown> | undefined;
 	try {
+		call = models.generate(
+			{
+				system: JUDGE_SYSTEM,
+				messages: [
+					{ role: 'user', content: `${describe('new_memory', written)}\n\n${describe('existing_memory', match)}` },
+				],
+			},
+			{ model: judge, maxTokens: JUDGE_MAX_TOKENS, signal: controller.signal },
+		);
+		// A backend that ignores the abort must not hold the write's response open.
+		const deadline = new Promise<'timeout'>((resolve) => {
+			timer = setTimeout(() => {
+				controller.abort();
+				resolve('timeout');
+			}, JUDGE_TIMEOUT_MS);
+		});
 		const result = await Promise.race([call, deadline]);
 		if (result === 'timeout') {
 			warnRateLimited('judge', `supersession judge "${judge}" timed out; candidate left unjudged`);
@@ -164,7 +165,7 @@ async function judgeOne(
 		return undefined;
 	} finally {
 		clearTimeout(timer);
-		call.catch(() => {});
+		call?.catch(() => {});
 	}
 }
 
@@ -183,7 +184,6 @@ export async function judgeCandidates(
 	);
 }
 
-/** `applied` appears only when auto mode decided, and only on `supersedes` verdicts. */
 export function toCandidates(matches: readonly CandidateMatch[], applied?: ReadonlySet<string>): Candidate[] {
 	return matches.map(({ id, title, similarity, verdict }) => ({
 		id,

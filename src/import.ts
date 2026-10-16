@@ -188,6 +188,7 @@ export async function importMemories(input: unknown, principal: Principal, reque
 			// Rows stored earlier that this batch supersedes (an import that arrived predecessor-first).
 			const createdIds = new Set(created.map((row) => row.id));
 			const changed: string[] = [];
+			const transitions = [];
 			for (const targetId of new Set(liveCreated.flatMap((row) => row.supersedes))) {
 				if (createdIds.has(targetId)) continue;
 				const target = await Memory.get(targetId, txn);
@@ -196,10 +197,12 @@ export async function importMemories(input: unknown, principal: Principal, reque
 				if (next.status === target.status && next.supersededBy === target.supersededBy) continue;
 				await Memory.patch(targetId, { ...next, revision: target.revision + 1 }, txn);
 				changed.push(targetId);
-				if (target.status !== STATUS_ACTIVE) continue;
+				if (target.status === STATUS_ACTIVE) transitions.push({ id: targetId, replacementId: next.supersededBy! });
+			}
+			// After every target is patched, so a citer this batch also supersedes is no longer active to flag.
+			for (const source of transitions) {
 				// The index does not show this batch's rows inside the transaction, so its citers are named here.
-				const batchCiters = liveCreated.filter((row) => row.evidenceMemoryIds.includes(targetId)).map((row) => row.id);
-				const source = { id: targetId, replacementId: next.supersededBy ?? undefined };
+				const batchCiters = liveCreated.filter((row) => row.evidenceMemoryIds.includes(source.id)).map((row) => row.id);
 				changed.push(...(await flagDependents(Memory, source, 'superseded', locks, txn, now, batchCiters)));
 			}
 
