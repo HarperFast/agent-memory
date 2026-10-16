@@ -5,10 +5,11 @@ Shared, permissioned, live memory for agents and people, as a Harper plugin.
 - Scoped visibility (`global`, `user:<id>`, `customer:<id>`, `team:<id>`) with grants on Harper users and roles
 - Hybrid search (vector + full-text, reciprocal rank fusion) that covers a memory as soon as its write commits
 - First-class supersession: replacing a memory hides the old one from default search, and withdrawing the replacement restores it
+- Write-time supersession candidates: every `PUT` returns the similar memories it may replace, optionally classified by a judge model, which `auto` mode can act on
+- Provenance flags: when a memory is superseded or withdrawn, the memories citing it as evidence get `needsReview` until their owner revises or confirms them
 - Extension points: `registerMemorySink` runs inside the lifecycle transaction for apps that mirror memories elsewhere, `setPrincipalResolver` maps app-defined identities
 
-Status: pre-release (v0 core). Write-time supersession candidates and live updates are designed but not yet
-built. Design and contracts: [DESIGN.md](DESIGN.md).
+Status: pre-release (v0 core). Live updates are designed but not yet built. Design and contracts: [DESIGN.md](DESIGN.md).
 
 ## Quick start
 
@@ -24,6 +25,10 @@ Requires Harper 5.3.1 or later on RocksDB (the default).
      package: '@harperfast/agent-memory'
      # urlPath: 'Memory'          # mount path
      # embeddingModel: 'default'  # logical model name from Harper's models config
+     # supersession:
+     #   similarity: 0.82         # candidates returned on PUT at or above this cosine similarity
+     #   judge: 'judge'           # a generative model that classifies each candidate
+     #   mode: 'suggest'          # or 'auto' (needs judge): apply "supersedes" verdicts on create
    ```
 
    ```yaml
@@ -72,6 +77,12 @@ Requires Harper 5.3.1 or later on RocksDB (the default).
    # pin or unpin a readable memory for your own bootstrap
    curl -u carol:pass -X POST localhost:9926/Memory/<id>/pin -H 'Content-Type: application/json' -d '{}'
    curl -u carol:pass -X POST localhost:9926/Memory/<id>/unpin -H 'Content-Type: application/json' -d '{}'
+
+   # a PUT response lists similar memories it may replace:
+   # { "id": "<id>", "revision": 1, "candidates": [{ "id": "<other>", "title": "...", "similarity": 0.91, "verdict": "supersedes" }] }
+
+   # a memory whose cited evidence was superseded or withdrawn carries needsReview; the owner clears it
+   curl -u carol:pass -X POST localhost:9926/Memory/<id>/confirm -H 'Content-Type: application/json' -d '{}'
 
    # replace a memory: everyone who reads the old one through its labels must be able to read the replacement
    curl -u carol:pass -X PUT localhost:9926/Memory/<new-id> -H 'Content-Type: application/json' -d '{

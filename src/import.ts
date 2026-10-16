@@ -4,9 +4,8 @@ import {
 	compareNewest,
 	deriveEvidenceMemoryIds,
 	ensureEmbedder,
-	inOwnTransaction,
 	isMemoryId,
-	lockRows,
+	LONG_LOCK_LEASE_MS,
 	memoryTable,
 	newestSuperseder,
 	normalizeEvidence,
@@ -21,14 +20,14 @@ import {
 	STATUS_WITHDRAWN,
 	toMemoryView,
 	WITHDRAW_REASON_MAX_CHARS,
+	withLockPlan,
 } from './lifecycle.ts';
+import { activeDependentIds, CLEARED_REVIEW, flagDependents } from './provenance.ts';
 import { isScopeLabel, MAX_SCOPES_PER_MEMORY, requirePrincipalId, type Principal } from './scopes.ts';
 import { getSettings } from './settings.ts';
 import { hasSinks, notifySinks } from './sinks.ts';
 
 const IMPORT_MAX_ROWS = 100;
-// A batch embeds every row inside its transaction; Harper's default 30 s lock lease could lapse before commit.
-const IMPORT_LOCK_LEASE_MS = 5 * 60_000;
 const IMPORT_SUPERSEDES_MAX_ITEMS = 100;
 const ROW_FIELDS = [
 	'id',
@@ -127,71 +126,96 @@ export async function importMemories(input: unknown, principal: Principal, reque
 	const Memory = memoryTable();
 	ensureEmbedder(Memory, settings);
 
-	return inOwnTransaction(requestContext, async (txn) => {
-		const targetIds = new Set<string>(rows.flatMap((row: { supersedes: string[] }) => row.supersedes));
-		await lockRows(Memory, [...rows.map((row: { id: string }) => row.id), ...targetIds], txn, IMPORT_LOCK_LEASE_MS);
-		const results: Array<{ id: string; result: ImportResult }> = [];
-		const created = [];
-		const now = new Date();
-		for (const row of rows) {
-			const existing = await Memory.get(row.id, txn);
-			if (existing) {
-				const same =
-					existing.ownerId === row.ownerId &&
-					sameEditableFields(existing, row) &&
-					sameStringArray(existing.supersedes ?? [], row.supersedes) &&
-					(row.status !== STATUS_WITHDRAWN ||
-						(existing.status === STATUS_WITHDRAWN && (existing.withdrawnReason ?? null) === row.withdrawnReason));
-				results.push({ id: row.id, result: same ? 'unchanged' : 'conflict' });
-			} else {
-				created.push({ ...row, createdAt: row.createdAt ?? now });
-				results.push({ id: row.id, result: 'created' });
-			}
-		}
-		const liveCreated = created.filter((row) => row.status !== STATUS_WITHDRAWN);
-		const graphState = async (targetId: string) => {
-			let newest = await newestSuperseder(Memory, targetId, txn);
-			for (const row of liveCreated) {
-				if (row.supersedes.includes(targetId) && (!newest || compareNewest(row, newest) > 0)) newest = row;
-			}
-			return newest
-				? { status: STATUS_SUPERSEDED, supersededBy: newest.id }
-				: { status: STATUS_ACTIVE, supersededBy: null };
-		};
+	const targetIds = new Set<string>(rows.flatMap((row: { supersedes: string[] }) => row.supersedes));
+	// A stored row this batch supersedes flags its citers, and citing serializes with that, as on PUT.
+	const citedIds = rows.flatMap((row: { evidenceMemoryIds: string[] }) => row.evidenceMemoryIds);
+	const plannedDependents = await activeDependentIds(Memory, targetIds, requestContext);
 
-		for (const row of created) {
-			const state =
-				row.status === STATUS_WITHDRAWN
-					? { status: row.status, supersededBy: row.supersededBy }
-					: await graphState(row.id);
-			await Memory.put(
-				{
-					...row,
-					...state,
-					revision: 1,
-					author: { principalId: row.ownerId, source: 'import', authoredAt: row.createdAt.toISOString() },
-					lastEditor: null,
-					embeddingModel: settings.embeddingModel,
-				},
-				txn,
-			);
+	return withLockPlan(
+		requestContext,
+		[...rows.map((row: { id: string }) => row.id), ...targetIds, ...citedIds, ...plannedDependents],
+		async (txn, locks) => {
+			const results: Array<{ id: string; result: ImportResult }> = [];
+			const created = [];
+			const now = new Date();
+			for (const row of rows) {
+				const existing = await Memory.get(row.id, txn);
+				if (existing) {
+					const same =
+						existing.ownerId === row.ownerId &&
+						sameEditableFields(existing, row) &&
+						sameStringArray(existing.supersedes ?? [], row.supersedes) &&
+						(row.status !== STATUS_WITHDRAWN ||
+							(existing.status === STATUS_WITHDRAWN && (existing.withdrawnReason ?? null) === row.withdrawnReason));
+					results.push({ id: row.id, result: same ? 'unchanged' : 'conflict' });
+				} else {
+					created.push({ ...row, createdAt: row.createdAt ?? now });
+					results.push({ id: row.id, result: 'created' });
+				}
+			}
+			const liveCreated = created.filter((row) => row.status !== STATUS_WITHDRAWN);
+			const graphState = async (targetId: string) => {
+				let newest = await newestSuperseder(Memory, targetId, txn);
+				for (const row of liveCreated) {
+					if (row.supersedes.includes(targetId) && (!newest || compareNewest(row, newest) > 0)) newest = row;
+				}
+				return newest
+					? { status: STATUS_SUPERSEDED, supersededBy: newest.id }
+					: { status: STATUS_ACTIVE, supersededBy: null };
+			};
+
+			for (const row of created) {
+				const state =
+					row.status === STATUS_WITHDRAWN
+						? { status: row.status, supersededBy: row.supersededBy }
+						: await graphState(row.id);
+				await Memory.put(
+					{
+						...row,
+						...state,
+						revision: 1,
+						autoSupersedes: [],
+						...CLEARED_REVIEW,
+						confirmed: null,
+						author: { principalId: row.ownerId, source: 'import', authoredAt: row.createdAt.toISOString() },
+						lastEditor: null,
+						embeddingModel: settings.embeddingModel,
+					},
+					txn,
+				);
+			}
+
+			// Rows stored earlier that this batch supersedes (an import that arrived predecessor-first).
+			const createdIds = new Set(created.map((row) => row.id));
+			const changed: string[] = [];
+			for (const targetId of new Set(liveCreated.flatMap((row) => row.supersedes))) {
+				if (createdIds.has(targetId)) continue;
+				const target = await Memory.get(targetId, txn);
+				if (!target || target.status === STATUS_WITHDRAWN) continue;
+				const next = await graphState(targetId);
+				if (next.status === target.status && next.supersededBy === target.supersededBy) continue;
+				await Memory.patch(targetId, { ...next, revision: target.revision + 1 }, txn);
+				changed.push(targetId);
+				if (target.status !== STATUS_ACTIVE) continue;
+				// The index does not show this batch's rows inside the transaction, so its citers are named here.
+				const batchCiters = liveCreated.filter((row) => row.evidenceMemoryIds.includes(targetId)).map((row) => row.id);
+				const source = { id: targetId, replacementId: next.supersededBy ?? undefined };
+				changed.push(...(await flagDependents(Memory, source, 'superseded', locks, txn, now, batchCiters)));
+			}
+
+			// Sinks run once every lock is confirmed, so an attempt the lock plan restarts never reaches one.
 			if (hasSinks()) {
-				const memory = toMemoryView(await Memory.get(row.id, txn));
-				await notifySinks(row.status === STATUS_WITHDRAWN ? 'withdraw' : 'write', memory, txn);
+				for (const row of created) {
+					const memory = toMemoryView(await Memory.get(row.id, txn));
+					await notifySinks(row.status === STATUS_WITHDRAWN ? 'withdraw' : 'write', memory, txn);
+				}
+				for (const changedId of new Set(changed)) {
+					if (createdIds.has(changedId)) continue;
+					await notifySinks('write', toMemoryView(await Memory.get(changedId, txn)), txn);
+				}
 			}
-		}
-
-		// Rows stored earlier that this batch supersedes (an import that arrived predecessor-first).
-		const createdIds = new Set(created.map((row) => row.id));
-		for (const targetId of new Set(liveCreated.flatMap((row) => row.supersedes))) {
-			if (createdIds.has(targetId)) continue;
-			const target = await Memory.get(targetId, txn);
-			if (!target || target.status === STATUS_WITHDRAWN) continue;
-			const next = await graphState(targetId);
-			if (next.status === target.status && next.supersededBy === target.supersededBy) continue;
-			await Memory.patch(targetId, { ...next, revision: target.revision + 1 }, txn);
-			if (hasSinks()) await notifySinks('write', toMemoryView(await Memory.get(targetId, txn)), txn);
-		}
-		return { results };
-	});
+			return { results };
+		},
+		LONG_LOCK_LEASE_MS,
+	);
 }

@@ -181,10 +181,18 @@ export function transaction(contextOrCallback, maybeCallback) {
 
 export const models = {
 	calls: [],
+	generateCalls: [],
+	// Tests install a deterministic generator: (input, options) => content string, or throw.
+	generator: undefined,
 	async embed(input, options) {
 		this.calls.push({ input, options });
 		const dimensions = options?.model === 'wide' ? 64 : 32;
 		return (Array.isArray(input) ? input : [input]).map((text) => Float32Array.from(embedText(text, dimensions)));
+	},
+	async generate(input, options) {
+		this.generateCalls.push({ input, options });
+		if (!this.generator) throw new Error(`stub: no generative backend for model ${options?.model}`);
+		return { content: await this.generator(input, options), finishReason: 'stop' };
 	},
 };
 
@@ -211,5 +219,7 @@ export const __test = {
 		searchLog.length = 0;
 		lockLog.length = 0;
 		models.calls.length = 0;
+		models.generateCalls.length = 0;
+		models.generator = undefined;
 	},
 };

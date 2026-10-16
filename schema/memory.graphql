@@ -11,9 +11,15 @@ type Memory @table(database: "memory", audit: true) {
 	status: String @indexed # active | superseded | withdrawn
 	revision: Int
 	supersedes: [ID] @indexed
+	# The subset of supersedes the auto judge added, so an identical retry compares only what the author sent.
+	autoSupersedes: [ID]
 	supersededBy: ID @indexed
 	evidence: Any
 	evidenceMemoryIds: [ID] @indexed
+	needsReview: Any # { since, cause: superseded | withdrawn, sourceId, replacementId? }
+	# needsReview.since, indexed because Harper does not index object values; never in a view.
+	needsReviewSince: Date @indexed
+	confirmed: Any # { by, at }
 	author: Any
 	lastEditor: Any
 	validUntil: Date

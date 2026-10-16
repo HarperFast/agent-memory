@@ -2,7 +2,7 @@
 import { logger, Resource } from 'harper';
 import { badRequest, isCallerSafe, memoryError, notFound } from './errors.ts';
 import { importMemories } from './import.ts';
-import { getMemory, pinMemory, putMemory, unpinMemory, withdrawMemory } from './lifecycle.ts';
+import { confirmMemory, getMemory, pinMemory, putMemory, unpinMemory, withdrawMemory } from './lifecycle.ts';
 import { resolvePrincipal } from './principal.ts';
 import type { Principal } from './scopes.ts';
 import { bootstrapMemories, parseBootstrapParams, parseSearchParams, searchMemories } from './search.ts';
@@ -78,9 +78,11 @@ async function handle(
 	}
 }
 
+const MEMORY_ACTIONS = ['pin', 'unpin', 'confirm'];
+
 function rejectUnsupportedVerb(target: any): never {
 	if (target?.rest || target?.pathname) throw notFound();
-	if (target?.action !== undefined && target.action !== 'pin' && target.action !== 'unpin') throw notFound();
+	if (target?.action !== undefined && !MEMORY_ACTIONS.includes(target.action)) throw notFound();
 	throw memoryError('Method not allowed', 405, 'method_not_allowed');
 }
 
@@ -156,8 +158,13 @@ export class MemoryItemResource extends MemoryEndpoint {
 
 	static async put(target: any, data: any, context: object) {
 		return handle('put', context, async (principal, ctx) => {
-			const { id, revision, created } = await putMemory(String(target?.id ?? ''), await readBody(data), principal, ctx);
-			return json({ id, revision }, created ? 201 : 200);
+			const { id, revision, created, candidates } = await putMemory(
+				String(target?.id ?? ''),
+				await readBody(data),
+				principal,
+				ctx,
+			);
+			return json({ id, revision, candidates }, created ? 201 : 200);
 		});
 	}
 
@@ -182,6 +189,8 @@ export class MemoryActionResource extends MemoryEndpoint {
 					return json(await pinMemory(id, input, principal, ctx));
 				case 'unpin':
 					return json(await unpinMemory(id, input, principal, ctx));
+				case 'confirm':
+					return json({ memory: await confirmMemory(id, input, principal, ctx) });
 				default:
 					throw notFound();
 			}

@@ -8,6 +8,7 @@ import {
 	STATUS_SUPERSEDED,
 	toMemoryView,
 } from './lifecycle.ts';
+import { forReader } from './provenance.ts';
 import { anyOf, canRead, isScopeLabel, readableCondition, type Condition, type Principal } from './scopes.ts';
 import { getSettings } from './settings.ts';
 
@@ -23,6 +24,7 @@ const BOOTSTRAP_DEFAULT_BUDGET = 8000;
 const BOOTSTRAP_MAX_BUDGET = 100_000;
 const BOOTSTRAP_RECENT_LIMIT = 50;
 const BOOTSTRAP_RELEVANT_LIMIT = 20;
+const BOOTSTRAP_REVIEW_LIMIT = 20;
 
 const VIEW_FIELDS = [
 	'id',
@@ -36,7 +38,10 @@ const VIEW_FIELDS = [
 	'evidence',
 	'evidenceMemoryIds',
 	'supersedes',
+	'autoSupersedes',
 	'supersededBy',
+	'needsReview',
+	'confirmed',
 	'author',
 	'lastEditor',
 	'validUntil',
@@ -92,7 +97,7 @@ export function parseSearchParams(params: URLSearchParams): SearchParams {
 	};
 }
 
-function unexpiredCondition(now: Date): Condition {
+export function unexpiredCondition(now: Date): Condition {
 	return anyOf([
 		{ attribute: 'validUntil', comparator: 'equals', value: null },
 		{ attribute: 'validUntil', comparator: 'greater_than', value: now },
@@ -123,11 +128,11 @@ const rejectedModels = new Set<string>();
 const EMBED_WARN_INTERVAL_MS = 60_000;
 let lastEmbedWarning = 0;
 
-function isVectorDimensionMismatch(error: any): boolean {
+export function isVectorDimensionMismatch(error: any): boolean {
 	return error?.statusCode === 400 && String(error?.message).startsWith('Search target has ');
 }
 
-function reportVectorLaneRejected(model: string, error: Error): void {
+export function reportVectorLaneRejected(model: string, error: Error): void {
 	if (rejectedModels.has(model)) return;
 	rejectedModels.add(model);
 	logger.error?.(
@@ -146,14 +151,14 @@ function reportEmbedFailure(model: string, error: unknown): void {
 	);
 }
 
-async function collect(iterable: AsyncIterable<any>): Promise<any[]> {
+export async function collect(iterable: AsyncIterable<any>): Promise<any[]> {
 	const records = [];
 	for await (const record of iterable) records.push(record);
 	return records;
 }
 
 // The conditions already exclude unreadable rows; this re-check only catches a defect in them.
-function assertReadable(records: any[], principal: Principal): any[] {
+export function assertReadable(records: any[], principal: Principal): any[] {
 	return records.filter((record) => {
 		if (canRead(record, principal)) return true;
 		logger.error?.(`[agent-memory] search returned unreadable memory ${record.id}; dropped`);
@@ -186,7 +191,7 @@ export async function searchMemories(params: SearchParams, principal: Principal,
 				context,
 			),
 		);
-		return assertReadable(recent, principal).map(toMemoryView);
+		return forReader(assertReadable(recent, principal).map(toMemoryView), principal, context);
 	}
 	const laneLimit = Math.min(params.limit * 2, 100);
 	let vector: ArrayLike<number> | undefined;
@@ -234,9 +239,16 @@ export async function searchMemories(params: SearchParams, principal: Principal,
 			),
 		),
 	]);
-	return fuse([assertReadable(vectorHits, principal), assertReadable(textHits, principal)])
-		.slice(0, params.limit)
-		.map(({ record, score }) => ({ ...toMemoryView(record), score }));
+	const ranked = fuse([assertReadable(vectorHits, principal), assertReadable(textHits, principal)]).slice(
+		0,
+		params.limit,
+	);
+	const views = await forReader(
+		ranked.map(({ record }) => toMemoryView(record)),
+		principal,
+		context,
+	);
+	return views.map((view, index) => ({ ...view, score: ranked[index].score }));
 }
 
 export interface BootstrapParams {
@@ -282,13 +294,35 @@ export async function bootstrapMemories(params: BootstrapParams, principal: Prin
 				context,
 			),
 		);
-		const byId = new Map(assertReadable(records, principal).map((record) => [record.id, toMemoryView(record)]));
+		const views = await forReader(assertReadable(records, principal).map(toMemoryView), principal, context);
+		const byId = new Map(views.map((view) => [view.id, view]));
 		return pins
 			.map((pin) => byId.get(pin.memoryId))
 			.filter((view): view is NonNullable<typeof view> => view !== undefined);
 	};
-	const [pinned, recent, relevant] = await Promise.all([
+	// The caller's own flagged memories; the indexed mirror of the flag's date keeps this off a scan of every owned row.
+	const loadNeedsReview = async () => {
+		const records = await collect(
+			Memory.search(
+				{
+					conditions: [
+						active,
+						unexpired,
+						{ attribute: 'ownerId', comparator: 'equals', value: principal.id },
+						{ attribute: 'needsReviewSince', comparator: 'greater_than', value: new Date(0) },
+					],
+					sort: { attribute: 'needsReviewSince', descending: true },
+					select: VIEW_FIELDS,
+					limit: BOOTSTRAP_REVIEW_LIMIT,
+				},
+				context,
+			),
+		);
+		return (await forReader(records.map(toMemoryView), principal, context)).filter((view) => view.needsReview);
+	};
+	const [pinned, needsReview, recent, relevant] = await Promise.all([
 		loadPinned(),
+		loadNeedsReview(),
 		collect(
 			Memory.search(
 				{
@@ -299,7 +333,7 @@ export async function bootstrapMemories(params: BootstrapParams, principal: Prin
 				},
 				context,
 			),
-		).then((records) => records.map(toMemoryView)),
+		).then((records) => forReader(records.map(toMemoryView), principal, context)),
 		params.q
 			? searchMemories(
 					{
@@ -320,6 +354,7 @@ export async function bootstrapMemories(params: BootstrapParams, principal: Prin
 	let used = 0;
 	for (const [section, records] of [
 		['pinned', pinned],
+		['needsReview', needsReview],
 		['recent', recent],
 		['relevant', relevant],
 	] as const) {

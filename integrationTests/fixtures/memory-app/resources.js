@@ -33,6 +33,25 @@ models.registerBackend(
 	}),
 );
 
+// Deterministic supersession judge: decides by a marker in the new memory, which the prompt puts first.
+models.registerBackend(
+	'generative',
+	'judge-stub',
+	models.defineBackend({
+		name: 'test-judge',
+		async generate(input) {
+			const prompt = input.messages.at(-1).content;
+			const written = prompt.slice(0, prompt.indexOf('<existing_memory>'));
+			const content = written.includes('REPLACES')
+				? 'supersedes'
+				: written.includes('EXTENDS')
+					? 'refines'
+					: 'unrelated';
+			return { status: 'completed', output: { content, finishReason: 'stop' } };
+		},
+	}),
+);
+
 // Writes before it can throw, so a failure must roll this row back along with the memory.
 const record = (kind) => async (memory, context) => {
 	await databases.memory.SinkLog.put(

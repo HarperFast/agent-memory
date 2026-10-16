@@ -41,14 +41,14 @@ describe('MEMORY_RESOURCES static surface', () => {
 		}
 	});
 
-	it('routes put (create/revise), get (with ETag), delete (withdraw), search, bootstrap, pin, unpin, and import via static verbs, and rejects removed POST routes with 404/405', async () => {
+	it('routes put (create/revise), get (with ETag), delete (withdraw), search, bootstrap, pin, unpin, confirm, and import via static verbs, and rejects removed POST routes with 404/405', async () => {
 		const context = { user: superUser };
 		const id = 'mem-item-00000001';
 		const created = await parse(
 			await MemoryItemResource.put(queryTarget('', { id }), { title: 't1', content: 'alpha content' }, context),
 		);
 		assert.equal(created.status, 201);
-		assert.deepEqual(created.body, { id, revision: 1 });
+		assert.deepEqual(created.body, { id, revision: 1, candidates: [] });
 
 		const fetched = await parse(await MemoryItemResource.get(queryTarget('', { id }), context));
 		assert.equal(fetched.status, 200);
@@ -88,16 +88,23 @@ describe('MEMORY_RESOURCES static surface', () => {
 			),
 		);
 		assert.equal(revised.status, 200);
-		assert.deepEqual(revised.body, { id, revision: 2 });
+		assert.deepEqual(revised.body, { id, revision: 2, candidates: [] });
 
 		const afterRevise = await parse(await MemoryItemResource.get(queryTarget('', { id }), context));
 		assert.equal(afterRevise.headers.get('etag'), '"2"');
 		assert.deepEqual(afterRevise.body.memory.scopes, ['global']);
 
+		const confirmed = await parse(
+			await MemoryActionResource.post(queryTarget('', { id, action: 'confirm' }), {}, context),
+		);
+		assert.equal(confirmed.status, 200);
+		assert.equal(confirmed.body.memory.revision, 3);
+		assert.equal(confirmed.body.memory.confirmed.by, 'root');
+
 		const withdrawn = await parse(
 			await MemoryItemResource.delete(queryTarget('reason=done', { id }), {
 				...context,
-				headers: { 'if-match': '"2"' },
+				headers: { 'if-match': '"3"' },
 			}),
 		);
 		assert.equal(withdrawn.status, 200);

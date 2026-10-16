@@ -79,9 +79,37 @@ describe('parseSettings', () => {
 			embeddingModel: 'default',
 			titleChars: 200,
 			contentChars: 20000,
+			supersession: { mode: 'suggest', similarity: 0.82 },
 		});
 		assert.throws(() => parseSettings({ limits: { titleChars: 1001 } }));
 		assert.throws(() => parseSettings({ embeddingModel: '' }));
 		assert.throws(() => parseSettings({ urlPath: '/' }));
+	});
+
+	it('validates supersession options, and refuses auto without a judge', () => {
+		assert.deepEqual(
+			parseSettings({ supersession: { mode: 'auto', similarity: 0.9, judge: 'local:judge' } }).supersession,
+			{
+				mode: 'auto',
+				similarity: 0.9,
+				judge: 'local:judge',
+			},
+		);
+		assert.deepEqual(parseSettings({ supersession: { judge: 'local:judge' } }).supersession, {
+			mode: 'suggest',
+			similarity: 0.82,
+			judge: 'local:judge',
+		});
+		for (const supersession of [
+			'auto',
+			{ mode: 'auto' },
+			{ mode: 'off' },
+			{ similarity: 0 },
+			{ similarity: 1.5 },
+			{ similarity: '0.9' },
+			{ judge: '' },
+		]) {
+			assert.throws(() => parseSettings({ supersession }), /supersession/, JSON.stringify(supersession));
+		}
 	});
 });

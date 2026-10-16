@@ -414,9 +414,9 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 		const first = await call('alice', 'PUT', id, input);
 		const retry = await call('alice', 'PUT', id, input);
 		strictEqual(first.status, 201);
-		deepStrictEqual(first.body, { id, revision: 1 });
+		deepStrictEqual(first.body, { id, revision: 1, candidates: [] });
 		strictEqual(retry.status, 200);
-		deepStrictEqual(retry.body, { id, revision: 1 });
+		deepStrictEqual(retry.body, { id, revision: 1, candidates: [] });
 
 		const createOnly = await call('alice', 'PUT', id, input, { 'If-None-Match': '*' });
 		strictEqual(createOnly.status, 412);
@@ -432,7 +432,7 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 
 		const revised = await call('alice', 'PUT', id, { ...input, content: 'other' }, { 'If-Match': '"1"' });
 		strictEqual(revised.status, 200);
-		deepStrictEqual(revised.body, { id, revision: 2 });
+		deepStrictEqual(revised.body, { id, revision: 2, candidates: [] });
 
 		const reviseWithSupersedes = await call(
 			'alice',
@@ -605,6 +605,179 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 			get_attributes: ['id'],
 		});
 		deepStrictEqual(indexed, [{ id: citing.id }]);
+	});
+
+	// Candidate search does not wait for index coverage; a search does, so it settles the index between steps.
+	const settleIndex = (user: string, q: string) => search(user, `q=${encodeURIComponent(q)}`);
+	const shape = (candidates: any[]) =>
+		candidates.map(({ id, verdict, applied }) => ({ id, verdict, applied: applied ?? null }));
+
+	test('PUT returns readable, scope-sharing candidates with a judge verdict; auto mode supersedes on a judged create', async () => {
+		const original = await create('alice', 'grebe-v1', {
+			title: 'grebe count',
+			content: 'grebe colony counted at forty pairs on the north lake',
+			visibility: 'shared',
+		});
+		await create('carol', 'grebe-cx', {
+			title: 'grebe count',
+			content: 'grebe colony counted at forty pairs on the north lake',
+			scopes: ['customer:x'],
+		});
+		await settleIndex('admin', 'grebe');
+
+		const refining = await call('bob', 'PUT', memId('grebe-v2'), {
+			title: 'grebe count',
+			content: 'grebe colony counted at forty pairs on the north lake EXTENDS',
+			visibility: 'shared',
+		});
+		strictEqual(refining.status, 201, JSON.stringify(refining.body));
+		deepStrictEqual(shape(refining.body.candidates), [{ id: original.id, verdict: 'refines', applied: null }]);
+		const [{ similarity }] = refining.body.candidates;
+		ok(similarity >= 0.82 && similarity <= 1 + 1e-6, String(similarity));
+		strictEqual((await call('alice', 'GET', original.id)).body.memory.status, 'active');
+
+		// A revise reports candidates for the vector its own write computed.
+		const note = await create('alice', 'grebe-note', {
+			title: 'note',
+			content: 'shoreline survey',
+			visibility: 'shared',
+		});
+		await settleIndex('admin', 'grebe');
+		const revised = await call(
+			'alice',
+			'PUT',
+			note.id,
+			{ content: 'grebe colony counted at forty pairs on the north lake' },
+			{ 'If-Match': '"1"' },
+		);
+		strictEqual(revised.status, 200, JSON.stringify(revised.body));
+		ok(revised.body.candidates.some((candidate: any) => candidate.id === original.id));
+
+		const replacing = await call('bob', 'PUT', memId('grebe-v3'), {
+			title: 'grebe count',
+			content: 'grebe colony counted at forty pairs on the north lake REPLACES',
+			visibility: 'shared',
+		});
+		strictEqual(replacing.status, 201, JSON.stringify(replacing.body));
+		const decided = shape(replacing.body.candidates).find((candidate: any) => candidate.id === original.id);
+		deepStrictEqual(decided, { id: original.id, verdict: 'supersedes', applied: true });
+		const old = (await call('alice', 'GET', original.id)).body.memory;
+		strictEqual(old.status, 'superseded');
+		strictEqual(old.supersededBy, replacing.body.id);
+		const replacement = (await call('bob', 'GET', replacing.body.id)).body.memory;
+		ok(replacement.autoSupersedes.includes(original.id));
+		ok(replacement.supersedes.includes(original.id));
+
+		const retried = await call('bob', 'PUT', memId('grebe-v3'), {
+			title: 'grebe count',
+			content: 'grebe colony counted at forty pairs on the north lake REPLACES',
+			visibility: 'shared',
+		});
+		strictEqual(retried.status, 200, JSON.stringify(retried.body));
+		strictEqual(retried.body.revision, 1);
+	});
+
+	test('superseding or withdrawing a memory flags its citers; search, bootstrap and confirm surface and clear the flag', async () => {
+		const source = await create('alice', 'avocet-src', {
+			title: 'avocet',
+			content: 'avocet nesting starts in april',
+			visibility: 'shared',
+		});
+		// customer:x, so dave (customer:*) reads it without owning it and bob cannot read it at all.
+		const dependent = await create('carol', 'avocet-dep', {
+			title: 'avocet plan',
+			content: 'survey avocet nests in early april',
+			scopes: ['customer:x'],
+			evidence: [{ kind: 'memory', ref: source.id }],
+		});
+		const secondHop = await create('dave', 'avocet-hop', {
+			title: 'avocet boat',
+			content: 'book the survey boat',
+			visibility: 'shared',
+			evidence: [{ kind: 'memory', ref: dependent.id }],
+		});
+		const replacement = await create('alice', 'avocet-repl', {
+			title: 'avocet',
+			content: 'avocet nesting starts in may',
+			visibility: 'shared',
+			supersedes: [source.id],
+		});
+
+		const flagged = await call('carol', 'GET', dependent.id);
+		strictEqual(flagged.etag, '"2"');
+		const { since, ...flag } = flagged.body.memory.needsReview;
+		deepStrictEqual(flag, { cause: 'superseded', sourceId: source.id, replacementId: replacement.id });
+		ok(!Number.isNaN(Date.parse(since)));
+		strictEqual((await call('dave', 'GET', secondHop.id)).body.memory.needsReview, null, 'one hop');
+
+		const hit = (await search('carol', 'q=avocet')).find((memory) => memory.id === dependent.id);
+		strictEqual(hit.needsReview.cause, 'superseded');
+		const boot = await call('carol', 'GET', 'bootstrap?budget=100000');
+		strictEqual(boot.status, 200, JSON.stringify(boot.body));
+		ok(boot.body.memories.some((memory: any) => memory.id === dependent.id && memory.section === 'needsReview'));
+
+		const byReader = await call('dave', 'POST', `${dependent.id}/confirm`, {});
+		strictEqual(byReader.status, 403);
+		strictEqual(byReader.body.code, 'not_memory_owner');
+		const byNonReader = await call('bob', 'POST', `${dependent.id}/confirm`, {});
+		const missing = await call('bob', 'POST', `${'0'.repeat(32)}/confirm`, {});
+		strictEqual(byNonReader.status, 404);
+		deepStrictEqual(byNonReader.body, missing.body);
+		strictEqual((await call('carol', 'POST', `${dependent.id}/confirm`, {}, { 'If-Match': '"1"' })).status, 412);
+
+		const confirmed = await call('carol', 'POST', `${dependent.id}/confirm`, {}, { 'If-Match': '"2"' });
+		strictEqual(confirmed.status, 200, JSON.stringify(confirmed.body));
+		strictEqual(confirmed.body.memory.needsReview, null);
+		strictEqual(confirmed.body.memory.confirmed.by, 'carol');
+		strictEqual((await call('carol', 'GET', dependent.id)).etag, '"3"');
+		const after = await call('carol', 'GET', 'bootstrap?budget=100000');
+		ok(!after.body.memories.some((memory: any) => memory.section === 'needsReview' && memory.id === dependent.id));
+
+		const retracted = await create('alice', 'avocet-retracted', {
+			title: 'avocet',
+			content: 'avocet colony uses the east island',
+			visibility: 'shared',
+		});
+		const citer = await create('bob', 'avocet-citer', {
+			title: 'avocet route',
+			content: 'land on the east island',
+			visibility: 'shared',
+			evidence: [{ kind: 'memory', ref: retracted.id }],
+		});
+		strictEqual((await call('alice', 'DELETE', retracted.id, undefined, { 'If-Match': '"1"' })).status, 200);
+		const withdrawnFlag = (await call('bob', 'GET', citer.id)).body.memory.needsReview;
+		strictEqual(withdrawnFlag.cause, 'withdrawn');
+		strictEqual(withdrawnFlag.sourceId, retracted.id);
+	});
+
+	test('a citation racing the supersede of its source is flagged, or created after the transition', async () => {
+		for (let round = 0; round < 4; round++) {
+			const source = await create('alice', `snipe-src-${round}`, {
+				title: 'snipe',
+				content: `snipe drumming display round ${round}`,
+				visibility: 'shared',
+			});
+			const [citer, replacement] = await Promise.all([
+				call('bob', 'PUT', memId(`snipe-cite-${round}`), {
+					title: 'snipe plan',
+					content: `listen for snipe drumming, embedded slowly ${round}`,
+					visibility: 'shared',
+					evidence: [{ kind: 'memory', ref: source.id }],
+				}),
+				call('alice', 'PUT', memId(`snipe-repl-${round}`), {
+					title: 'snipe',
+					content: `snipe drumming display moved, round ${round}, embedded slowly`,
+					visibility: 'shared',
+					supersedes: [source.id],
+				}),
+			]);
+			strictEqual(citer.status, 201, JSON.stringify(citer.body));
+			strictEqual(replacement.status, 201, JSON.stringify(replacement.body));
+			const cited = (await call('bob', 'GET', citer.body.id)).body.memory;
+			const superseded = (await call('alice', 'GET', source.id)).body.memory;
+			strictEqual(superseded.status, 'superseded');
+			ok(cited.needsReview !== null || cited.createdAt >= superseded.updatedAt, JSON.stringify({ cited, superseded }));
+		}
 	});
 
 	test('import (super_user): preserves client id, owner and createdAt, is idempotent, and reports conflicts', async () => {
