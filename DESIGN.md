@@ -160,12 +160,12 @@ lock (`Memory.lock`) on every row it will change, in sorted id order, before rea
 (`withLockPlan`, `src/lifecycle.ts`). An operation plans its whole lock set before the transaction:
 a `PUT` locks its id, its `supersedes`, the memories it cites, and the active citers of what it
 supersedes; a withdrawal locks its id, its `supersedes` (which never changes after create) and its
-active citers. A row discovered under the locks that the plan missed (a citer that appeared, a
-`supersedes` populated after the pre-read) aborts the attempt, and the next attempt locks the union in
-one sorted pass, so no operation waits for a lock while holding one out of order; after three
-attempts it answers 503 `unavailable`. The planning reads run only for a request that would pass the
-cheap checks (owner, `If-Match` present, explicit targets readable), so a refused request never locks a
-citation graph. An operation that supersedes or withdraws takes a 5-minute lease instead of Harper's
+active citers. Under the locks, before its first write, the operation re-reads every row it will
+change; one the plan missed (a citer that appeared, a `supersedes` populated after the pre-read)
+aborts the attempt, and the next attempt locks the union in one sorted pass, so no operation waits
+for a lock while holding one out of order; after three attempts it answers 503 `unavailable`. The
+planning reads run only for a request that would pass the cheap checks (owner, a matching `If-Match`,
+explicit targets and cited memories readable), so a refused request never locks a citation graph. An operation that supersedes or withdraws takes a 5-minute lease instead of Harper's
 30 s default, since it flags every citer inside the transaction. The plugin is the
 only writer of `Memory`, so on one node a read-check-write is serialized: of N concurrent revisions at
 the same `If-Match` revision exactly one succeeds. The locks are node-scoped, because a cluster-scoped
