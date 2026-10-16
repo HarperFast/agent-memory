@@ -28,7 +28,7 @@ import { isScopeLabel, MAX_SCOPES_PER_MEMORY, requirePrincipalId, type Principal
 import { getSettings } from './settings.ts';
 import { hasSinks, notifySinks } from './sinks.ts';
 
-export const IMPORT_MAX_ROWS = 100;
+const IMPORT_MAX_ROWS = 100;
 // A batch embeds every row inside its transaction; Harper's default 30 s lock lease could lapse before commit.
 const IMPORT_LOCK_LEASE_MS = 5 * 60_000;
 const IMPORT_SUPERSEDES_MAX_ITEMS = 100;

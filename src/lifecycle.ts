@@ -19,11 +19,12 @@ export interface EvidenceItem {
 	ref: string;
 	note?: string;
 }
-export const TAGS_MAX_ITEMS = 20;
-export const TAG_MAX_CHARS = 64;
+const TAGS_MAX_ITEMS = 20;
+const TAG_MAX_CHARS = 64;
 export const IDEMPOTENCY_KEY_MAX_CHARS = 200;
 export const WITHDRAW_REASON_MAX_CHARS = 500;
-export const SUPERSEDES_MAX_ITEMS = 10;
+const SUPERSEDES_MAX_ITEMS = 10;
+export const BOOTSTRAP_PINNED_LIMIT = 50;
 // Reserved for POST /Memory/import, so a native create can never land on an imported row's id.
 export const IMPORT_KEY_PREFIX = 'import:';
 const MEMORY_ID = /^[0-9a-f]{32}$/;
@@ -61,7 +62,7 @@ export function memoryPinTable(): any {
 	return (databases as any).memory.MemoryPin;
 }
 
-export function memoryPinIdFor(principalId: string, memoryId: string): string {
+function memoryPinIdFor(principalId: string, memoryId: string): string {
 	return `${principalId}:${memoryId}`;
 }
 
@@ -115,7 +116,6 @@ function boundedStrings(value: unknown, field: string, maxItems: number, maxChar
 	});
 }
 
-/** Evidence holds bounded typed references (memories, docs, PRs, commits, URLs, short text), not fetched payloads or credentials. */
 export function normalizeEvidence(value: unknown): EvidenceItem[] {
 	if (value === undefined || value === null) return [];
 	if (!Array.isArray(value)) throw badRequest('evidence must be an array of evidence items', 'invalid_evidence');
@@ -178,7 +178,7 @@ async function assertReadableEvidence(
 
 export function normalizeTags(value: unknown): string[] {
 	if (value === undefined || value === null) return [];
-	return [...new Set(boundedStrings(value, 'tags', TAGS_MAX_ITEMS, TAG_MAX_CHARS))];
+	return [...new Set(boundedStrings(value, 'tags', TAGS_MAX_ITEMS, TAG_MAX_CHARS))].sort();
 }
 
 export function normalizeIds(value: unknown, field: string, maxItems: number): string[] {
@@ -208,10 +208,7 @@ function requireExpectedRevision(value: unknown): number {
 	return value as number;
 }
 
-/**
- * Fingerprint of the original create request. Revisions never touch it, so a late retry of the first create
- * still matches and returns the current record instead of reading as a conflicting key reuse.
- */
+/** Stored from the original create; revisions leave it untouched so a late create retry still matches. */
 export function fingerprint(fields: unknown[]): string {
 	return createHash('sha256').update(JSON.stringify(fields)).digest('hex');
 }
@@ -300,7 +297,6 @@ export async function getMemory(id: string, principal: Principal, context?: obje
 export async function createMemory(input: unknown, principal: Principal, requestContext: object) {
 	const settings = getSettings();
 	const payload = rejectUnknownFields(input, CREATE_FIELDS, 'create');
-	// All validation runs before the transaction, so an invalid request never writes and then fails.
 	const idempotencyKey = boundedText(payload.idempotencyKey, 'idempotencyKey', IDEMPOTENCY_KEY_MAX_CHARS, true)!;
 	if (idempotencyKey.startsWith(IMPORT_KEY_PREFIX)) {
 		throw badRequest(`idempotencyKey must not start with "${IMPORT_KEY_PREFIX}"`, 'reserved_idempotency_key');
@@ -410,11 +406,12 @@ async function mutateMemory(
 	if (!isMemoryId(id)) throw notFound();
 	const Memory = memoryTable();
 	ensureEmbedder(Memory, settings);
+	// A withdrawal also changes the memories it superseded. `supersedes` never changes after create, so a
+	// pre-transaction read plans the lock set and lockRows is the first operation inside the transaction.
+	const planned = operation === 'withdraw' ? await Memory.get(id, requestContext) : undefined;
+	if (operation === 'withdraw' && !planned) throw notFound();
 
 	return inOwnTransaction(requestContext, async (txn) => {
-		// A withdrawal also changes the memories it superseded. `supersedes` never changes after create, so an
-		// unlocked read can plan the whole lock set, taken once in sorted order like every other operation.
-		const planned = operation === 'withdraw' ? await Memory.get(id, txn) : undefined;
 		await lockRows(Memory, [id, ...(planned?.supersedes ?? [])], txn);
 		const existing = await Memory.get(id, txn);
 		if (!existing) throw notFound();
@@ -538,12 +535,16 @@ async function reconcileSuperseded(Memory: any, withdrawn: any, context: object)
 export async function reviseMemory(id: unknown, input: unknown, principal: Principal, context: object) {
 	const settings = getSettings();
 	const payload = rejectUnknownFields(input, REVISE_FIELDS, 'revise');
+	if (payload.scopes === null) throw badRequest('scopes must be a non-empty array of scope labels', 'invalid_scopes');
+	if (payload.visibility === null) {
+		throw badRequest('visibility must be one of: private, shared', 'invalid_visibility');
+	}
 	const title = boundedText(payload.title, 'title', settings.titleChars, false);
 	const content = boundedText(payload.content, 'content', settings.contentChars, false);
 	const tags = payload.tags === undefined ? undefined : normalizeTags(payload.tags);
 	const evidence = payload.evidence === undefined ? undefined : normalizeEvidence(payload.evidence);
 	const evidenceMemoryIds = evidence === undefined ? undefined : deriveEvidenceMemoryIds(evidence);
-	const validUntil = optionalDate(payload.validUntil, 'validUntil');
+	const validUntil = payload.validUntil === null ? null : optionalDate(payload.validUntil, 'validUntil');
 	const scopesRequested = payload.scopes != null || payload.visibility != null;
 	const scopes = scopesRequested ? normalizeScopes(payload.scopes, payload.visibility, principal.id) : undefined;
 	const changes: Record<string, any> = {
@@ -602,6 +603,32 @@ export async function pinMemory(id: unknown, input: unknown = {}, principal: Pri
 		if (!record || !canRead(record, principal)) throw notFound();
 		const existing = await MemoryPin.get(pinId, txn);
 		if (!existing) {
+			const existingPins: Array<{ id: string; memoryId: string }> = [];
+			for await (const pin of MemoryPin.search(
+				{
+					conditions: [{ attribute: 'principalId', comparator: 'equals', value: principal.id }],
+					select: ['id', 'memoryId'],
+				},
+				txn,
+			)) {
+				existingPins.push(pin);
+			}
+			if (existingPins.length >= BOOTSTRAP_PINNED_LIMIT) {
+				const now = Date.now();
+				let activeCount = 0;
+				for (const pin of existingPins) {
+					const target = await Memory.get(pin.memoryId, txn);
+					const expired = target?.validUntil != null && new Date(target.validUntil).getTime() <= now;
+					if (!target || !canRead(target, principal) || target.status !== STATUS_ACTIVE || expired) {
+						await MemoryPin.delete(pin.id, txn);
+					} else {
+						activeCount++;
+					}
+				}
+				if (activeCount >= BOOTSTRAP_PINNED_LIMIT) {
+					throw memoryError(`Principal may pin at most ${BOOTSTRAP_PINNED_LIMIT} memories`, 409, 'pin_limit_exceeded');
+				}
+			}
 			await MemoryPin.put(
 				{
 					id: pinId,

@@ -28,6 +28,8 @@ Requires Harper 5.3.1 or later on RocksDB (the default).
 
    ```yaml
    # harperdb-config.yaml
+   authentication:
+     authorizeLocal: false # required when behind a local reverse proxy so loopback requests are not treated as super_user
    models:
      embedding:
        default: { backend: openai, model: text-embedding-3-small, apiKey: '${OPENAI_API_KEY}' }
@@ -61,15 +63,18 @@ Requires Harper 5.3.1 or later on RocksDB (the default).
    curl -u carol:pass localhost:9926/Memory/<id>                          # read
 
    # revise, change scopes, withdraw: each takes the revision you read
-   curl -u carol:pass -X POST localhost:9926/Memory/<id>/revise -d '{ "expectedRevision": 1, "content": "Stalls above 25%." }'
-   curl -u carol:pass -X POST localhost:9926/Memory/<id>/withdraw -d '{ "expectedRevision": 2, "reason": "obsolete" }'
+   curl -u carol:pass -X POST localhost:9926/Memory/<id>/revise -H 'Content-Type: application/json' \
+     -d '{ "expectedRevision": 1, "content": "Stalls above 25%." }'
+   curl -u carol:pass -X POST localhost:9926/Memory/<id>/withdraw -H 'Content-Type: application/json' \
+     -d '{ "expectedRevision": 2, "reason": "obsolete" }'
 
    # pin or unpin a readable memory for your own bootstrap
-   curl -u carol:pass -X POST localhost:9926/Memory/<id>/pin -d '{}'
-   curl -u carol:pass -X POST localhost:9926/Memory/<id>/unpin -d '{}'
+   curl -u carol:pass -X POST localhost:9926/Memory/<id>/pin -H 'Content-Type: application/json' -d '{}'
+   curl -u carol:pass -X POST localhost:9926/Memory/<id>/unpin -H 'Content-Type: application/json' -d '{}'
 
    # replace a memory: everyone who reads the old one through its labels must be able to read the replacement
-   curl -u carol:pass -X POST localhost:9926/Memory/ -d '{ "idempotencyKey": "run-43", "title": "Disk saturation",
+   curl -u carol:pass -X POST localhost:9926/Memory/ -H 'Content-Type: application/json' -d '{
+     "idempotencyKey": "run-43", "title": "Disk saturation",
      "content": "Stalls above 20% iowait on the new kernel.", "scopes": ["customer:acme"], "supersedes": ["<id>"] }'
    ```
 

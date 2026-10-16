@@ -117,14 +117,14 @@ Rules:
 
 ## Lifecycle
 
-| Operation   | Effect                                                                                                                                                     |
-| ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| create      | id = `sha256(memory:<owner>:<idempotencyKey>)[:32]`; a matching retry returns the existing row (200 vs 201), a different payload under the same key is 409 |
-| revise      | requires `expectedRevision`; bumps `revision`; re-embeds via `@embed` when `content` changes                                                               |
-| scopes      | owner changes scopes (rule 2)                                                                                                                              |
-| supersede   | create a memory with `supersedes: [ids]` (below)                                                                                                           |
-| withdraw    | `status = withdrawn`, row kept as a tombstone, never deleted                                                                                               |
-| pin / unpin | records or deletes the caller's `MemoryPin` row (`<principalId>:<memoryId>`); requires read access (same 404 when missing or unreadable)                   |
+| Operation   | Effect                                                                                                                                                                                                                                       |
+| ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| create      | id = `sha256(memory:<owner>:<idempotencyKey>)[:32]`; a matching retry returns the existing row (200 vs 201), a different payload under the same key is 409                                                                                   |
+| revise      | requires `expectedRevision`; bumps `revision`; re-embeds via `@embed` when `content` changes                                                                                                                                                 |
+| scopes      | owner changes scopes (rule 2)                                                                                                                                                                                                                |
+| supersede   | create a memory with `supersedes: [ids]` (below)                                                                                                                                                                                             |
+| withdraw    | `status = withdrawn`, row kept as a tombstone, never deleted                                                                                                                                                                                 |
+| pin / unpin | records or deletes the caller's `MemoryPin` row (`<principalId>:<memoryId>`, up to 50 active pins per principal; stale pins are pruned on pin, 409 `pin_limit_exceeded` past 50); requires read access (same 404 when missing or unreadable) |
 
 `status` is `active | superseded | withdrawn`. Search returns `active` by default. The `import:` key
 prefix is reserved for import, so a native create cannot land on an imported row.
@@ -137,7 +137,7 @@ ids are stored deduplicated on `evidenceMemoryIds`.
 Every lifecycle operation runs in a transaction of its own (not the request's, which would commit
 whatever was staged before an error the resource turns into a response) and takes Harper's record
 lock (`Memory.lock`) on every row it will change, in sorted id order, before reading it. A withdrawal
-plans its lock set from the memory's `supersedes`, which never changes after create. The plugin is the
+plans its lock set from a pre-transaction read of the memory's `supersedes`, which never changes after create. The plugin is the
 only writer of `Memory`, so on one node a read-check-write is serialized: of N concurrent revisions at
 the same expected revision exactly one succeeds. The locks are node-scoped, because a cluster-scoped
 lock on a replicated database fails closed unless the cluster has opted into replicated record locks
@@ -166,7 +166,8 @@ first-class operation, and the write path proposes it.
   replacement. Covering them would publish the replacement to a principal its author did not choose.
 - **A memory is superseded exactly while a non-withdrawn memory lists it in `supersedes`**; the newest
   such memory (by `createdAt`, then id) is its `supersededBy`. A superseder that is itself superseded
-  still counts — its replacement carries the chain forward. Withdrawing a superseder recomputes each
+  (or expired via `validUntil`) still counts — its replacement carries the chain forward, and callers
+  pass `includeSuperseded=true` or `includeExpired=true` to inspect the chain. Withdrawing a superseder recomputes each
   memory it superseded under that rule, returning it to `active` when no superseder is left; import
   derives status by the same rule. The lookup reads non-withdrawn superseders newest first through
   the indexed `supersedes` and `createdAt`, so it is exact however many there are.
@@ -222,8 +223,8 @@ true` puts `@embed`'s HNSW index on the native plane). Each lane passes `waitFor
   skips (and logs) vectors of another size, and rejects a query vector of another size. Search then
   serves the full-text lane alone and logs the rejection once per model. Switching dimensions needs a
   re-embedding migration, which v0 does not provide.
-- `GET /Memory/bootstrap?q=&budget=` — the caller's pinned memories (`MemoryPin` rows for `principal.id`
-  whose target memory is active, unexpired and readable by the caller), then the caller's recent
+- `GET /Memory/bootstrap?q=&budget=` — the caller's pinned memories (up to 50 `MemoryPin` rows for
+  `principal.id`, newest pin first, whose target memory is active, unexpired and readable by the caller), then the caller's recent
   memories, then memories relevant to `q`, deduplicated and packed into a character budget (title +
   content; default 8000). Expired memories (`validUntil <= now`) are excluded from all three sections.
   A memory that does not fit is skipped rather than ending the pack. Used at session start.

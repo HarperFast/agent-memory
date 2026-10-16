@@ -1,20 +1,26 @@
 import { logger, models } from 'harper';
 import { badRequest } from './errors.ts';
-import { memoryPinTable, memoryTable, STATUS_ACTIVE, STATUS_SUPERSEDED, toMemoryView } from './lifecycle.ts';
+import {
+	BOOTSTRAP_PINNED_LIMIT,
+	memoryPinTable,
+	memoryTable,
+	STATUS_ACTIVE,
+	STATUS_SUPERSEDED,
+	toMemoryView,
+} from './lifecycle.ts';
 import { anyOf, canRead, isScopeLabel, readableCondition, type Condition, type Principal } from './scopes.ts';
 import { getSettings } from './settings.ts';
 
-export const RRF_K = 60;
-export const SEARCH_MAX_LIMIT = 50;
+const RRF_K = 60;
+const SEARCH_MAX_LIMIT = 50;
 const SEARCH_DEFAULT_LIMIT = 10;
 const QUERY_MAX_CHARS = 1000;
 // Both derived indexes apply commits after the fact; waiting for coverage of writes committed before the
 // search keeps a memory searchable from the moment its create returns. An index that is already current
 // does not wait.
 const INDEX_WAIT_MS = 5000;
-export const BOOTSTRAP_DEFAULT_BUDGET = 8000;
+const BOOTSTRAP_DEFAULT_BUDGET = 8000;
 const BOOTSTRAP_MAX_BUDGET = 100_000;
-const BOOTSTRAP_PINNED_LIMIT = 50;
 const BOOTSTRAP_RECENT_LIMIT = 50;
 const BOOTSTRAP_RELEVANT_LIMIT = 20;
 
@@ -232,7 +238,9 @@ export async function bootstrapMemories(params: BootstrapParams, principal: Prin
 			MemoryPin.search(
 				{
 					conditions: [{ attribute: 'principalId', comparator: 'equals', value: principal.id }],
+					sort: { attribute: 'createdAt', descending: true },
 					select: ['memoryId'],
+					limit: BOOTSTRAP_PINNED_LIMIT,
 				},
 				context,
 			),

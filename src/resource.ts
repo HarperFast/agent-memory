@@ -97,7 +97,7 @@ export class MemoryResource extends Resource {
 	}
 }
 
-// @ts-expect-error — Resource's static verb types carry transactional()'s reliesOnPrototype brand
+// @ts-expect-error — see MemoryResource
 export class MemoryBootstrapResource extends Resource {
 	static path = '/Memory/bootstrap';
 	static hidden = true;
@@ -110,7 +110,7 @@ export class MemoryBootstrapResource extends Resource {
 	}
 }
 
-// @ts-expect-error — Resource's static verb types carry transactional()'s reliesOnPrototype brand
+// @ts-expect-error — see MemoryResource
 export class MemoryImportResource extends Resource {
 	static path = '/Memory/import';
 	static hidden = true;
@@ -123,7 +123,7 @@ export class MemoryImportResource extends Resource {
 	}
 }
 
-// @ts-expect-error — Resource's static verb types carry transactional()'s reliesOnPrototype brand
+// @ts-expect-error — see MemoryResource
 export class MemoryItemResource extends Resource {
 	static path = '/Memory/:id';
 	static hidden = true;
@@ -137,7 +137,7 @@ export class MemoryItemResource extends Resource {
 	}
 }
 
-// @ts-expect-error — Resource's static verb types carry transactional()'s reliesOnPrototype brand
+// @ts-expect-error — see MemoryResource
 export class MemoryActionResource extends Resource {
 	static path = '/Memory/:id/:action';
 	static hidden = true;

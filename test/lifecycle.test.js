@@ -2,6 +2,7 @@ import { beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { __test, databases, models } from 'harper';
 import {
+	BOOTSTRAP_PINNED_LIMIT,
 	createMemory,
 	EVIDENCE_MAX_ITEMS,
 	EVIDENCE_NOTE_MAX_CHARS,
@@ -152,10 +153,11 @@ describe('idempotent create', () => {
 		const writes = [];
 		const unregister = registerMemorySink({ write: (memory) => writes.push(memory.id) });
 		try {
-			const first = await createMemory(validInput(), alice, context);
-			const retry = await createMemory(validInput(), alice, context);
+			const first = await createMemory(validInput({ tags: ['b', 'a'] }), alice, context);
+			const retry = await createMemory(validInput({ tags: ['a', 'b'] }), alice, context);
 			assert.equal(retry.created, false);
 			assert.equal(retry.memory.id, first.memory.id);
+			assert.deepEqual(retry.memory.tags, ['a', 'b']);
 			assert.equal(memoryRows().size, 1);
 			assert.deepEqual(writes, [first.memory.id]);
 		} finally {
@@ -191,11 +193,16 @@ describe('idempotent create', () => {
 });
 
 describe('revise and scope changes', () => {
-	it('keeps scopes and ownership when omitted and bumps the revision once', async () => {
-		const { memory } = await createMemory(validInput({ visibility: 'shared' }), alice, context);
+	it('keeps scopes and ownership when omitted, allows clearing validUntil with null, and bumps the revision once', async () => {
+		const { memory } = await createMemory(
+			validInput({ visibility: 'shared', validUntil: '2099-01-01T00:00:00.000Z' }),
+			alice,
+			context,
+		);
+		assert.equal(memory.validUntil, '2099-01-01T00:00:00.000Z');
 		const revised = await reviseMemory(
 			memory.id,
-			{ content: 'The stall starts at 25%.', expectedRevision: 1 },
+			{ content: 'The stall starts at 25%.', validUntil: null, expectedRevision: 1 },
 			alice,
 			context,
 		);
@@ -203,6 +210,7 @@ describe('revise and scope changes', () => {
 		assert.deepEqual(revised.scopes, ['global']);
 		assert.equal(revised.ownerId, 'alice');
 		assert.equal(revised.title, memory.title);
+		assert.equal(revised.validUntil, null);
 		assert.equal(revised.author.principalId, 'alice');
 		assert.equal(revised.lastEditor.principalId, 'alice');
 		assert.notEqual(revised.updatedAt, memory.updatedAt);
@@ -244,7 +252,7 @@ describe('revise and scope changes', () => {
 		assert.equal(stored(memory.id).revision, 1);
 	});
 
-	it('refuses to blank out a title or content, and an empty revision', async () => {
+	it('refuses to blank out a title or content, null scopes/visibility, and an empty revision', async () => {
 		const { memory } = await createMemory(validInput(), alice, context);
 		for (const field of ['title', 'content']) {
 			await rejection(
@@ -253,6 +261,16 @@ describe('revise and scope changes', () => {
 				`${field}_required`,
 			);
 		}
+		await rejection(
+			reviseMemory(memory.id, { scopes: null, expectedRevision: 1 }, alice, context),
+			400,
+			'invalid_scopes',
+		);
+		await rejection(
+			reviseMemory(memory.id, { visibility: null, expectedRevision: 1 }, alice, context),
+			400,
+			'invalid_visibility',
+		);
 		await rejection(reviseMemory(memory.id, { expectedRevision: 1 }, alice, context), 400, 'empty_revision');
 		assert.equal(stored(memory.id).revision, 1);
 	});
@@ -749,5 +767,22 @@ describe('pin and unpin', () => {
 		const { memory } = await createMemory(validInput(), alice, context);
 		await rejection(pinMemory(memory.id, { pinned: true }, alice, context), 400, 'unsupported_fields');
 		await rejection(unpinMemory(memory.id, { pinned: false }, alice, context), 400, 'unsupported_fields');
+	});
+
+	it('caps active pins per principal at 50 and evicts stale pins before rejecting', async () => {
+		const memories = [];
+		for (let i = 0; i < BOOTSTRAP_PINNED_LIMIT; i++) {
+			const { memory } = await createMemory(validInput({ idempotencyKey: `pin-${i}` }), alice, context);
+			memories.push(memory);
+			await pinMemory(memory.id, {}, alice, context);
+		}
+		const extra = (await createMemory(validInput({ idempotencyKey: 'pin-extra' }), alice, context)).memory;
+		await rejection(pinMemory(extra.id, {}, alice, context), 409, 'pin_limit_exceeded');
+
+		await withdrawMemory(memories[0].id, { expectedRevision: 1 }, alice, context);
+		const pinnedExtra = await pinMemory(extra.id, {}, alice, context);
+		assert.equal(pinnedExtra.pinned, true);
+		assert.equal(pinRows().has(`alice:${memories[0].id}`), false);
+		assert.equal(pinRows().has(`alice:${extra.id}`), true);
 	});
 });

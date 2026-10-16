@@ -33,7 +33,7 @@ type MemoryPin @table(database: "memory") @sealed {
 	id: ID @primaryKey
 	principalId: String @indexed
 	memoryId: ID @indexed
-	createdAt: Date
+	createdAt: Date @indexed
 }
 
 # Keyed "role:<roleName>" or "user:<username>". Patterns are exact labels or "<namespace>:*".

@@ -92,8 +92,8 @@ describe('grant matching', () => {
 
 		const many = Array.from({ length: MAX_GRANT_PATTERNS + 5 }, (_, i) => `team:t${i}`);
 		const capped = compileMatcher(many, 'eve');
-		assert.equal(capped.matcher.exact.size, MAX_GRANT_PATTERNS);
-		assert.equal(capped.rejected.length, 6);
+		assert.equal(capped.matcher.exact.size, MAX_GRANT_PATTERNS + 1);
+		assert.equal(capped.rejected.length, 5);
 	});
 
 	it('reports rejected patterns to the caller of createPrincipal', () => {

@@ -11,7 +11,7 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const fixturesDir = join(repoRoot, 'integrationTests', 'fixtures');
 
 function run(command, args, cwd) {
-	const result = spawnSync(command, args, { cwd, stdio: 'inherit' });
+	const result = spawnSync(command, args, { cwd, stdio: 'inherit', timeout: 120_000 });
 	if (result.status !== 0) throw new Error(`${command} ${args.join(' ')} failed in ${cwd} (exit ${result.status})`);
 }
 
@@ -19,7 +19,11 @@ run('npm', ['run', 'build'], repoRoot);
 
 const packDir = mkdtempSync(join(tmpdir(), 'agent-memory-fixture-pack-'));
 try {
-	const pack = spawnSync('npm', ['pack', '--pack-destination', packDir, '--json'], { cwd: repoRoot, encoding: 'utf8' });
+	const pack = spawnSync('npm', ['pack', '--pack-destination', packDir, '--json'], {
+		cwd: repoRoot,
+		encoding: 'utf8',
+		timeout: 120_000,
+	});
 	if (pack.status !== 0) throw new Error(`npm pack failed (exit ${pack.status}): ${pack.stderr}`);
 	const tarball = join(packDir, JSON.parse(pack.stdout)[0].filename);
 	for (const entry of readdirSync(fixturesDir, { withFileTypes: true })) {

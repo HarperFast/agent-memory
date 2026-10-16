@@ -1,15 +1,15 @@
 import { badRequest, memoryError } from './errors.ts';
 
-export const GLOBAL_SCOPE = 'global';
-export const SCOPE_LABEL_MAX_CHARS = 128;
+const GLOBAL_SCOPE = 'global';
+const SCOPE_LABEL_MAX_CHARS = 128;
 // `user:` plus the id must fit a 128-character label.
-export const PRINCIPAL_ID_MAX_CHARS = 122;
+const PRINCIPAL_ID_MAX_CHARS = 122;
 export const MAX_SCOPES_PER_MEMORY = 16;
 // Bounds the OR group every search carries.
 export const MAX_GRANT_PATTERNS = 256;
 
-export const VISIBILITY_PRIVATE = 'private';
-export const VISIBILITY_SHARED = 'shared';
+const VISIBILITY_PRIVATE = 'private';
+const VISIBILITY_SHARED = 'shared';
 
 // `:` would let an id forge a different label (`user:a:b`), `*` would turn it into a wildcard.
 const PRINCIPAL_ID_FORBIDDEN = /[\s:*]/;
@@ -49,7 +49,7 @@ export interface ScopedRecord {
 
 const USER_PREFIX = 'user:';
 
-export function userScope(principalId: string): string {
+function userScope(principalId: string): string {
 	return `${USER_PREFIX}${principalId}`;
 }
 
@@ -88,7 +88,7 @@ export function compileMatcher(
 	const namespaces = new Set<string>();
 	const rejected: unknown[] = [];
 	for (const pattern of patterns ?? []) {
-		if (exact.size + namespaces.size >= MAX_GRANT_PATTERNS) {
+		if (exact.size + namespaces.size >= MAX_GRANT_PATTERNS + 1) {
 			rejected.push(pattern);
 			continue;
 		}

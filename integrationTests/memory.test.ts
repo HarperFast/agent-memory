@@ -296,12 +296,26 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 		strictEqual((await call('alice', 'GET', memory.id)).body.memory.revision, 2);
 	});
 
+	test('concurrent withdrawals at the same expected revision: exactly one succeeds, the rest get 409', async () => {
+		const memory = await create('alice', { idempotencyKey: 'withdraw-race', title: 'race', content: 'stork count 3' });
+		const results = await Promise.all(
+			Array.from({ length: 8 }, () =>
+				call('alice', 'POST', `${memory.id}/withdraw`, { expectedRevision: 1, reason: 'duplicate' }),
+			),
+		);
+		deepStrictEqual(
+			results.map((result) => result.status).sort(),
+			[200, 409, 409, 409, 409, 409, 409, 409],
+			JSON.stringify(results.map((result) => result.body)),
+		);
+		strictEqual((await call('alice', 'GET', memory.id)).body.memory.revision, 2);
+	});
+
 	test('a supersede racing the withdrawal of an earlier superseder leaves the newest one in charge', async () => {
 		const shared = (key: string, content: string, supersedes?: string[]) =>
 			create('alice', { idempotencyKey: key, title: 'egret', content, visibility: 'shared', supersedes });
 		const target = await shared('egret-t', 'egret roost one');
 		const first = await shared('egret-w', 'egret roost two', [target.id]);
-		// The new superseder embeds slowly, so it holds the target's lock while the withdrawal waits on it.
 		const [replacement, withdrawn] = await Promise.all([
 			call('alice', 'POST', '', {
 				idempotencyKey: 'egret-n',

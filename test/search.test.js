@@ -227,6 +227,9 @@ describe('bootstrapMemories', () => {
 		const large = await create(alice, 'big', { content: 'y'.repeat(500) });
 		const relevant = await create(root, 'tapir', { content: 'tapir facts', visibility: 'shared' });
 		const result = await bootstrapMemories({ q: 'tapir', budget: 120 }, alice, context);
+		const pinSearch = __test.searchLog.findLast((entry) => entry.table === 'MemoryPin');
+		assert.deepEqual(pinSearch.query.sort, { attribute: 'createdAt', descending: true });
+		assert.equal(pinSearch.query.limit, 50);
 		assert.deepEqual(
 			result.memories.map((memory) => [memory.id, memory.section]),
 			[
