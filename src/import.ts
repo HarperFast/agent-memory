@@ -30,6 +30,8 @@ import { getSettings } from './settings.ts';
 import { hasSinks, notifySinks } from './sinks.ts';
 
 const IMPORT_MAX_ROWS = 100;
+// Embedding providers cap the tokens in one request, so a batch's rows are embedded in calls of at most this size.
+const IMPORT_EMBED_CHARS = 100_000;
 const IMPORT_SUPERSEDES_MAX_ITEMS = 100;
 const ROW_FIELDS = [
 	'id',
@@ -132,17 +134,30 @@ export async function importMemories(input: unknown, principal: Principal, reque
 	// A stored row this batch supersedes flags its citers, and citing serializes with that, as on PUT.
 	const citedIds = rows.flatMap((row: { evidenceMemoryIds: string[] }) => row.evidenceMemoryIds);
 	const plannedDependents = await activeDependentIds(Memory, targetIds, requestContext);
-	// Rows are embedded before the transaction, in one call, so the batch holds its locks only while it writes.
+	// Rows are embedded before the transaction, so the batch holds its locks only while it writes.
 	const vectors = new Map<string, number[]>();
 	const embed = async (ids: Iterable<string>) => {
 		const wanted = new Set(ids);
 		const missing = rows.filter((row: { id: string }) => wanted.has(row.id) && !vectors.has(row.id));
-		if (missing.length === 0) return;
-		const embedded = await embedContents(
-			missing.map((row: { content: string }) => row.content),
-			settings.embeddingModel,
-		);
-		missing.forEach((row: { id: string }, index: number) => vectors.set(row.id, embedded[index]));
+		const flush = async (batch: Array<{ id: string; content: string }>) => {
+			const embedded = await embedContents(
+				batch.map((row) => row.content),
+				settings.embeddingModel,
+			);
+			batch.forEach((row, index) => vectors.set(row.id, embedded[index]));
+		};
+		let batch: Array<{ id: string; content: string }> = [];
+		let chars = 0;
+		for (const row of missing) {
+			if (batch.length > 0 && chars + row.content.length > IMPORT_EMBED_CHARS) {
+				await flush(batch);
+				batch = [];
+				chars = 0;
+			}
+			batch.push(row);
+			chars += row.content.length;
+		}
+		if (batch.length > 0) await flush(batch);
 	};
 	const stored = await Promise.all(rows.map((row: { id: string }) => Memory.get(row.id, requestContext)));
 	await embed(rows.filter((_row: unknown, index: number) => !stored[index]).map((row: { id: string }) => row.id));
@@ -177,8 +192,7 @@ export async function importMemories(input: unknown, principal: Principal, reque
 				const storedTargetIds = [...new Set(liveCreated.flatMap((row) => row.supersedes))].filter(
 					(targetId) => !createdIds.has(targetId),
 				);
-				// Every stored citer is locked before the first write.
-				const citers = new Map<string, string[]>();
+					const citers = new Map<string, string[]>();
 				for (const targetId of storedTargetIds) citers.set(targetId, await activeDependentIds(Memory, [targetId], txn));
 				locks.require([...citers.values()].flat());
 				const graphState = async (targetId: string) => {

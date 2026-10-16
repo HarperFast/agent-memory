@@ -371,6 +371,36 @@ describe('auto mode', () => {
 		assert.deepEqual(stored(idFor('new')), before);
 	});
 
+	it('plans again, judging and applying, when the transaction finds the pre-read overtaken', async () => {
+		const old = (await putMemory(idFor('old'), shared(), alice, context)).memory;
+		const cited = (await putMemory(idFor('cited'), shared('pelican nesting begins in march'), alice, context)).memory;
+		const Memory = databases.memory.Memory;
+		const get = Memory.get.bind(Memory);
+		let stale = true;
+		// The first pre-read misses the cited memory, as if it committed a moment later.
+		Memory.get = async (id, ctx) => {
+			if (stale && id === cited.id && !ctx?.transaction) {
+				stale = false;
+				return null;
+			}
+			return get(id, ctx);
+		};
+		let result;
+		try {
+			result = await putMemory(
+				idFor('new'),
+				shared(`${DISK} REPLACES`, { evidence: [{ kind: 'memory', ref: cited.id }] }),
+				bob,
+				context,
+			);
+		} finally {
+			Memory.get = get;
+		}
+		assert.equal(result.created, true);
+		assert.equal(result.candidates.find((candidate) => candidate.id === old.id).applied, true);
+		assert.equal(stored(old.id).status, 'superseded');
+	});
+
 	it('is advisory on a revise: supersedes cannot change after create', async () => {
 		const old = (await putMemory(idFor('old'), shared(), alice, context)).memory;
 		const mine = (await putMemory(idFor('mine'), shared('pelican nesting begins in march'), bob, context)).memory;

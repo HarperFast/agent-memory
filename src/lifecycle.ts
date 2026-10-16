@@ -477,80 +477,85 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 	ensureEmbedder(Memory);
 	const { supersession } = settings;
 
-	// Planning runs only for what looks like a permitted write, so a refused or no-op PUT never pays for an
-	// embedding, a judge call or a citer fan-out. The transaction re-checks everything under its locks.
-	const preExisting = await Memory.get(id, requestContext);
-	const cited = await Promise.all((parsedEvidenceMemoryIds ?? []).map((refId) => Memory.get(refId, requestContext)));
-	const citedReadable = cited.every((record) => record && canRead(record, principal));
-	const createScopes =
-		!preExisting && ifMatch === undefined && parsedTitle !== undefined && parsedContent !== undefined && citedReadable
-			? plannedScopes(payload, principal, principal.id)
-			: undefined;
-	const refused = (target: any) => supersedeRefusal(target, createScopes!, principal) !== undefined;
-	const explicitTargets = createScopes
-		? await Promise.all(supersedes.map((targetId) => Memory.get(targetId, requestContext)))
-		: [];
-	const planningCreate = createScopes !== undefined && !explicitTargets.some(refused);
-	const mayRevise =
-		preExisting &&
-		ifMatch !== undefined &&
-		matchesIfMatch(ifMatch, preExisting.revision) &&
-		(ifNoneMatch === undefined || !matchesIfNoneMatch(ifNoneMatch, preExisting.revision)) &&
-		payload.supersedes === undefined &&
-		(preExisting.ownerId === principal.id || principal.superUser) &&
-		preExisting.status === STATUS_ACTIVE &&
-		citedReadable &&
-		plannedScopes(payload, principal, preExisting.ownerId, preExisting.scopes) !== undefined;
-	const writesContent =
-		parsedContent !== undefined &&
-		(planningCreate ||
-			(mayRevise && (parsedContent !== preExisting.content || preExisting.embeddingModel !== settings.embeddingModel)));
-	let vector = writesContent ? await embedContent(parsedContent!, settings.embeddingModel) : undefined;
-	// supersedes never changes after create, so auto verdicts must exist before the create commits.
-	const proposals =
-		planningCreate && supersession.mode === 'auto'
-			? await judgeCandidates(
-					{ title: parsedTitle!, content: parsedContent! },
-					await findCandidates(
-						{
-							vector,
-							embeddingModel: settings.embeddingModel,
-							scopes: createScopes!,
-							excludeIds: [id, ...supersedes],
-						},
-						principal,
-						supersession.similarity,
-						requestContext,
-					),
-					supersession.judge,
-				)
-			: undefined;
-	const autoTargets = (proposals ?? []).filter(
-		(match) => match.verdict === 'supersedes' && !supersedes.includes(match.id),
-	);
-	let plannedDependents: string[] = [];
-	if (planningCreate && supersedes.length + autoTargets.length > 0) {
-		const transitioning = [...explicitTargets, ...autoTargets].filter(
-			(target) => target?.status === STATUS_ACTIVE && !refused(target),
+	// Planning runs again when the transaction finds the pre-read overtaken; `reembed` then guarantees a vector.
+	const plan = async (reembed: boolean) => {
+		// Planning runs only for what looks like a permitted write, so a refused or no-op PUT never pays for an
+		// embedding, a judge call or a citer fan-out. The transaction re-checks everything under its locks.
+		const preExisting = await Memory.get(id, requestContext);
+		const cited = await Promise.all((parsedEvidenceMemoryIds ?? []).map((refId) => Memory.get(refId, requestContext)));
+		const citedReadable = cited.every((record) => record && canRead(record, principal));
+		const createScopes =
+			!preExisting && ifMatch === undefined && parsedTitle !== undefined && parsedContent !== undefined && citedReadable
+				? plannedScopes(payload, principal, principal.id)
+				: undefined;
+		const refused = (target: any) => supersedeRefusal(target, createScopes!, principal) !== undefined;
+		const explicitTargets = createScopes
+			? await Promise.all(supersedes.map((targetId) => Memory.get(targetId, requestContext)))
+			: [];
+		const planningCreate = createScopes !== undefined && !explicitTargets.some(refused);
+		const mayRevise =
+			preExisting &&
+			ifMatch !== undefined &&
+			matchesIfMatch(ifMatch, preExisting.revision) &&
+			(ifNoneMatch === undefined || !matchesIfNoneMatch(ifNoneMatch, preExisting.revision)) &&
+			payload.supersedes === undefined &&
+			(preExisting.ownerId === principal.id || principal.superUser) &&
+			preExisting.status === STATUS_ACTIVE &&
+			citedReadable &&
+			plannedScopes(payload, principal, preExisting.ownerId, preExisting.scopes) !== undefined;
+		const writesContent =
+			parsedContent !== undefined &&
+			(planningCreate ||
+				(mayRevise &&
+					(parsedContent !== preExisting.content || preExisting.embeddingModel !== settings.embeddingModel)));
+		const vector = writesContent || reembed ? await embedContent(parsedContent!, settings.embeddingModel) : undefined;
+		// supersedes never changes after create, so auto verdicts must exist before the create commits.
+		const proposals =
+			planningCreate && supersession.mode === 'auto'
+				? await judgeCandidates(
+						{ title: parsedTitle!, content: parsedContent! },
+						await findCandidates(
+							{
+								vector,
+								embeddingModel: settings.embeddingModel,
+								scopes: createScopes!,
+								excludeIds: [id, ...supersedes],
+							},
+							principal,
+							supersession.similarity,
+							requestContext,
+						),
+						supersession.judge,
+					)
+				: undefined;
+		const autoTargets = (proposals ?? []).filter(
+			(match) => match.verdict === 'supersedes' && !supersedes.includes(match.id),
 		);
-		plannedDependents = await activeDependentIds(
-			Memory,
-			transitioning.map((target) => target.id),
-			requestContext,
-		);
-	}
+		let plannedDependents: string[] = [];
+		if (planningCreate && supersedes.length + autoTargets.length > 0) {
+			const transitioning = [...explicitTargets, ...autoTargets].filter(
+				(target) => target?.status === STATUS_ACTIVE && !refused(target),
+			);
+			plannedDependents = await activeDependentIds(
+				Memory,
+				transitioning.map((target) => target.id),
+				requestContext,
+			);
+		}
+		return { planningCreate, mayRevise, vector, proposals, autoTargets, plannedDependents };
+	};
 
-	const write = () =>
+	const write = (planned: Awaited<ReturnType<typeof plan>>) =>
 		withLockPlan(
 			requestContext,
 			[
 				id,
-				...(planningCreate ? supersedes : []),
-				...autoTargets.map((match) => match.id),
+				...(planned.planningCreate ? supersedes : []),
+				...planned.autoTargets.map((match) => match.id),
 				// Citing serializes with the cited memory's supersede or withdrawal, so a citer is either flagged by it
 				// or reads the source's new status. A write the cheap checks refuse locks none of them.
-				...(planningCreate || mayRevise ? (parsedEvidenceMemoryIds ?? []) : []),
-				...plannedDependents,
+				...(planned.planningCreate || planned.mayRevise ? (parsedEvidenceMemoryIds ?? []) : []),
+				...planned.plannedDependents,
 			],
 			async (txn, locks) => {
 				const existing = await Memory.get(id, txn);
@@ -631,12 +636,12 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 					const contentChanged =
 						parsedContent !== undefined &&
 						(parsedContent !== existing.content || existing.embeddingModel !== settings.embeddingModel);
-					if (contentChanged && vector === undefined) throw new VectorNeeded();
+					if (contentChanged && planned.vector === undefined) throw new VectorNeeded();
 					const changes: Record<string, any> = {
 						...(parsedTitle !== undefined && { title: parsedTitle }),
 						...(contentChanged && {
 							content: parsedContent,
-							embedding: vector,
+							embedding: planned.vector,
 							embeddingModel: settings.embeddingModel,
 						}),
 						...(parsedTags !== undefined && { tags: parsedTags }),
@@ -685,7 +690,7 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 					targets.push(target);
 				}
 				const applied: string[] = [];
-				for (const proposal of autoTargets) {
+				for (const proposal of planned.autoTargets) {
 					const target = await Memory.get(proposal.id, txn);
 					// The judge compared this revision; a later one is content it never saw.
 					if (target?.revision !== proposal.revision || supersedeRefusal(target, scopes, principal)) continue;
@@ -708,13 +713,13 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 				}
 				locks.require([...evidenceMemoryIds, ...supersedes, ...[...citers.values()].flat()]);
 
-				if (vector === undefined) throw new VectorNeeded();
+				if (planned.vector === undefined) throw new VectorNeeded();
 				await Memory.put(
 					{
 						id,
 						title,
 						content,
-						embedding: vector,
+						embedding: planned.vector,
 						tags,
 						scopes,
 						ownerId: principal.id,
@@ -767,17 +772,19 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 				}
 				return { created: true, textChanged: true, written: captureWritten(created), applied };
 			},
-			supersedes.length + autoTargets.length > 0 ? LONG_LOCK_LEASE_MS : undefined,
+			supersedes.length + planned.autoTargets.length > 0 ? LONG_LOCK_LEASE_MS : undefined,
 		);
+	let planned = await plan(false);
 	let outcome;
 	try {
-		outcome = await write();
+		outcome = await write(planned);
 	} catch (error) {
-		// A write the pre-read did not foresee (another writer changed the row) embeds outside the locks and retries.
+		// Another writer changed the row after the pre-read: plan again, embedding outside the locks, and retry.
 		if (!(error instanceof VectorNeeded)) throw error;
-		vector = await embedContent(parsedContent!, settings.embeddingModel);
-		outcome = await write();
+		planned = await plan(true);
+		outcome = await write(planned);
 	}
+	const { proposals } = planned;
 
 	const { memory } = outcome.written;
 	const [view] = await forReader([memory], principal, requestContext);

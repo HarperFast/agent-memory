@@ -64,6 +64,23 @@ describe('importMemories', () => {
 		assert.deepEqual(rows().get(idOf(2)).embedding, Array.from(Float32Array.from(__test.embedText('imported 2'))));
 	});
 
+	it('splits the embedding of a large batch into requests of bounded size', async () => {
+		applySettings(parseSettings({ limits: { contentChars: 60_000 } }));
+		const big = (n) => row(`big-${n}`, { content: `${n} `.repeat(30_000) });
+		const embed = models.embed;
+		const sizes = [];
+		models.embed = (input, options) => {
+			sizes.push(input.length);
+			return embed.call(models, input, options);
+		};
+		try {
+			await importMemories({ rows: [big(1), big(2), big(3), big(4)] }, root, context);
+		} finally {
+			models.embed = embed;
+		}
+		assert.deepEqual(sizes, [1, 1, 1, 1]);
+	});
+
 	it('preserves owner, createdAt, typed evidence and links, with status derived from the graph (successor first)', async () => {
 		const evidence = [
 			{ kind: 'memory', ref: idOf(1), note: 'imported predecessor' },
