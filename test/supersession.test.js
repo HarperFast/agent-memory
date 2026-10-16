@@ -170,6 +170,29 @@ describe('write-time candidates (suggest)', () => {
 		assert.equal(stored(idFor('new')).status, 'active');
 	});
 
+	it('searches nothing in mode off', async () => {
+		configure({ mode: 'off' });
+		await putMemory(idFor('near'), shared(), alice, context);
+		__test.searchLog.length = 0;
+		const { candidates } = await putMemory(idFor('new'), shared(), alice, context);
+		assert.deepEqual(candidates, []);
+		assert.ok(!__test.searchLog.some((entry) => entry.query.sort?.target));
+	});
+
+	it('does not lock memories a refused write cites', async () => {
+		const hidden = (await putMemory(idFor('hidden'), shared(DISK, { scopes: ['customer:x'] }), carol, context)).memory;
+		__test.lockLog.length = 0;
+		await rejection(
+			putMemory(idFor('cites'), shared(DISK, { evidence: [{ kind: 'memory', ref: hidden.id }] }), alice, context),
+			400,
+			'invalid_evidence',
+		);
+		assert.deepEqual(
+			__test.lockLog.map((entry) => entry.id),
+			[idFor('cites')],
+		);
+	});
+
 	it('judges each candidate after commit and acts on none of them', async () => {
 		configure({ judge: 'local:judge' });
 		const near = (await putMemory(idFor('near'), shared(), alice, context)).memory;
@@ -182,6 +205,11 @@ describe('write-time candidates (suggest)', () => {
 		};
 		const { candidates } = await putMemory(idFor('new'), shared(`${DISK} REPLACES`), bob, context);
 		assert.equal(committed, true, 'the judge runs after the write committed');
+		const judged = models.generateCalls.length;
+		const retry = await putMemory(idFor('new'), shared(`${DISK} REPLACES`), bob, context);
+		assert.equal(retry.created, false);
+		assert.equal(models.generateCalls.length, judged, 'a no-op retry is not judged again');
+		assert.equal(retry.candidates[0].verdict, undefined);
 		assert.deepEqual(candidates, [
 			{ id: near.id, title: 'Disk saturation', similarity: candidates[0].similarity, verdict: 'supersedes' },
 		]);
@@ -300,26 +328,26 @@ describe('auto mode', () => {
 		assert.equal(stored(old.id).status, 'active');
 	});
 
-	it('falls back to advisory candidates when it cannot embed before the create', async () => {
-		const old = (await putMemory(idFor('old'), shared(), alice, context)).memory;
+	it('embeds once for the row and the search, and fails a create whose embedding fails before any lock', async () => {
+		await putMemory(idFor('old'), shared(), alice, context);
+		models.calls.length = 0;
+		await putMemory(idFor('new'), shared(`${DISK} REPLACES`), bob, context);
+		assert.equal(models.calls.length, 1);
+
 		const embed = models.embed;
-		// Only the pre-transaction call fails; the table's own embedding of the row succeeds.
 		models.embed = async () => {
-			models.embed = embed;
 			throw Object.assign(new Error('embedding backend rate limited'), { upstreamStatus: 429 });
 		};
-		let result;
+		__test.lockLog.length = 0;
+		const generatesBefore = models.generateCalls.length;
 		try {
-			result = await putMemory(idFor('new'), shared(`${DISK} REPLACES`), bob, context);
+			await assert.rejects(putMemory(idFor('failed'), shared(`${DISK} REPLACES`), bob, context), /rate limited/);
 		} finally {
 			models.embed = embed;
 		}
-		assert.equal(result.created, true);
-		assert.deepEqual(
-			result.candidates.map(({ id, verdict, applied }) => ({ id, verdict, applied })),
-			[{ id: old.id, verdict: 'supersedes', applied: undefined }],
-		);
-		assert.equal(stored(old.id).status, 'active');
+		assert.deepEqual(__test.lockLog, []);
+		assert.equal(stored(idFor('failed')), undefined);
+		assert.equal(models.generateCalls.length, generatesBefore);
 	});
 
 	it('spends no embedding or judge call on a create the transaction will refuse', async () => {

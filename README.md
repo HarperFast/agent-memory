@@ -28,7 +28,7 @@ Requires Harper 5.3.1 or later on RocksDB (the default).
      # supersession:
      #   similarity: 0.82         # candidates returned on PUT at or above this cosine similarity
      #   judge: 'judge'           # a generative model that classifies each candidate
-     #   mode: 'suggest'          # or 'auto' (needs judge): apply "supersedes" verdicts on create
+     #   mode: 'suggest'          # 'off', or 'auto' (needs judge): apply "supersedes" verdicts on create
    ```
 
    ```yaml

@@ -1,4 +1,4 @@
-export type SupersessionMode = 'suggest' | 'auto';
+export type SupersessionMode = 'off' | 'suggest' | 'auto';
 
 export interface SupersessionSettings {
 	readonly mode: SupersessionMode;
@@ -45,8 +45,8 @@ function parseSupersession(options: unknown): SupersessionSettings {
 		throw new Error('@harperfast/agent-memory: supersession must be an object');
 	}
 	const { mode = 'suggest', similarity = 0.82, judge } = options as Record<string, unknown>;
-	if (mode !== 'suggest' && mode !== 'auto') {
-		throw new Error('@harperfast/agent-memory: supersession.mode must be suggest or auto');
+	if (mode !== 'off' && mode !== 'suggest' && mode !== 'auto') {
+		throw new Error('@harperfast/agent-memory: supersession.mode must be off, suggest or auto');
 	}
 	if (typeof similarity !== 'number' || !(similarity > 0 && similarity <= 1)) {
 		throw new Error('@harperfast/agent-memory: supersession.similarity must be a number in (0, 1]');

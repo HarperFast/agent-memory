@@ -1,6 +1,7 @@
 // In-memory stand-in for the parts of the `harper` package the plugin uses. Transactions snapshot every
 // table, commit only when the callback resolves, and run one at a time — the serialization the plugin gets
-// from Harper's record locks — so rollback and stale-revision behavior are observable. Records come back
+// from Harper's record locks — so rollback and stale-revision behavior are observable. Inside a transaction
+// `get` sees its own writes but `search` sees only committed rows, as Harper's indexes do. Records come back
 // frozen, as Harper's do, so a module that mutates a read record fails here too.
 
 let clock = 0;
@@ -93,7 +94,8 @@ class StubTable {
 	}
 	async get(id, context) {
 		const row = this.#rows(context).get(id);
-		return row ? Object.freeze(structuredClone(row)) : undefined;
+		// Harper answers a missing id with null.
+		return row ? Object.freeze(structuredClone(row)) : null;
 	}
 	async put(record, context) {
 		const rows = this.#rows(context);
@@ -116,13 +118,14 @@ class StubTable {
 	search(query, context) {
 		searchLog.push({ table: this.name, query });
 		const combine = query.operator === 'or' ? 'some' : 'every';
-		let results = [...this.#rows(context).values()].filter((record) =>
+		const committed = stores.get(this.name);
+		let results = [...committed.values()].filter((record) =>
 			(query.conditions ?? [])[combine]((condition) => matchesCondition(record, condition)),
 		);
 		const sort = query.sort;
 		if (sort?.target) {
 			// Harper checks the target against the index's dimensions, whatever the conditions select.
-			const stored = [...this.#rows(context).values()].find((record) => Array.isArray(record[sort.attribute]));
+			const stored = [...committed.values()].find((record) => Array.isArray(record[sort.attribute]));
 			if (stored && stored[sort.attribute].length !== sort.target.length) {
 				throw Object.assign(
 					new Error(

@@ -165,8 +165,13 @@ change; one the plan missed (a citer that appeared, a `supersedes` populated aft
 aborts the attempt, and the next attempt locks the union in one sorted pass, so no operation waits
 for a lock while holding one out of order; after three attempts it answers 503 `unavailable`. The
 planning reads run only for a request that would pass the cheap checks (owner, a matching `If-Match`,
-explicit targets and cited memories readable), so a refused request never locks a citation graph. An operation that supersedes or withdraws takes a 5-minute lease instead of Harper's
-30 s default, since it flags every citer inside the transaction. The plugin is the
+explicit targets and cited memories readable), so a refused request never locks a citation graph or a
+memory it cites. An operation that supersedes or withdraws takes a 5-minute lease instead of Harper's
+30 s default, since it flags every citer inside the transaction. No model call runs under a lock: a
+`PUT` that writes content embeds it before the transaction and hands the vector to the table's
+embedder (`setEmbedAttribute`, installed for every model), which falls back to embedding only for a
+write whose content it was not given (import, or a pre-read the transaction overtook). An embedding
+failure fails the write before it takes any lock. The plugin is the
 only writer of `Memory`, so on one node a read-check-write is serialized: of N concurrent revisions at
 the same `If-Match` revision exactly one succeeds. The locks are node-scoped, because a cluster-scoped
 lock on a replicated database fails closed unless the cluster has opted into replicated record locks
@@ -204,17 +209,19 @@ first-class operation, and the write path proposes it.
   `candidates: [{ id, title, similarity, verdict?, applied? }]`: up to 5 of the nearest active,
   unexpired memories the writer can read that share at least one scope label with the written memory,
   other than itself and what it supersedes, with cosine similarity at least `supersession.similarity`
-  (default 0.82). The search runs after the write commits, with the vector the write's own `@embed`
-  computed and only among rows of that row's `embeddingModel`, and does not wait for index coverage:
-  candidates are advice, so a memory committed within the index lag can be missed, and an unavailable
-  index yields `[]` rather than failing the write. It never holds a record lock.
+  (default 0.82). The search runs after the write commits, with the row's own vector and only among
+  rows of the row's `embeddingModel`, and does not wait for index coverage: candidates are advice, so a
+  memory committed within the index lag can be missed, and a failed search yields `[]` rather than
+  failing a committed write. It never holds a record lock. `supersession.mode: off` searches nothing and
+  returns `[]`.
 - **Judge**: with `supersession.judge` (a `models.generate` model name), each candidate is classified
   `supersedes | refines | unrelated`. Only a complete one-word answer counts (at most 16 output tokens,
   20 s per candidate); anything else, or a failed call, leaves the candidate without a `verdict`. The
-  judge runs outside every transaction.
+  judge runs outside every transaction, and not again for a `PUT` that changed nothing (an identical
+  retry gets its candidates unjudged).
 - **Auto** (`supersession.mode: auto`, requires `judge`; default `suggest`): on a create, the plugin
-  embeds the content, searches and judges before the transaction, because `supersedes` cannot change
-  after create. Each `supersedes` verdict joins the create's `supersedes` under the explicit rules and
+  searches with the write's vector and judges before the transaction, because `supersedes` cannot
+  change after create. Each `supersedes` verdict joins the create's `supersedes` under the explicit rules and
   only if the candidate's `revision` is still the one the judge compared; `applied: true | false` says
   whether it did. Applied links are also listed in `autoSupersedes`, so an identical retry compares only
   the links the author sent, and readers can tell the judge's links from the author's. Auto adds at most
@@ -234,7 +241,8 @@ one of its supports changing.
 - **One hop**: flagging D never flags the memories citing D, and neither does revising or confirming D
   or X; only another supersede or withdrawal flags.
 - **Only transitions flag**: superseding an already superseded memory, re-pointing `supersededBy`, and
-  restoring a memory to `active` flag nothing, and a restore does not clear flags it left behind.
+  restoring a memory to `active` flag nothing, and a restore does not clear flags it left behind. A
+  memory that a withdrawal restores, and that cites the withdrawn memory, is flagged like any citer.
 - **First cause stands**: a memory already flagged keeps its first flag, unrewritten, until its owner
   revises it or calls `confirm`. A review should therefore re-check all of its memory evidence.
 - **`confirmed` is an event, not a state**: it records the latest confirmation `{ by, at }` and survives
@@ -242,8 +250,9 @@ one of its supports changing.
 - **Not its replacement**: a memory that lists X in `supersedes` (on create, or in the same import) is
   never flagged for X.
 - **Citing serializes with the transition**: a create or revise locks the memories it cites, so a citer
-  either commits first and is flagged, or reads X's new status. Across nodes the same caveat as every
-  other lock-based rule applies.
+  either commits first and is flagged, or reads X's new status. The lock is held for milliseconds, since
+  the citer's embedding happens before its transaction. Across nodes the same caveat as every other
+  lock-based rule applies.
 - **Who sees a flag**: `needsReview` is shown to a reader who can read X through its labels or owns it,
   ignoring withdrawal (that reader could read X before, so learning it was withdrawn reveals no
   existence it did not know); everyone else sees `null`. `replacementId` is shown only to a reader who
@@ -344,9 +353,8 @@ Three levels, built in order (none in the v0 core):
 - `setPrincipalResolver(fn)` — see Identity.
 - Options (`config.yaml` under the plugin's key): `urlPath`, `embeddingModel` (default `default`),
   `limits.{contentChars, titleChars}` (default 20000 / 200), and `supersession.{mode, similarity,
-judge}` (default `suggest`, 0.82, none; `auto` without `judge` is rejected as malformed). The schema's `@embed` names `default`; for any other
-  `embeddingModel` the plugin installs a per-table embedder (`setEmbedAttribute`) that embeds with the
-  model recorded on the row. A changed option is checked for well-formedness before it applies; a
+judge}` (`off | suggest | auto`, default `suggest`; 0.82; none; `auto` without `judge` is rejected as
+  malformed). The plugin's table embedder embeds with the model recorded on the row. A changed option is checked for well-formedness before it applies; a
   malformed change is logged and the previous configuration keeps serving (model compatibility is not
   checked — see "One vector space"). Changing `urlPath` mounts the new path and
   removes the old one if the plugin still owns it.

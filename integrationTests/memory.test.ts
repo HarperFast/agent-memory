@@ -612,7 +612,7 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 	const shape = (candidates: any[]) =>
 		candidates.map(({ id, verdict, applied }) => ({ id, verdict, applied: applied ?? null }));
 
-	test('PUT returns readable, scope-sharing candidates with a judge verdict; auto mode supersedes on a judged create', async () => {
+	test('PUT returns readable, scope-sharing candidates with a judge verdict, and acts on none in suggest mode', async () => {
 		const original = await create('alice', 'grebe-v1', {
 			title: 'grebe count',
 			content: 'grebe colony counted at forty pairs on the north lake',
@@ -659,21 +659,9 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 		});
 		strictEqual(replacing.status, 201, JSON.stringify(replacing.body));
 		const decided = shape(replacing.body.candidates).find((candidate: any) => candidate.id === original.id);
-		deepStrictEqual(decided, { id: original.id, verdict: 'supersedes', applied: true });
-		const old = (await call('alice', 'GET', original.id)).body.memory;
-		strictEqual(old.status, 'superseded');
-		strictEqual(old.supersededBy, replacing.body.id);
-		const replacement = (await call('bob', 'GET', replacing.body.id)).body.memory;
-		ok(replacement.autoSupersedes.includes(original.id));
-		ok(replacement.supersedes.includes(original.id));
-
-		const retried = await call('bob', 'PUT', memId('grebe-v3'), {
-			title: 'grebe count',
-			content: 'grebe colony counted at forty pairs on the north lake REPLACES',
-			visibility: 'shared',
-		});
-		strictEqual(retried.status, 200, JSON.stringify(retried.body));
-		strictEqual(retried.body.revision, 1);
+		deepStrictEqual(decided, { id: original.id, verdict: 'supersedes', applied: null });
+		strictEqual((await call('alice', 'GET', original.id)).body.memory.status, 'active');
+		deepStrictEqual((await call('bob', 'GET', replacing.body.id)).body.memory.autoSupersedes, []);
 	});
 
 	test('superseding or withdrawing a memory flags its citers; search, bootstrap and confirm surface and clear the flag', async () => {

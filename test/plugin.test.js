@@ -95,6 +95,7 @@ describe('parseSettings', () => {
 				judge: 'local:judge',
 			},
 		);
+		assert.deepEqual(parseSettings({ supersession: { mode: 'off' } }).supersession, { mode: 'off', similarity: 0.82 });
 		assert.deepEqual(parseSettings({ supersession: { judge: 'local:judge' } }).supersession, {
 			mode: 'suggest',
 			similarity: 0.82,
@@ -103,7 +104,7 @@ describe('parseSettings', () => {
 		for (const supersession of [
 			'auto',
 			{ mode: 'auto' },
-			{ mode: 'off' },
+			{ mode: 'never' },
 			{ similarity: 0 },
 			{ similarity: 1.5 },
 			{ similarity: '0.9' },

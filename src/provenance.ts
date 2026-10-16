@@ -1,9 +1,9 @@
 import { type LockPlan, memoryTable, type MemoryView, STATUS_ACTIVE } from './lifecycle.ts';
-import { canRead, type Principal } from './scopes.ts';
+import { anyOf, canRead, type Principal } from './scopes.ts';
 
 export type ReviewCause = 'superseded' | 'withdrawn';
 
-export interface ReviewFlag {
+interface ReviewFlag {
 	since: string;
 	cause: ReviewCause;
 	sourceId: string;
@@ -60,7 +60,6 @@ export async function flagDependents(
 			!(dependent.evidenceMemoryIds ?? []).includes(source.id) ||
 			// A memory that supersedes the source replaced it rather than relying on it.
 			(dependent.supersedes ?? []).includes(source.id) ||
-			// The first cause stands until the owner revises or confirms.
 			dependent.needsReview
 		) {
 			continue;
@@ -86,26 +85,34 @@ export async function forReader<T extends MemoryView>(
 	context?: object,
 ): Promise<T[]> {
 	if (principal.superUser || !views.some((view) => view.needsReview)) return [...views];
-	const Memory = memoryTable();
-	const loaded = new Map<string, Promise<any>>();
-	const load = (id: string) => {
-		let record = loaded.get(id);
-		if (!record) loaded.set(id, (record = Memory.get(id, context)));
-		return record;
-	};
-	return Promise.all(
-		views.map(async (view) => {
-			const flag = view.needsReview as ReviewFlag | null;
-			if (!flag) return view;
-			const source = await load(flag.sourceId);
-			if (!source || !canRead({ ownerId: source.ownerId, scopes: source.scopes }, principal)) {
-				return { ...view, needsReview: null };
-			}
-			if (!flag.replacementId) return view;
-			const replacement = await load(flag.replacementId);
-			if (replacement && canRead(replacement, principal)) return view;
-			const { replacementId: _unreadable, ...visible } = flag;
-			return { ...view, needsReview: visible };
-		}),
-	);
+	const ids = new Set<string>();
+	for (const view of views) {
+		const flag = view.needsReview as ReviewFlag | null;
+		if (!flag) continue;
+		ids.add(flag.sourceId);
+		if (flag.replacementId) ids.add(flag.replacementId);
+	}
+	const access = new Map<string, any>();
+	for await (const record of memoryTable().search(
+		{
+			conditions: [anyOf([...ids].map((id) => ({ attribute: 'id', comparator: 'equals', value: id })))],
+			select: ['id', 'ownerId', 'scopes', 'status'],
+		},
+		context,
+	)) {
+		access.set(record.id, record);
+	}
+	return views.map((view) => {
+		const flag = view.needsReview as ReviewFlag | null;
+		if (!flag) return view;
+		const source = access.get(flag.sourceId);
+		if (!source || !canRead({ ownerId: source.ownerId, scopes: source.scopes }, principal)) {
+			return { ...view, needsReview: null };
+		}
+		if (!flag.replacementId) return view;
+		const replacement = access.get(flag.replacementId);
+		if (replacement && canRead(replacement, principal)) return view;
+		const { replacementId: _unreadable, ...visible } = flag;
+		return { ...view, needsReview: visible };
+	});
 }

@@ -598,16 +598,44 @@ describe('sinks', () => {
 });
 
 describe('embedding model', () => {
-	it('installs the override only for a non-default model, and tags each row with the model that embedded it', async () => {
-		await putMemory(DEFAULT_ID, validInput(), alice, context);
-		assert.equal(__test.setEmbedCalls.length, 0);
-
+	it('embeds each write once, before taking any lock, with the configured model, and tags the row with it', async () => {
 		applySettings(parseSettings({ embeddingModel: 'local:small' }));
-		const { memory } = await putMemory(idFor('k2'), validInput(), alice, context);
-		assert.deepEqual(__test.setEmbedCalls, [{ table: 'Memory', attribute: 'embedding' }]);
+		const embed = models.embed;
+		let locksAtEmbed;
+		models.embed = (input, options) => {
+			locksAtEmbed = __test.lockLog.length;
+			return embed.call(models, input, options);
+		};
+		__test.lockLog.length = 0;
+		let memory;
+		try {
+			({ memory } = await putMemory(idFor('k2'), validInput(), alice, context));
+		} finally {
+			models.embed = embed;
+		}
+		assert.equal(locksAtEmbed, 0);
+		assert.deepEqual(
+			models.calls.map((call) => call.options),
+			[{ model: 'local:small', inputType: 'document' }],
+		);
 		assert.equal(stored(memory.id).embeddingModel, 'local:small');
-		assert.deepEqual(models.calls.at(-1).options, { model: 'local:small', inputType: 'document', signal: undefined });
-		assert.ok(databases.memory.Memory.embedders.embedding);
+		assert.deepEqual(
+			stored(memory.id).embedding,
+			Array.from(Float32Array.from(__test.embedText(validInput().content))),
+		);
+		assert.deepEqual(__test.setEmbedCalls, [{ table: 'Memory', attribute: 'embedding' }]);
+	});
+
+	it('keeps the stored vector when a revise leaves the content and model unchanged', async () => {
+		const { memory } = await putMemory(DEFAULT_ID, validInput(), alice, context);
+		models.calls.length = 0;
+		await putMemory(memory.id, { content: validInput().content, tags: ['ops'] }, alice, ifMatch(1));
+		assert.equal(models.calls.length, 0);
+		assert.deepEqual(stored(memory.id).tags, ['ops']);
+		applySettings(parseSettings({ embeddingModel: 'local:small' }));
+		await putMemory(memory.id, { content: validInput().content, tags: ['ops', 'disk'] }, alice, ifMatch(2));
+		assert.equal(models.calls.length, 1, 'a new model re-embeds even unchanged content');
+		assert.equal(stored(memory.id).embeddingModel, 'local:small');
 	});
 });
 

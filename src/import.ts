@@ -124,7 +124,7 @@ export async function importMemories(input: unknown, principal: Principal, reque
 	});
 	const settings = getSettings();
 	const Memory = memoryTable();
-	ensureEmbedder(Memory, settings);
+	ensureEmbedder(Memory);
 
 	const targetIds = new Set<string>(rows.flatMap((row: { supersedes: string[] }) => row.supersedes));
 	// A stored row this batch supersedes flags its citers, and citing serializes with that, as on PUT.

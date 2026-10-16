@@ -9,8 +9,8 @@ import {
 	unexpiredCondition,
 } from './search.ts';
 
-export const CANDIDATE_LIMIT = 5;
-export const VERDICTS = ['supersedes', 'refines', 'unrelated'] as const;
+const CANDIDATE_LIMIT = 5;
+const VERDICTS = ['supersedes', 'refines', 'unrelated'] as const;
 export type Verdict = (typeof VERDICTS)[number];
 const JUDGE_CONTENT_CHARS = 4000;
 const JUDGE_TIMEOUT_MS = 20_000;
@@ -30,6 +30,9 @@ export interface CandidateMatch {
 	title: string | null;
 	content: string;
 	revision: number;
+	ownerId: string;
+	scopes: string[];
+	status: string;
 	similarity: number;
 	verdict?: Verdict;
 }
@@ -51,7 +54,7 @@ export interface CandidateQuery {
 
 const lastWarning = new Map<string, number>();
 
-export function warnRateLimited(key: string, message: string, error?: unknown): void {
+function warnRateLimited(key: string, message: string, error?: unknown): void {
 	const now = Date.now();
 	if (now - (lastWarning.get(key) ?? 0) < WARN_INTERVAL_MS) return;
 	lastWarning.set(key, now);
@@ -61,7 +64,7 @@ export function warnRateLimited(key: string, message: string, error?: unknown): 
 /**
  * The nearest active, unexpired memories the writer can read that share a scope label with the written one.
  * Advisory: it does not wait for index coverage, so a memory committed within the index lag can be missed, and
- * an unavailable index yields no candidates rather than failing the write.
+ * a failed search yields no candidates rather than failing the write.
  */
 export async function findCandidates(
 	query: CandidateQuery,
@@ -96,8 +99,8 @@ export async function findCandidates(
 			reportVectorLaneRejected(query.embeddingModel, error);
 			return [];
 		}
-		if (error?.statusCode !== 503) throw error;
-		warnRateLimited('candidates', 'supersession candidates unavailable; returning none', error);
+		// Advice only: a failed search must not turn a committed write into an error.
+		warnRateLimited('candidates', 'supersession candidate search failed; returning none', error);
 		return [];
 	}
 	return assertReadable(hits, principal)
@@ -108,6 +111,9 @@ export async function findCandidates(
 			title: hit.title ?? null,
 			content: hit.content,
 			revision: hit.revision,
+			ownerId: hit.ownerId,
+			scopes: [...(hit.scopes ?? [])],
+			status: hit.status,
 			similarity: 1 - hit.$distance,
 		}))
 		.filter((match) => match.similarity >= threshold);
