@@ -403,9 +403,13 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 			idempotencyKey: 'pinned',
 			title: 'pin',
 			content: 'always load this',
-			pinned: true,
 			visibility: 'shared',
 		});
+		const pinResponse = await call('bob', 'POST', `${pinned.id}/pin`, {});
+		strictEqual(pinResponse.status, 200, JSON.stringify(pinResponse.body));
+		strictEqual(pinResponse.body.pinned, true);
+		strictEqual(pinResponse.body.memoryId, pinned.id);
+
 		const recent = await create('bob', { idempotencyKey: 'recent', title: 'recent', content: 'bob was here' });
 		const large = await create('bob', { idempotencyKey: 'large', title: 'large', content: 'x'.repeat(500) });
 		const relevant = await create('alice', {
@@ -422,6 +426,110 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 		ok(!sections.some(([id]: any) => id === large.id), 'a memory larger than the remaining budget is skipped');
 		ok(response.body.memories.every((memory: any) => !('score' in memory)));
 		ok(response.body.used <= 200);
+
+		const aliceBootstrap = await call('alice', 'GET', 'bootstrap?q=puffin&budget=200');
+		strictEqual(aliceBootstrap.status, 200);
+		ok(
+			!aliceBootstrap.body.memories.some((memory: any) => memory.id === pinned.id && memory.section === 'pinned'),
+			'pins are per-reader and never leak to another principal',
+		);
+
+		const alicePrivate = await create('alice', {
+			idempotencyKey: 'alice-private-pin-target',
+			title: 'secret',
+			content: 'alice private note',
+		});
+		const pinUnreadable = await call('bob', 'POST', `${alicePrivate.id}/pin`, {});
+		const pinMissing = await call('bob', 'POST', `${'0'.repeat(32)}/pin`, {});
+		strictEqual(pinUnreadable.status, 404);
+		deepStrictEqual(pinUnreadable.body, pinMissing.body);
+
+		const unpinResponse = await call('bob', 'POST', `${pinned.id}/unpin`, {});
+		strictEqual(unpinResponse.status, 200);
+		strictEqual(unpinResponse.body.pinned, false);
+	});
+
+	test('validUntil excludes expired memories by default and includeExpired=true restores them', async () => {
+		const expired = await create('alice', {
+			idempotencyKey: 'expired-gannet',
+			title: 'expired gannet',
+			content: 'gannet rookery expired note',
+			validUntil: '2020-01-01T00:00:00.000Z',
+		});
+		const active = await create('alice', {
+			idempotencyKey: 'active-gannet',
+			title: 'active gannet',
+			content: 'gannet rookery active note',
+			validUntil: '2099-01-01T00:00:00.000Z',
+		});
+		await call('alice', 'POST', `${expired.id}/pin`, {});
+
+		const defaultSearch = await call('alice', 'GET', '?q=gannet');
+		strictEqual(defaultSearch.status, 200);
+		const defaultIds = defaultSearch.body.memories.map((m: any) => m.id);
+		ok(defaultIds.includes(active.id));
+		ok(!defaultIds.includes(expired.id));
+
+		const expiredSearch = await call('alice', 'GET', '?q=gannet&includeExpired=true');
+		strictEqual(expiredSearch.status, 200);
+		const expiredIds = expiredSearch.body.memories.map((m: any) => m.id);
+		ok(expiredIds.includes(active.id));
+		ok(expiredIds.includes(expired.id));
+
+		const bootstrap = await call('alice', 'GET', 'bootstrap?q=gannet');
+		strictEqual(bootstrap.status, 200);
+		ok(!bootstrap.body.memories.some((m: any) => m.id === expired.id));
+	});
+
+	test('typed evidence validates readable memory refs and indexes evidenceMemoryIds', async () => {
+		const source = await create('alice', {
+			idempotencyKey: 'evidence-source',
+			title: 'source',
+			content: 'curlew migration observation',
+			visibility: 'shared',
+		});
+		const bobPrivate = await create('bob', {
+			idempotencyKey: 'evidence-bob-private',
+			title: 'bob secret',
+			content: 'bob private observation',
+		});
+
+		const unreadableRef = await call('alice', 'POST', '', {
+			idempotencyKey: 'evidence-unreadable',
+			title: 'unreadable',
+			content: 'citing unreadable memory',
+			evidence: [{ kind: 'memory', ref: bobPrivate.id }],
+		});
+		const missingRef = await call('alice', 'POST', '', {
+			idempotencyKey: 'evidence-missing',
+			title: 'missing',
+			content: 'citing missing memory',
+			evidence: [{ kind: 'memory', ref: '0'.repeat(32) }],
+		});
+		strictEqual(unreadableRef.status, 400);
+		strictEqual(unreadableRef.body.code, 'invalid_evidence');
+		deepStrictEqual(unreadableRef.body, missingRef.body);
+
+		const citing = await create('alice', {
+			idempotencyKey: 'evidence-citing',
+			title: 'citing',
+			content: 'curlew synthesis',
+			evidence: [
+				{ kind: 'memory', ref: source.id, note: 'primary observation' },
+				{ kind: 'pr', ref: 'https://github.com/HarperFast/agent-memory/pull/5' },
+			],
+		});
+		deepStrictEqual(citing.evidenceMemoryIds, [source.id]);
+
+		const indexed = await operation({
+			operation: 'search_by_value',
+			database: 'memory',
+			table: 'Memory',
+			search_attribute: 'evidenceMemoryIds',
+			search_value: source.id,
+			get_attributes: ['id'],
+		});
+		deepStrictEqual(indexed, [{ id: citing.id }]);
 	});
 
 	test('import (super_user): preserves owner and createdAt, is idempotent, and reports conflicts', async () => {

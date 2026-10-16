@@ -43,15 +43,16 @@ database).
   (`@fullText`, which requires `@table(audit: true)`), so a memory is searchable at commit, with no
   indexing queue of the plugin's own.
 - `ScopeGrant` — read/write scope patterns held by a Harper role or user.
+- `MemoryPin` — a principal's pinned memories (`<principalId>:<memoryId>`), loaded first at session bootstrap.
 - `MemoryWatch` — a principal's time-bounded interest in specific memories (live updates).
 
 See `schema/memory.graphql`. The table is not `@export`ed: every read and write goes through the
 `Memory` resource so the rules below have exactly one enforcement point.
 
 Server-owned fields: `ownerId`, `status`, `revision`, `author`, `lastEditor`, `supersededBy`,
-`createdAt`, `createFingerprint`, `embeddingModel`. `createdAt` is set by the lifecycle rather than
-`@createdTime`, because Harper's `@createdTime` overwrites a supplied value on insert and import must
-preserve it. `updatedAt` stays `@updatedTime`.
+`evidenceMemoryIds`, `createdAt`, `createFingerprint`, `embeddingModel`. `createdAt` is set by the
+lifecycle rather than `@createdTime`, because Harper's `@createdTime` overwrites a supplied value on
+insert and import must preserve it. `updatedAt` stays `@updatedTime`.
 
 ## Identity
 
@@ -99,7 +100,7 @@ Rules:
 
 1. **Read**: `scopes ∩ readable(caller) ≠ ∅`, or the caller is the owner. A withdrawn memory is
    readable by its owner and `super_user` only. A memory the caller cannot read is indistinguishable
-   from one that does not exist (same 404 body), on reads, writes and `supersedes` references alike.
+   from one that does not exist (same 404 body), on reads, writes, pins and `supersedes` references alike.
 2. **Write scopes**: creating or revising with scopes `S` requires every label of `S` to be writable by
    the caller — the resulting scopes, so revising a memory that stays `global` needs `global` write.
    `visibility: "private" | "shared"` is shorthand for `[user:<owner>]` / `[global]`; explicit
@@ -116,16 +117,22 @@ Rules:
 
 ## Lifecycle
 
-| Operation | Effect                                                                                                                                                     |
-| --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| create    | id = `sha256(memory:<owner>:<idempotencyKey>)[:32]`; a matching retry returns the existing row (200 vs 201), a different payload under the same key is 409 |
-| revise    | requires `expectedRevision`; bumps `revision`; re-embeds via `@embed` when `content` changes                                                               |
-| scopes    | owner changes scopes (rule 2)                                                                                                                              |
-| supersede | create a memory with `supersedes: [ids]` (below)                                                                                                           |
-| withdraw  | `status = withdrawn`, row kept as a tombstone, never deleted                                                                                               |
+| Operation   | Effect                                                                                                                                                     |
+| ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| create      | id = `sha256(memory:<owner>:<idempotencyKey>)[:32]`; a matching retry returns the existing row (200 vs 201), a different payload under the same key is 409 |
+| revise      | requires `expectedRevision`; bumps `revision`; re-embeds via `@embed` when `content` changes                                                               |
+| scopes      | owner changes scopes (rule 2)                                                                                                                              |
+| supersede   | create a memory with `supersedes: [ids]` (below)                                                                                                           |
+| withdraw    | `status = withdrawn`, row kept as a tombstone, never deleted                                                                                               |
+| pin / unpin | records or deletes the caller's `MemoryPin` row (`<principalId>:<memoryId>`); requires read access (same 404 when missing or unreadable)                   |
 
 `status` is `active | superseded | withdrawn`. Search returns `active` by default. The `import:` key
 prefix is reserved for import, so a native create cannot land on an imported row.
+
+Each `evidence` item is `{ kind, ref, note? }` with `kind` one of `memory | doc | pr | commit | url | text`.
+`memory`-kind items must name a valid memory id readable by the writer on `create` and `revise`
+(missing, unreadable or malformed → 400 `invalid_evidence`, so citing cannot probe existence), and their
+ids are stored deduplicated on `evidenceMemoryIds`.
 
 Every lifecycle operation runs in a transaction of its own (not the request's, which would commit
 whatever was staged before an error the resource turns into a response) and takes Harper's record
@@ -174,14 +181,15 @@ similarity }]` on the response. With `supersession.judge` configured, `models.ge
 
 Mounted at `urlPath` (default `Memory`); hidden from MCP and OpenAPI auto-export until the MCP task.
 
-| Route                                                   | Purpose                                 |
-| ------------------------------------------------------- | --------------------------------------- |
-| `POST /Memory/`                                         | create                                  |
-| `GET /Memory/<id>`                                      | read                                    |
-| `GET /Memory/?q=&tag=&scope=&limit=&includeSuperseded=` | search (no `q`: newest first)           |
-| `GET /Memory/bootstrap?q=&budget=`                      | session-start context                   |
-| `POST /Memory/<id>/revise` · `/scopes` · `/withdraw`    | mutations, each with `expectedRevision` |
-| `POST /Memory/import`                                   | bulk import (`super_user`)              |
+| Route                                                                   | Purpose                                     |
+| ----------------------------------------------------------------------- | ------------------------------------------- |
+| `POST /Memory/`                                                         | create                                      |
+| `GET /Memory/<id>`                                                      | read                                        |
+| `GET /Memory/?q=&tag=&scope=&limit=&includeSuperseded=&includeExpired=` | search (no `q`: newest first)               |
+| `GET /Memory/bootstrap?q=&budget=`                                      | session-start context                       |
+| `POST /Memory/<id>/revise` · `/scopes` · `/withdraw`                    | mutations, each with `expectedRevision`     |
+| `POST /Memory/<id>/pin` · `/unpin`                                      | per-reader pin / unpin (empty or `{}` body) |
+| `POST /Memory/import`                                                   | bulk import (`super_user`)                  |
 
 Errors are `{ error, code }` (plus `index` for an import row). Only errors the plugin creates carry
 their own message; anything else is a 500 `internal_error`. Harper's retryable failures — 503 (an index
@@ -192,12 +200,13 @@ holds its locks with a 5-minute lease, since a batch embeds every row inside its
 
 ## Search and bootstrap
 
-- `GET /Memory/?q=&tag=&scope=&limit=&includeSuperseded=` — hybrid: HNSW over `embedding` (query
-  embedded with the same model) and the `@fullText` index, fused with reciprocal rank fusion (k = 60,
-  `2 × limit` per lane). Both lanes carry the status and readable-scope conditions. `scope=` narrows
-  within the readable set; it never widens it. Results include `supersededBy` when
-  `includeSuperseded` is set; withdrawn memories never appear. The vector lane has no distance
-  cutoff, so it contributes the nearest readable memories whatever their distance.
+- `GET /Memory/?q=&tag=&scope=&limit=&includeSuperseded=&includeExpired=` — hybrid: HNSW over
+  `embedding` (query embedded with the same model) and the `@fullText` index, fused with reciprocal
+  rank fusion (k = 60, `2 × limit` per lane). Both lanes carry the status, expiry (`validUntil` null
+  or `> now` unless `includeExpired=true`) and readable-scope conditions. `scope=` narrows within the
+  readable set; it never widens it. Results include `supersededBy` when `includeSuperseded` is set;
+  withdrawn memories never appear. The vector lane has no distance cutoff, so it contributes the
+  nearest readable memories whatever their distance.
 - **Searchable at commit**: both indexes are Harper derived indexes maintained after commit (`audit:
 true` puts `@embed`'s HNSW index on the native plane). Each lane passes `waitForIndexMilliseconds`,
   so a search covers every write committed before it began; an index that is already current does not
@@ -213,9 +222,11 @@ true` puts `@embed`'s HNSW index on the native plane). Each lane passes `waitFor
   skips (and logs) vectors of another size, and rejects a query vector of another size. Search then
   serves the full-text lane alone and logs the rejection once per model. Switching dimensions needs a
   re-embedding migration, which v0 does not provide.
-- `GET /Memory/bootstrap?q=&budget=` — pinned memories, then the caller's recent memories, then
-  memories relevant to `q`, deduplicated and packed into a character budget (title + content; default
-  8000). A memory that does not fit is skipped rather than ending the pack. Used at session start.
+- `GET /Memory/bootstrap?q=&budget=` — the caller's pinned memories (`MemoryPin` rows for `principal.id`
+  whose target memory is active, unexpired and readable by the caller), then the caller's recent
+  memories, then memories relevant to `q`, deduplicated and packed into a character budget (title +
+  content; default 8000). Expired memories (`validUntil <= now`) are excluded from all three sections.
+  A memory that does not fit is skipped rather than ending the pack. Used at session start.
 - Ranking may add recency decay and retrieval/citation counts later; decay is a ranking function only,
   never deletion.
 
@@ -261,8 +272,8 @@ Three levels, built in order (none in the v0 core):
 
 `POST /Memory/import` (`super_user` only) takes `{ rows: [...] }`, at most 100 rows, in one transaction:
 every row commits or none does. Each row: `{ id?, idempotencyKey: "import:<source>:<sourceId>",
-ownerId, title?, content, tags?, durability?, pinned?, evidence?, scopes, status, supersedes?,
-supersededBy?, createdAt?, validUntil?, withdrawnAt?, withdrawnReason? }`.
+ownerId, title?, content, tags?, evidence?, scopes, status, supersedes?, supersededBy?, createdAt?,
+validUntil?, withdrawnAt?, withdrawnReason? }`.
 
 - The id is the create formula `sha256(memory:<ownerId>:<idempotencyKey>)[:32]`. A client may send it
   (so rows can reference each other); the server recomputes it and rejects a mismatch.

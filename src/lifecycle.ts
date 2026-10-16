@@ -11,10 +11,17 @@ export const STATUS_WITHDRAWN = 'withdrawn';
 
 export const EVIDENCE_MAX_ITEMS = 20;
 export const EVIDENCE_REF_MAX_CHARS = 500;
+export const EVIDENCE_NOTE_MAX_CHARS = 500;
+export const EVIDENCE_KINDS = ['memory', 'doc', 'pr', 'commit', 'url', 'text'] as const;
+export type EvidenceKind = (typeof EVIDENCE_KINDS)[number];
+export interface EvidenceItem {
+	kind: EvidenceKind;
+	ref: string;
+	note?: string;
+}
 export const TAGS_MAX_ITEMS = 20;
 export const TAG_MAX_CHARS = 64;
 export const IDEMPOTENCY_KEY_MAX_CHARS = 200;
-export const DURABILITY_MAX_CHARS = 32;
 export const WITHDRAW_REASON_MAX_CHARS = 500;
 export const SUPERSEDES_MAX_ITEMS = 10;
 // Reserved for POST /Memory/import, so a native create can never land on an imported row's id.
@@ -28,8 +35,6 @@ const CREATE_FIELDS = [
 	'scopes',
 	'visibility',
 	'evidence',
-	'pinned',
-	'durability',
 	'validUntil',
 	'idempotencyKey',
 	'supersedes',
@@ -41,16 +46,23 @@ const REVISE_FIELDS = [
 	'scopes',
 	'visibility',
 	'evidence',
-	'pinned',
-	'durability',
 	'validUntil',
 	'expectedRevision',
 ];
 const SCOPE_FIELDS = ['scopes', 'visibility', 'expectedRevision'];
 const WITHDRAW_FIELDS = ['expectedRevision', 'reason'];
+const EVIDENCE_FIELDS = ['kind', 'ref', 'note'];
 
 export function memoryTable(): any {
 	return (databases as any).memory.Memory;
+}
+
+export function memoryPinTable(): any {
+	return (databases as any).memory.MemoryPin;
+}
+
+export function memoryPinIdFor(principalId: string, memoryId: string): string {
+	return `${principalId}:${memoryId}`;
 }
 
 /** Idempotent create: a retry is a primary-key hit, not a secondary-index lookup two retries could both miss. */
@@ -103,10 +115,65 @@ function boundedStrings(value: unknown, field: string, maxItems: number, maxChar
 	});
 }
 
-/** Evidence holds bounded references (ticket ids, URLs, run ids), not fetched payloads or credentials. */
-export function normalizeEvidence(value: unknown): string[] {
+/** Evidence holds bounded typed references (memories, docs, PRs, commits, URLs, short text), not fetched payloads or credentials. */
+export function normalizeEvidence(value: unknown): EvidenceItem[] {
 	if (value === undefined || value === null) return [];
-	return boundedStrings(value, 'evidence', EVIDENCE_MAX_ITEMS, EVIDENCE_REF_MAX_CHARS);
+	if (!Array.isArray(value)) throw badRequest('evidence must be an array of evidence items', 'invalid_evidence');
+	if (value.length > EVIDENCE_MAX_ITEMS) {
+		throw badRequest(`evidence exceeds ${EVIDENCE_MAX_ITEMS} items`, 'evidence_too_many');
+	}
+	return value.map((raw, i) => {
+		if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+			throw badRequest(`evidence[${i}] must be an object`, 'invalid_evidence');
+		}
+		const item = raw as Record<string, unknown>;
+		if (Object.keys(item).some((key) => !EVIDENCE_FIELDS.includes(key))) {
+			throw badRequest(`evidence[${i}] has unsupported field(s)`, 'invalid_evidence');
+		}
+		if (typeof item.kind !== 'string' || !(EVIDENCE_KINDS as readonly string[]).includes(item.kind)) {
+			throw badRequest(`evidence[${i}].kind must be one of: ${EVIDENCE_KINDS.join(', ')}`, 'invalid_evidence');
+		}
+		if (typeof item.ref !== 'string' || item.ref.trim().length === 0) {
+			throw badRequest(`evidence[${i}].ref must be a non-empty string`, 'invalid_evidence');
+		}
+		const ref = item.ref.trim();
+		if (ref.length > EVIDENCE_REF_MAX_CHARS) {
+			throw badRequest(`evidence[${i}].ref exceeds ${EVIDENCE_REF_MAX_CHARS} characters`, 'evidence_too_long');
+		}
+		if (item.kind === 'memory' && !isMemoryId(ref)) {
+			throw badRequest('Referenced evidence memory is not readable', 'invalid_evidence');
+		}
+		if (item.note === undefined || item.note === null) {
+			return { kind: item.kind as EvidenceKind, ref };
+		}
+		if (typeof item.note !== 'string' || item.note.trim().length === 0) {
+			throw badRequest(`evidence[${i}].note must be a non-empty string`, 'invalid_evidence');
+		}
+		const note = item.note.trim();
+		if (note.length > EVIDENCE_NOTE_MAX_CHARS) {
+			throw badRequest(`evidence[${i}].note exceeds ${EVIDENCE_NOTE_MAX_CHARS} characters`, 'evidence_too_long');
+		}
+		return { kind: item.kind as EvidenceKind, ref, note };
+	});
+}
+
+export function deriveEvidenceMemoryIds(evidence: readonly EvidenceItem[]): string[] {
+	return [...new Set(evidence.filter((item) => item.kind === 'memory').map((item) => item.ref))];
+}
+
+async function assertReadableEvidence(
+	Memory: any,
+	evidenceMemoryIds: readonly string[],
+	principal: Principal,
+	context: object,
+): Promise<void> {
+	for (const refId of evidenceMemoryIds) {
+		const target = await Memory.get(refId, context);
+		// Same 400 whether missing or unreadable, so citing cannot probe another principal's memory.
+		if (!target || !canRead(target, principal)) {
+			throw badRequest('Referenced evidence memory is not readable', 'invalid_evidence');
+		}
+	}
 }
 
 export function normalizeTags(value: unknown): string[] {
@@ -132,12 +199,6 @@ export function optionalDate(value: unknown, field: string): Date | undefined {
 	const date = typeof value === 'string' || value instanceof Date ? new Date(value) : undefined;
 	if (!date || Number.isNaN(date.getTime())) throw badRequest(`${field} must be an ISO date`, `invalid_${field}`);
 	return date;
-}
-
-function optionalBoolean(value: unknown, field: string): boolean | undefined {
-	if (value === undefined || value === null) return undefined;
-	if (typeof value !== 'boolean') throw badRequest(`${field} must be a boolean`, `invalid_${field}`);
-	return value;
 }
 
 function requireExpectedRevision(value: unknown): number {
@@ -173,9 +234,8 @@ export function toMemoryView(record: any): MemoryView {
 		ownerId: record.ownerId,
 		status: record.status,
 		revision: record.revision,
-		pinned: record.pinned === true,
-		durability: record.durability ?? null,
-		evidence: [...(record.evidence ?? [])],
+		evidence: (record.evidence ?? []).map((item: any) => ({ ...item })),
+		evidenceMemoryIds: [...(record.evidenceMemoryIds ?? [])],
 		supersedes: [...(record.supersedes ?? [])],
 		supersededBy: record.supersededBy ?? null,
 		author: record.author ?? null,
@@ -251,23 +311,12 @@ export async function createMemory(input: unknown, principal: Principal, request
 	const content = boundedText(payload.content, 'content', settings.contentChars, true);
 	const tags = normalizeTags(payload.tags);
 	const evidence = normalizeEvidence(payload.evidence);
-	const pinned = optionalBoolean(payload.pinned, 'pinned') ?? false;
-	const durability = boundedText(payload.durability, 'durability', DURABILITY_MAX_CHARS, false);
+	const evidenceMemoryIds = deriveEvidenceMemoryIds(evidence);
 	const validUntil = optionalDate(payload.validUntil, 'validUntil');
 	const supersedes = normalizeIds(payload.supersedes, 'supersedes', SUPERSEDES_MAX_ITEMS);
 
 	const id = memoryIdFor(principal.id, idempotencyKey);
-	const createFingerprint = fingerprint([
-		title,
-		content,
-		tags,
-		scopes,
-		evidence,
-		pinned,
-		durability ?? null,
-		iso(validUntil),
-		supersedes,
-	]);
+	const createFingerprint = fingerprint([title, content, tags, scopes, evidence, iso(validUntil), supersedes]);
 	const Memory = memoryTable();
 	ensureEmbedder(Memory, settings);
 
@@ -285,6 +334,7 @@ export async function createMemory(input: unknown, principal: Principal, request
 			return { memory: toMemoryView(existing), created: false };
 		}
 
+		await assertReadableEvidence(Memory, evidenceMemoryIds, principal, txn);
 		const now = new Date();
 		const targets = [];
 		for (const targetId of supersedes) {
@@ -316,9 +366,8 @@ export async function createMemory(input: unknown, principal: Principal, request
 				ownerId: principal.id,
 				status: STATUS_ACTIVE,
 				revision: 1,
-				pinned,
-				durability: durability ?? null,
 				evidence,
+				evidenceMemoryIds,
 				supersedes,
 				supersededBy: null,
 				idempotencyKey,
@@ -395,6 +444,7 @@ async function mutateMemory(
 			const scopes = changes.scopes ?? existing.scopes;
 			assertWritable(scopes, principal);
 			if (changes.scopes) await assertStillCoversSuperseded(Memory, existing, changes.scopes, txn);
+			if (changes.evidenceMemoryIds) await assertReadableEvidence(Memory, changes.evidenceMemoryIds, principal, txn);
 			if (changes.content !== undefined) changes.embeddingModel = settings.embeddingModel;
 		}
 		changes.revision = existing.revision + 1;
@@ -492,8 +542,7 @@ export async function reviseMemory(id: unknown, input: unknown, principal: Princ
 	const content = boundedText(payload.content, 'content', settings.contentChars, false);
 	const tags = payload.tags === undefined ? undefined : normalizeTags(payload.tags);
 	const evidence = payload.evidence === undefined ? undefined : normalizeEvidence(payload.evidence);
-	const pinned = optionalBoolean(payload.pinned, 'pinned');
-	const durability = boundedText(payload.durability, 'durability', DURABILITY_MAX_CHARS, false);
+	const evidenceMemoryIds = evidence === undefined ? undefined : deriveEvidenceMemoryIds(evidence);
 	const validUntil = optionalDate(payload.validUntil, 'validUntil');
 	const scopesRequested = payload.scopes != null || payload.visibility != null;
 	const scopes = scopesRequested ? normalizeScopes(payload.scopes, payload.visibility, principal.id) : undefined;
@@ -501,9 +550,7 @@ export async function reviseMemory(id: unknown, input: unknown, principal: Princ
 		...(title !== undefined && { title }),
 		...(content !== undefined && { content }),
 		...(tags !== undefined && { tags }),
-		...(evidence !== undefined && { evidence }),
-		...(pinned !== undefined && { pinned }),
-		...(durability !== undefined && { durability }),
+		...(evidence !== undefined && { evidence, evidenceMemoryIds }),
 		...(validUntil !== undefined && { validUntil }),
 	};
 	if (Object.keys(changes).length === 0 && !scopes) {
@@ -540,4 +587,46 @@ export async function withdrawMemory(id: unknown, input: unknown, principal: Pri
 		withdrawnAt: new Date(),
 		withdrawnReason: reason ?? null,
 	}));
+}
+
+export async function pinMemory(id: unknown, input: unknown = {}, principal: Principal, requestContext: object = {}) {
+	rejectUnknownFields(input, [], 'pin');
+	if (!isMemoryId(id)) throw notFound();
+	const Memory = memoryTable();
+	const MemoryPin = memoryPinTable();
+	const pinId = memoryPinIdFor(principal.id, id);
+	return inOwnTransaction(requestContext, async (txn) => {
+		await lockRows(MemoryPin, [pinId], txn);
+		const record = await Memory.get(id, txn);
+		// Same 404 whether missing or unreadable, so pinning cannot probe another principal's memory.
+		if (!record || !canRead(record, principal)) throw notFound();
+		const existing = await MemoryPin.get(pinId, txn);
+		if (!existing) {
+			await MemoryPin.put(
+				{
+					id: pinId,
+					principalId: principal.id,
+					memoryId: id,
+					createdAt: new Date(),
+				},
+				txn,
+			);
+		}
+		return { pinned: true, memoryId: id, memory: toMemoryView(record) };
+	});
+}
+
+export async function unpinMemory(id: unknown, input: unknown = {}, principal: Principal, requestContext: object = {}) {
+	rejectUnknownFields(input, [], 'unpin');
+	if (!isMemoryId(id)) throw notFound();
+	const Memory = memoryTable();
+	const MemoryPin = memoryPinTable();
+	const pinId = memoryPinIdFor(principal.id, id);
+	return inOwnTransaction(requestContext, async (txn) => {
+		await lockRows(MemoryPin, [pinId], txn);
+		const record = await Memory.get(id, txn);
+		if (!record || !canRead(record, principal)) throw notFound();
+		await MemoryPin.delete(pinId, txn);
+		return { pinned: false, memoryId: id, memory: toMemoryView(record) };
+	});
 }

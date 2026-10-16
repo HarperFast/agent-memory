@@ -44,11 +44,15 @@ describe('importMemories', () => {
 		await rejection(importMemories({ rows: [row(1)] }, alice, context), 403, 'import_forbidden', undefined);
 	});
 
-	it('preserves owner, createdAt and links, with status derived from the graph (successor first)', async () => {
+	it('preserves owner, createdAt, typed evidence and links, with status derived from the graph (successor first)', async () => {
+		const evidence = [
+			{ kind: 'memory', ref: idOf(1), note: 'imported predecessor' },
+			{ kind: 'doc', ref: 'flair:note:2' },
+		];
 		const result = await importMemories(
 			{
 				rows: [
-					row(2, { id: idOf(2), supersedes: [idOf(1)], scopes: ['global'] }),
+					row(2, { id: idOf(2), supersedes: [idOf(1)], scopes: ['global'], evidence }),
 					row(1, { status: 'superseded', supersededBy: idOf(2) }),
 				],
 			},
@@ -59,6 +63,9 @@ describe('importMemories', () => {
 			{ id: idOf(2), result: 'created' },
 			{ id: idOf(1), result: 'created' },
 		]);
+		const successor = await getMemory(idOf(2), alice);
+		assert.deepEqual(successor.evidence, evidence);
+		assert.deepEqual(successor.evidenceMemoryIds, [idOf(1)]);
 		const old = await getMemory(idOf(1), alice);
 		assert.equal(old.status, 'superseded');
 		assert.equal(old.supersededBy, idOf(2));
@@ -132,6 +139,11 @@ describe('importMemories', () => {
 			[row(2, { supersedes: [idOf(2)] }), 'self_supersede'],
 			[row(2, { withdrawnReason: 'x' }), 'invalid_status'],
 			[row(2, { visibility: 'shared' }), 'unsupported_fields'],
+			[row(2, { durability: 'permanent' }), 'unsupported_fields'],
+			[row(2, { pinned: true }), 'unsupported_fields'],
+			[row(2, { evidenceMemoryIds: [idOf(1)] }), 'unsupported_fields'],
+			[row(2, { evidence: ['legacy-string'] }), 'invalid_evidence'],
+			[row(2, { evidence: [{ kind: 'memory', ref: 'not-a-hex-id' }] }), 'invalid_evidence'],
 			[row(2, { content: undefined }), 'content_required'],
 		];
 		for (const [bad, code] of cases) {

@@ -2,12 +2,12 @@ import { badRequest, isCallerSafe, memoryError } from './errors.ts';
 import {
 	boundedText,
 	compareNewest,
+	deriveEvidenceMemoryIds,
 	ensureEmbedder,
 	fingerprint,
 	inOwnTransaction,
 	IDEMPOTENCY_KEY_MAX_CHARS,
 	IMPORT_KEY_PREFIX,
-	DURABILITY_MAX_CHARS,
 	isMemoryId,
 	lockRows,
 	memoryIdFor,
@@ -39,8 +39,6 @@ const ROW_FIELDS = [
 	'title',
 	'content',
 	'tags',
-	'durability',
-	'pinned',
 	'evidence',
 	'scopes',
 	'status',
@@ -93,8 +91,7 @@ function validateRow(input: unknown, index: number) {
 		if ((withdrawnAt || withdrawnReason) && status !== STATUS_WITHDRAWN) {
 			throw badRequest('withdrawnAt and withdrawnReason require status withdrawn', 'invalid_status');
 		}
-		const pinned = row.pinned ?? false;
-		if (typeof pinned !== 'boolean') throw badRequest('pinned must be a boolean', 'invalid_pinned');
+		const evidence = normalizeEvidence(row.evidence);
 		const record = {
 			id,
 			idempotencyKey,
@@ -102,9 +99,8 @@ function validateRow(input: unknown, index: number) {
 			title: boundedText(row.title, 'title', settings.titleChars, false) ?? null,
 			content: boundedText(row.content, 'content', settings.contentChars, true)!,
 			tags: normalizeTags(row.tags),
-			durability: boundedText(row.durability, 'durability', DURABILITY_MAX_CHARS, false) ?? null,
-			pinned,
-			evidence: normalizeEvidence(row.evidence),
+			evidence,
+			evidenceMemoryIds: deriveEvidenceMemoryIds(evidence),
 			scopes,
 			status,
 			supersedes,
@@ -120,8 +116,6 @@ function validateRow(input: unknown, index: number) {
 			record.title,
 			record.content,
 			record.tags,
-			record.durability,
-			record.pinned,
 			record.evidence,
 			record.scopes,
 			record.status,

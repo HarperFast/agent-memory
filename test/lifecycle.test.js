@@ -4,10 +4,14 @@ import { __test, databases, models } from 'harper';
 import {
 	createMemory,
 	EVIDENCE_MAX_ITEMS,
+	EVIDENCE_NOTE_MAX_CHARS,
+	EVIDENCE_REF_MAX_CHARS,
 	getMemory,
 	memoryIdFor,
+	pinMemory,
 	reviseMemory,
 	setMemoryScopes,
+	unpinMemory,
 	withdrawMemory,
 } from '../dist/lifecycle.js';
 import { createPrincipal } from '../dist/scopes.js';
@@ -24,11 +28,12 @@ const context = { user: { username: 'request-user' } };
 
 const stored = (id) => __test.stores.get('Memory').get(id);
 const memoryRows = () => __test.stores.get('Memory');
+const pinRows = () => __test.stores.get('MemoryPin');
 
 const validInput = (overrides = {}) => ({
 	title: 'Disk saturation on the east cluster',
 	content: 'The database stalls when iowait passes 30%.',
-	evidence: ['https://tickets.example/4821'],
+	evidence: [{ kind: 'url', ref: 'https://tickets.example/4821' }],
 	idempotencyKey: 'run-2026-09-28-a',
 	...overrides,
 });
@@ -59,10 +64,13 @@ describe('create', () => {
 		assert.equal(memory.revision, 1);
 		assert.equal(memory.author.principalId, 'alice');
 		assert.equal(memory.lastEditor, null);
-		assert.deepEqual(memory.evidence, ['https://tickets.example/4821']);
+		assert.deepEqual(memory.evidence, [{ kind: 'url', ref: 'https://tickets.example/4821' }]);
+		assert.deepEqual(memory.evidenceMemoryIds, []);
 		assert.equal(stored(memory.id).embeddingModel, 'default');
 		assert.ok(Array.isArray(stored(memory.id).embedding), 'the @embed hook ran on create');
 		assert.equal(memory.embedding, undefined, 'the view never carries the vector');
+		assert.equal(memory.durability, undefined);
+		assert.equal(memory.pinned, undefined);
 	});
 
 	it('derives the id from the principal and idempotency key, not the payload', async () => {
@@ -71,8 +79,20 @@ describe('create', () => {
 		assert.notEqual(memoryIdFor('bob', 'run-2026-09-28-a'), memory.id);
 	});
 
-	it('rejects server-derived fields in the payload without echoing their names', async () => {
-		for (const field of ['ownerId', 'revision', 'status', 'author', 'id', 'createdAt', 'embedding', 'supersededBy']) {
+	it('rejects server-derived and removed fields in the payload without echoing their names', async () => {
+		for (const field of [
+			'ownerId',
+			'revision',
+			'status',
+			'author',
+			'id',
+			'createdAt',
+			'embedding',
+			'supersededBy',
+			'evidenceMemoryIds',
+			'durability',
+			'pinned',
+		]) {
 			await rejection(createMemory(validInput({ [field]: 'x' }), alice, context), 400, 'unsupported_fields');
 		}
 		const error = await rejection(
@@ -100,7 +120,7 @@ describe('create', () => {
 	it('bounds title, content and evidence before writing', async () => {
 		await rejection(createMemory(validInput({ title: 'x'.repeat(201) }), alice, context), 400, 'title_too_long');
 		await rejection(createMemory(validInput({ content: 'x'.repeat(20_001) }), alice, context), 400, 'content_too_long');
-		const evidence = Array.from({ length: EVIDENCE_MAX_ITEMS + 1 }, (_, i) => `ref-${i}`);
+		const evidence = Array.from({ length: EVIDENCE_MAX_ITEMS + 1 }, (_, i) => ({ kind: 'doc', ref: `ref-${i}` }));
 		await rejection(createMemory(validInput({ evidence }), alice, context), 400, 'evidence_too_many');
 		assert.equal(memoryRows().size, 0);
 	});
@@ -546,5 +566,188 @@ describe('embedding model', () => {
 		assert.equal(stored(memory.id).embeddingModel, 'local:small');
 		assert.deepEqual(models.calls.at(-1).options, { model: 'local:small', inputType: 'document', signal: undefined });
 		assert.ok(databases.memory.Memory.embedders.embedding);
+	});
+});
+
+describe('typed evidence and evidenceMemoryIds', () => {
+	it('accepts all six kinds, derives deduplicated evidenceMemoryIds, and indexes them for search', async () => {
+		const m1 = (await createMemory(validInput({ idempotencyKey: 'm1', visibility: 'shared' }), alice, context)).memory;
+		const m2 = (await createMemory(validInput({ idempotencyKey: 'm2' }), bob, context)).memory;
+		const evidence = [
+			{ kind: 'memory', ref: m1.id, note: 'shared antecedent' },
+			{ kind: 'memory', ref: m1.id, note: 'duplicate ref still deduplicates evidenceMemoryIds' },
+			{ kind: 'memory', ref: m2.id },
+			{ kind: 'doc', ref: 'DESIGN.md#lifecycle' },
+			{ kind: 'pr', ref: 'HarperFast/agent-memory#5' },
+			{ kind: 'commit', ref: '3113fb8' },
+			{ kind: 'url', ref: 'https://tickets.example/4821' },
+			{ kind: 'text', ref: 'observed in staging logs', note: 'east-1' },
+		];
+		const { memory } = await createMemory(validInput({ idempotencyKey: 'citing', evidence }), bob, context);
+		assert.deepEqual(memory.evidence, evidence);
+		assert.deepEqual(memory.evidenceMemoryIds, [m1.id, m2.id]);
+		assert.deepEqual(stored(memory.id).evidenceMemoryIds, [m1.id, m2.id]);
+
+		const dependents = [];
+		for await (const row of databases.memory.Memory.search({
+			conditions: [{ attribute: 'evidenceMemoryIds', comparator: 'equals', value: m1.id }],
+		})) {
+			dependents.push(row.id);
+		}
+		assert.deepEqual(dependents, [memory.id]);
+
+		const revised = await reviseMemory(
+			memory.id,
+			{ evidence: [{ kind: 'memory', ref: m2.id }], expectedRevision: 1 },
+			bob,
+			context,
+		);
+		assert.deepEqual(revised.evidenceMemoryIds, [m2.id]);
+		assert.deepEqual(stored(memory.id).evidenceMemoryIds, [m2.id]);
+	});
+
+	it('rejects unreadable, missing, or malformed memory-kind refs with the same 400 invalid_evidence on create and revise', async () => {
+		const secret = (await createMemory(validInput({ idempotencyKey: 'secret' }), alice, context)).memory;
+		const withdrawn = (
+			await createMemory(validInput({ idempotencyKey: 'withdrawn', visibility: 'shared' }), alice, context)
+		).memory;
+		await withdrawMemory(withdrawn.id, { expectedRevision: 1 }, alice, context);
+		const missingId = '0'.repeat(32);
+
+		const unreadableErr = await rejection(
+			createMemory(
+				validInput({ idempotencyKey: 'probe-1', evidence: [{ kind: 'memory', ref: secret.id }] }),
+				bob,
+				context,
+			),
+			400,
+			'invalid_evidence',
+		);
+		const missingErr = await rejection(
+			createMemory(
+				validInput({ idempotencyKey: 'probe-2', evidence: [{ kind: 'memory', ref: missingId }] }),
+				bob,
+				context,
+			),
+			400,
+			'invalid_evidence',
+		);
+		const withdrawnErr = await rejection(
+			createMemory(
+				validInput({ idempotencyKey: 'probe-3', evidence: [{ kind: 'memory', ref: withdrawn.id }] }),
+				bob,
+				context,
+			),
+			400,
+			'invalid_evidence',
+		);
+		const malformedErr = await rejection(
+			createMemory(
+				validInput({ idempotencyKey: 'probe-4', evidence: [{ kind: 'memory', ref: 'not-a-hex-id' }] }),
+				bob,
+				context,
+			),
+			400,
+			'invalid_evidence',
+		);
+		assert.equal(unreadableErr.message, missingErr.message);
+		assert.equal(withdrawnErr.message, missingErr.message);
+		assert.equal(malformedErr.message, missingErr.message);
+
+		const bobs = (await createMemory(validInput({ idempotencyKey: 'bobs' }), bob, context)).memory;
+		const reviseUnreadable = await rejection(
+			reviseMemory(bobs.id, { evidence: [{ kind: 'memory', ref: secret.id }], expectedRevision: 1 }, bob, context),
+			400,
+			'invalid_evidence',
+		);
+		const reviseMissing = await rejection(
+			reviseMemory(bobs.id, { evidence: [{ kind: 'memory', ref: missingId }], expectedRevision: 1 }, bob, context),
+			400,
+			'invalid_evidence',
+		);
+		assert.equal(reviseUnreadable.message, reviseMissing.message);
+		assert.equal(stored(bobs.id).revision, 1);
+	});
+
+	it('validates evidence item shape and length bounds', async () => {
+		for (const bad of [
+			'not-an-array',
+			['legacy-string'],
+			[null],
+			[{ kind: 'issue', ref: '123' }],
+			[{ kind: 'url', ref: '   ' }],
+			[{ kind: 'url', ref: 'https://example.com', note: '   ' }],
+			[{ kind: 'url', ref: 'https://example.com', extra: true }],
+		]) {
+			await rejection(createMemory(validInput({ evidence: bad }), alice, context), 400, 'invalid_evidence');
+		}
+		await rejection(
+			createMemory(
+				validInput({ evidence: [{ kind: 'url', ref: 'x'.repeat(EVIDENCE_REF_MAX_CHARS + 1) }] }),
+				alice,
+				context,
+			),
+			400,
+			'evidence_too_long',
+		);
+		await rejection(
+			createMemory(
+				validInput({
+					evidence: [{ kind: 'url', ref: 'https://example.com', note: 'x'.repeat(EVIDENCE_NOTE_MAX_CHARS + 1) }],
+				}),
+				alice,
+				context,
+			),
+			400,
+			'evidence_too_long',
+		);
+	});
+});
+
+describe('pin and unpin', () => {
+	it('records a per-reader MemoryPin row, is idempotent, and unpins without touching other readers', async () => {
+		const { memory } = await createMemory(validInput({ visibility: 'shared' }), alice, context);
+		const first = await pinMemory(memory.id, {}, bob, context);
+		assert.equal(first.pinned, true);
+		assert.equal(first.memoryId, memory.id);
+		assert.equal(first.memory.id, memory.id);
+		assert.ok(pinRows().has(`bob:${memory.id}`));
+
+		const createdAt = pinRows().get(`bob:${memory.id}`).createdAt;
+		const second = await pinMemory(memory.id, {}, bob, context);
+		assert.equal(second.pinned, true);
+		assert.equal(pinRows().get(`bob:${memory.id}`).createdAt, createdAt);
+
+		await pinMemory(memory.id, {}, alice, context);
+		assert.equal(pinRows().size, 2);
+
+		const unpinned = await unpinMemory(memory.id, {}, bob, context);
+		assert.equal(unpinned.pinned, false);
+		assert.equal(unpinned.memoryId, memory.id);
+		assert.equal(pinRows().has(`bob:${memory.id}`), false);
+		assert.equal(pinRows().has(`alice:${memory.id}`), true);
+
+		const again = await unpinMemory(memory.id, {}, bob, context);
+		assert.equal(again.pinned, false);
+	});
+
+	it('returns the same 404 for an unreadable memory as for a missing id on pin and unpin', async () => {
+		const secret = (await createMemory(validInput({ idempotencyKey: 'secret' }), alice, context)).memory;
+		const missingId = '0'.repeat(32);
+
+		const pinHidden = await rejection(pinMemory(secret.id, {}, bob, context), 404, 'memory_not_found');
+		const pinMissing = await rejection(pinMemory(missingId, {}, bob, context), 404, 'memory_not_found');
+		assert.equal(pinHidden.message, pinMissing.message);
+
+		const unpinHidden = await rejection(unpinMemory(secret.id, {}, bob, context), 404, 'memory_not_found');
+		const unpinMissing = await rejection(unpinMemory(missingId, {}, bob, context), 404, 'memory_not_found');
+		assert.equal(unpinHidden.message, unpinMissing.message);
+		assert.equal(pinRows().size, 0);
+	});
+
+	it('rejects unknown fields in pin and unpin payloads', async () => {
+		const { memory } = await createMemory(validInput(), alice, context);
+		await rejection(pinMemory(memory.id, { pinned: true }, alice, context), 400, 'unsupported_fields');
+		await rejection(unpinMemory(memory.id, { pinned: false }, alice, context), 400, 'unsupported_fields');
 	});
 });

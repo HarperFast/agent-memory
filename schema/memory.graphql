@@ -10,11 +10,10 @@ type Memory @table(database: "memory", audit: true) {
 	ownerId: String @indexed
 	status: String @indexed # active | superseded | withdrawn
 	revision: Int
-	pinned: Boolean @indexed
-	durability: String
 	supersedes: [ID] @indexed
 	supersededBy: ID @indexed
 	evidence: Any
+	evidenceMemoryIds: [ID] @indexed
 	idempotencyKey: String
 	createFingerprint: String
 	author: Any
@@ -28,6 +27,13 @@ type Memory @table(database: "memory", audit: true) {
 	text: FullText @fullText(fields: [{ name: "title", weight: 2.0 }, { name: "content" }])
 	createdAt: Date @indexed
 	updatedAt: Date @updatedTime @indexed
+}
+
+type MemoryPin @table(database: "memory") @sealed {
+	id: ID @primaryKey
+	principalId: String @indexed
+	memoryId: ID @indexed
+	createdAt: Date
 }
 
 # Keyed "role:<roleName>" or "user:<username>". Patterns are exact labels or "<namespace>:*".

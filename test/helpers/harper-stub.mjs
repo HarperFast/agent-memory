@@ -51,6 +51,10 @@ function matchesCondition(record, condition) {
 				return value === condition.value;
 			case 'not_equal':
 				return value !== condition.value;
+			case 'greater_than':
+				return value instanceof Date && condition.value instanceof Date
+					? value.getTime() > condition.value.getTime()
+					: value !== null && value !== undefined && value > condition.value;
 			case 'gelt':
 				return value >= condition.value[0] && value < condition.value[1];
 			default:
@@ -96,7 +100,7 @@ class StubTable {
 		const next = structuredClone(record);
 		await this.#embed(next);
 		next.createdAt ??= rows.get(record.id)?.createdAt ?? stamp();
-		next.updatedAt = stamp();
+		if (this.name !== 'MemoryPin') next.updatedAt = stamp();
 		rows.set(record.id, next);
 	}
 	async patch(id, changes, context) {
@@ -105,6 +109,9 @@ class StubTable {
 		await this.#embed(changes.content === undefined ? {} : next);
 		next.updatedAt = stamp();
 		rows.set(id, next);
+	}
+	async delete(id, context) {
+		return this.#rows(context).delete(id);
 	}
 	search(query, context) {
 		searchLog.push({ table: this.name, query });
@@ -135,7 +142,11 @@ class StubTable {
 }
 
 export const databases = {
-	memory: { Memory: new StubTable('Memory'), ScopeGrant: new StubTable('ScopeGrant') },
+	memory: {
+		Memory: new StubTable('Memory'),
+		MemoryPin: new StubTable('MemoryPin'),
+		ScopeGrant: new StubTable('ScopeGrant'),
+	},
 };
 export const tables = {};
 

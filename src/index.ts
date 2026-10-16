@@ -1,9 +1,13 @@
 import type { Scope } from 'harper';
-import { MemoryResource } from './resource.ts';
+import { MEMORY_RESOURCES } from './resource.ts';
 import { applySettings, parseSettings } from './settings.ts';
 
 export { registerMemorySink, type MemorySink } from './sinks.ts';
 export { setPrincipalResolver, type PrincipalResolver, type PrincipalResolution } from './principal.ts';
+
+function routePathFor(basePath: string, resource: { path: string }): string {
+	return resource.path.replace(/^\/Memory\b/, basePath);
+}
 
 export async function handleApplication(scope: Scope): Promise<void> {
 	const resources = scope.resources;
@@ -14,9 +18,18 @@ export async function handleApplication(scope: Scope): Promise<void> {
 	const configure = () => {
 		const settings = parseSettings((scope.options.getAll() ?? {}) as Record<string, any>);
 		if (settings.urlPath !== mountedPath) {
-			resources.set(settings.urlPath, MemoryResource);
-			if (mountedPath !== undefined && resources.get(mountedPath)?.Resource === MemoryResource) {
-				resources.delete(mountedPath);
+			for (const ResourceClass of MEMORY_RESOURCES) {
+				resources.set(routePathFor(settings.urlPath, ResourceClass), ResourceClass);
+			}
+			if (mountedPath !== undefined) {
+				for (const ResourceClass of MEMORY_RESOURCES) {
+					const oldPath = routePathFor(mountedPath, ResourceClass);
+					const existing =
+						resources.get(oldPath) ?? resources.paramRoutes?.find((route) => route.pattern === oldPath)?.entry;
+					if (existing === undefined || existing.Resource === ResourceClass) {
+						resources.delete(oldPath);
+					}
+				}
 			}
 			mountedPath = settings.urlPath;
 		}

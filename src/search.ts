@@ -1,6 +1,6 @@
 import { logger, models } from 'harper';
 import { badRequest } from './errors.ts';
-import { memoryTable, STATUS_ACTIVE, STATUS_SUPERSEDED, toMemoryView } from './lifecycle.ts';
+import { memoryPinTable, memoryTable, STATUS_ACTIVE, STATUS_SUPERSEDED, toMemoryView } from './lifecycle.ts';
 import { anyOf, canRead, isScopeLabel, readableCondition, type Condition, type Principal } from './scopes.ts';
 import { getSettings } from './settings.ts';
 
@@ -27,9 +27,8 @@ const VIEW_FIELDS = [
 	'ownerId',
 	'status',
 	'revision',
-	'pinned',
-	'durability',
 	'evidence',
+	'evidenceMemoryIds',
 	'supersedes',
 	'supersededBy',
 	'author',
@@ -47,6 +46,7 @@ export interface SearchParams {
 	scopes: string[];
 	limit: number;
 	includeSuperseded: boolean;
+	includeExpired: boolean;
 }
 
 function boundedInteger(value: string | null, field: string, fallback: number, max: number): number {
@@ -65,23 +65,35 @@ function optionalQuery(value: string | null): string | undefined {
 	return q;
 }
 
+function booleanParam(params: URLSearchParams, name: string): boolean {
+	const value = params.get(name);
+	if (value !== null && value !== 'true' && value !== 'false') {
+		throw badRequest(`${name} must be true or false`, `invalid_${name}`);
+	}
+	return value === 'true';
+}
+
 export function parseSearchParams(params: URLSearchParams): SearchParams {
 	const scopes = params.getAll('scope');
 	if (!scopes.every(isScopeLabel)) throw badRequest('scope must be a scope label', 'invalid_scope_label');
-	const includeSuperseded = params.get('includeSuperseded');
-	if (includeSuperseded !== null && includeSuperseded !== 'true' && includeSuperseded !== 'false') {
-		throw badRequest('includeSuperseded must be true or false', 'invalid_includeSuperseded');
-	}
 	return {
 		q: optionalQuery(params.get('q')),
 		tags: params.getAll('tag'),
 		scopes,
 		limit: boundedInteger(params.get('limit'), 'limit', SEARCH_DEFAULT_LIMIT, SEARCH_MAX_LIMIT),
-		includeSuperseded: includeSuperseded === 'true',
+		includeSuperseded: booleanParam(params, 'includeSuperseded'),
+		includeExpired: booleanParam(params, 'includeExpired'),
 	};
 }
 
-function filterConditions(params: SearchParams, principal: Principal): Condition[] {
+function unexpiredCondition(now: Date): Condition {
+	return anyOf([
+		{ attribute: 'validUntil', comparator: 'equals', value: null },
+		{ attribute: 'validUntil', comparator: 'greater_than', value: now },
+	]);
+}
+
+function filterConditions(params: SearchParams, principal: Principal, now = new Date()): Condition[] {
 	const conditions: Condition[] = [
 		anyOf(
 			(params.includeSuperseded ? [STATUS_ACTIVE, STATUS_SUPERSEDED] : [STATUS_ACTIVE]).map((status) => ({
@@ -91,6 +103,7 @@ function filterConditions(params: SearchParams, principal: Principal): Condition
 			})),
 		),
 	];
+	if (!params.includeExpired) conditions.push(unexpiredCondition(now));
 	for (const tag of params.tags) conditions.push({ attribute: 'tags', comparator: 'equals', value: tag });
 	if (params.scopes.length > 0) {
 		conditions.push(anyOf(params.scopes.map((label) => ({ attribute: 'scopes', comparator: 'equals', value: label }))));
@@ -209,29 +222,42 @@ export function parseBootstrapParams(params: URLSearchParams): BootstrapParams {
 
 export async function bootstrapMemories(params: BootstrapParams, principal: Principal, context: object) {
 	const Memory = memoryTable();
+	const MemoryPin = memoryPinTable();
 	const active = { attribute: 'status', comparator: 'equals', value: STATUS_ACTIVE };
+	const unexpired = unexpiredCondition(new Date());
 	const readable = readableCondition(principal);
 	const recentFirst = { attribute: 'updatedAt', descending: true };
-	const [pinned, recent, relevant] = await Promise.all([
-		collect(
+	const loadPinned = async () => {
+		const pins = await collect(
+			MemoryPin.search(
+				{
+					conditions: [{ attribute: 'principalId', comparator: 'equals', value: principal.id }],
+					select: ['memoryId'],
+				},
+				context,
+			),
+		);
+		if (pins.length === 0) return [];
+		const pinIds = anyOf(pins.map((pin) => ({ attribute: 'id', comparator: 'equals', value: pin.memoryId })));
+		const records = await collect(
 			Memory.search(
 				{
-					conditions: [
-						active,
-						{ attribute: 'pinned', comparator: 'equals', value: true },
-						...(readable ? [readable] : []),
-					],
+					conditions: [active, unexpired, pinIds, ...(readable ? [readable] : [])],
 					sort: recentFirst,
 					select: VIEW_FIELDS,
 					limit: BOOTSTRAP_PINNED_LIMIT,
 				},
 				context,
 			),
-		).then((records) => assertReadable(records, principal).map(toMemoryView)),
+		);
+		return assertReadable(records, principal).map(toMemoryView);
+	};
+	const [pinned, recent, relevant] = await Promise.all([
+		loadPinned(),
 		collect(
 			Memory.search(
 				{
-					conditions: [active, { attribute: 'ownerId', comparator: 'equals', value: principal.id }],
+					conditions: [active, unexpired, { attribute: 'ownerId', comparator: 'equals', value: principal.id }],
 					sort: recentFirst,
 					select: VIEW_FIELDS,
 					limit: BOOTSTRAP_RECENT_LIMIT,
@@ -241,7 +267,14 @@ export async function bootstrapMemories(params: BootstrapParams, principal: Prin
 		).then((records) => records.map(toMemoryView)),
 		params.q
 			? searchMemories(
-					{ q: params.q, tags: [], scopes: [], limit: BOOTSTRAP_RELEVANT_LIMIT, includeSuperseded: false },
+					{
+						q: params.q,
+						tags: [],
+						scopes: [],
+						limit: BOOTSTRAP_RELEVANT_LIMIT,
+						includeSuperseded: false,
+						includeExpired: false,
+					},
 					principal,
 					context,
 				).then((hits) => hits.map(({ score: _score, ...memory }) => memory))

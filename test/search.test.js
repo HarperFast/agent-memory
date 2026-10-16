@@ -1,12 +1,13 @@
 import { beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { __test } from 'harper';
-import { createMemory, withdrawMemory } from '../dist/lifecycle.js';
+import { createMemory, pinMemory, unpinMemory, withdrawMemory } from '../dist/lifecycle.js';
 import { createPrincipal } from '../dist/scopes.js';
 import { applySettings, parseSettings } from '../dist/settings.js';
 import { bootstrapMemories, fuse, parseBootstrapParams, parseSearchParams, searchMemories } from '../dist/search.js';
 
 const alice = createPrincipal({ id: 'alice', grants: { read: ['global'], write: ['global'] } });
+const bob = createPrincipal({ id: 'bob', grants: { read: ['global'], write: ['global'] } });
 const dave = createPrincipal({ id: 'dave', grants: { read: ['customer:*'] } });
 const root = createPrincipal({ id: 'root', superUser: true });
 const context = {};
@@ -45,20 +46,32 @@ describe('fuse', () => {
 
 describe('parseSearchParams', () => {
 	it('defaults and bounds its parameters', () => {
-		assert.deepEqual(params(''), { q: undefined, tags: [], scopes: [], limit: 10, includeSuperseded: false });
-		assert.deepEqual(params('q=%20disk%20&tag=a&tag=b&scope=team:x&limit=5&includeSuperseded=true'), {
-			q: 'disk',
-			tags: ['a', 'b'],
-			scopes: ['team:x'],
-			limit: 5,
-			includeSuperseded: true,
+		assert.deepEqual(params(''), {
+			q: undefined,
+			tags: [],
+			scopes: [],
+			limit: 10,
+			includeSuperseded: false,
+			includeExpired: false,
 		});
+		assert.deepEqual(
+			params('q=%20disk%20&tag=a&tag=b&scope=team:x&limit=5&includeSuperseded=true&includeExpired=true'),
+			{
+				q: 'disk',
+				tags: ['a', 'b'],
+				scopes: ['team:x'],
+				limit: 5,
+				includeSuperseded: true,
+				includeExpired: true,
+			},
+		);
 		for (const bad of [
 			'limit=0',
 			'limit=51',
 			'limit=two',
 			'scope=team:*',
 			'includeSuperseded=yes',
+			'includeExpired=yes',
 			`q=${'x'.repeat(1001)}`,
 		]) {
 			assert.throws(
@@ -79,7 +92,7 @@ describe('parseSearchParams', () => {
 });
 
 describe('searchMemories', () => {
-	it('pushes status and the readable set into both lanes, and the model into the vector lane', async () => {
+	it('pushes status, expiry and the readable set into both lanes, and the model into the vector lane', async () => {
 		await searchMemories(params('q=disk'), dave, context);
 		const [vector, text] = __test.searchLog;
 		const readable = {
@@ -91,21 +104,28 @@ describe('searchMemories', () => {
 			],
 		};
 		const status = { attribute: 'status', comparator: 'equals', value: 'active' };
+		const unexpired = vector.query.conditions[1];
+		assert.equal(unexpired.operator, 'or');
+		assert.deepEqual(unexpired.conditions[0], { attribute: 'validUntil', comparator: 'equals', value: null });
+		assert.equal(unexpired.conditions[1].attribute, 'validUntil');
+		assert.equal(unexpired.conditions[1].comparator, 'greater_than');
+		assert.ok(unexpired.conditions[1].value instanceof Date);
 		assert.deepEqual(vector.query.conditions, [
 			status,
+			unexpired,
 			readable,
 			{ attribute: 'embeddingModel', comparator: 'equals', value: 'default' },
 		]);
 		assert.equal(vector.query.sort.attribute, 'embedding');
 		assert.ok(vector.query.sort.waitForIndexMilliseconds > 0);
-		assert.deepEqual(text.query.conditions.slice(0, 2), [status, readable]);
-		assert.equal(text.query.conditions[2].comparator, 'matches');
-		assert.ok(text.query.conditions[2].waitForIndexMilliseconds > 0);
+		assert.deepEqual(text.query.conditions.slice(0, 3), [status, unexpired, readable]);
+		assert.equal(text.query.conditions[3].comparator, 'matches');
+		assert.ok(text.query.conditions[3].waitForIndexMilliseconds > 0);
 		for (const lane of [vector, text]) assert.ok(!lane.query.select.includes('embedding'));
 	});
 
-	it('adds no readable condition for super_user, and admits superseded only when asked', async () => {
-		await searchMemories(params('q=disk&includeSuperseded=true&tag=ops'), root, context);
+	it('adds no readable condition for super_user, and admits superseded and expired only when asked', async () => {
+		await searchMemories(params('q=disk&includeSuperseded=true&includeExpired=true&tag=ops'), root, context);
 		const [vector] = __test.searchLog;
 		assert.deepEqual(vector.query.conditions.slice(0, 2), [
 			{
@@ -118,6 +138,27 @@ describe('searchMemories', () => {
 			{ attribute: 'tags', comparator: 'equals', value: 'ops' },
 		]);
 		assert.equal(vector.query.conditions.length, 3);
+	});
+
+	it('excludes expired memories by default and includes them with includeExpired=true', async () => {
+		const live = await create(alice, 'disk live', {
+			content: 'disk pressure live',
+			validUntil: '2099-01-01T00:00:00.000Z',
+		});
+		const expired = await create(alice, 'disk expired', {
+			content: 'disk pressure expired',
+			validUntil: '2020-01-01T00:00:00.000Z',
+		});
+		const timeless = await create(alice, 'disk timeless', { content: 'disk pressure timeless' });
+
+		const defaultQueryHits = await searchMemories(params('q=disk'), alice, context);
+		assert.deepEqual(defaultQueryHits.map((hit) => hit.id).sort(), [live.id, timeless.id].sort());
+
+		const defaultListHits = await searchMemories(params(''), alice, context);
+		assert.deepEqual(defaultListHits.map((hit) => hit.id).sort(), [live.id, timeless.id].sort());
+
+		const withExpired = await searchMemories(params('q=disk&includeExpired=true'), alice, context);
+		assert.deepEqual(withExpired.map((hit) => hit.id).sort(), [expired.id, live.id, timeless.id].sort());
 	});
 
 	it('returns only readable, non-withdrawn memories, ranked, with a score', async () => {
@@ -180,7 +221,8 @@ describe('searchMemories', () => {
 
 describe('bootstrapMemories', () => {
 	it('orders pinned, recent, relevant; deduplicates; skips what does not fit', async () => {
-		const pinned = await create(root, 'pin', { content: 'pinned guidance', pinned: true, visibility: 'shared' });
+		const pinned = await create(root, 'pin', { content: 'pinned guidance', visibility: 'shared' });
+		await pinMemory(pinned.id, {}, alice, context);
 		const recent = await create(alice, 'mine', { content: 'my recent note' });
 		const large = await create(alice, 'big', { content: 'y'.repeat(500) });
 		const relevant = await create(root, 'tapir', { content: 'tapir facts', visibility: 'shared' });
@@ -195,5 +237,42 @@ describe('bootstrapMemories', () => {
 		);
 		assert.ok(!result.memories.some((memory) => memory.id === large.id));
 		assert.ok(result.used <= 120);
+	});
+
+	it('isolates pins per reader and excludes expired memories from every bootstrap section', async () => {
+		const shared = await create(root, 'shared-guide', { content: 'shared guide', visibility: 'shared' });
+		await pinMemory(shared.id, {}, bob, context);
+
+		const expiredPin = await create(root, 'expired-pin', {
+			content: 'expired pinned guidance',
+			visibility: 'shared',
+			validUntil: '2020-01-01T00:00:00.000Z',
+		});
+		await pinMemory(expiredPin.id, {}, alice, context);
+		await create(alice, 'expired-recent', {
+			content: 'expired recent note',
+			validUntil: '2020-01-01T00:00:00.000Z',
+		});
+		await create(root, 'expired-relevant', {
+			content: 'tapir expired facts',
+			visibility: 'shared',
+			validUntil: '2020-01-01T00:00:00.000Z',
+		});
+
+		const bobBootstrap = await bootstrapMemories({ budget: 8000 }, bob, context);
+		assert.deepEqual(
+			bobBootstrap.memories.map((memory) => [memory.id, memory.section]),
+			[[shared.id, 'pinned']],
+		);
+
+		assert.deepEqual((await bootstrapMemories({ budget: 8000 }, alice, context)).memories, []);
+		const aliceWithQuery = await bootstrapMemories({ q: 'tapir', budget: 8000 }, alice, context);
+		assert.deepEqual(
+			aliceWithQuery.memories.map((memory) => [memory.id, memory.section]),
+			[[shared.id, 'relevant']],
+		);
+
+		await unpinMemory(shared.id, {}, bob, context);
+		assert.deepEqual((await bootstrapMemories({ budget: 8000 }, bob, context)).memories, []);
 	});
 });

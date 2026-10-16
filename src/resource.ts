@@ -1,13 +1,30 @@
 // Memory ids are 32 hex characters, so the `bootstrap` and `import` path segments cannot collide with one.
 import { logger, Resource } from 'harper';
-import { isCallerSafe, notFound } from './errors.ts';
+import { badRequest, isCallerSafe, notFound } from './errors.ts';
 import { importMemories } from './import.ts';
-import { createMemory, getMemory, reviseMemory, setMemoryScopes, withdrawMemory } from './lifecycle.ts';
+import {
+	createMemory,
+	getMemory,
+	pinMemory,
+	reviseMemory,
+	setMemoryScopes,
+	unpinMemory,
+	withdrawMemory,
+} from './lifecycle.ts';
 import { resolvePrincipal } from './principal.ts';
+import type { Principal } from './scopes.ts';
 import { bootstrapMemories, parseBootstrapParams, parseSearchParams, searchMemories } from './search.ts';
 
 function json(data: unknown, status = 200): Response {
 	return new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json' } });
+}
+
+async function readBody(data: unknown): Promise<unknown> {
+	try {
+		return (await data) ?? {};
+	} catch {
+		throw badRequest('Request body must be valid JSON', 'invalid_body');
+	}
 }
 
 // Harper's retryable failures: 503 (an index rebuilding or lagging, a database closing), 423 (a record lock not
@@ -41,56 +58,116 @@ function errorResponse(error: unknown, route: string): Response {
 	return json({ error: 'Internal error', code: 'internal_error' }, 500);
 }
 
-function segments(target: any): string[] {
-	return String(target?.pathname ?? '')
-		.split('/')
-		.filter(Boolean);
+async function handle(
+	route: string,
+	context: object | undefined,
+	fn: (principal: Principal, ctx: object) => Promise<Response>,
+): Promise<Response> {
+	try {
+		const ctx = (context ?? {}) as Record<string, unknown>;
+		// Static verb overrides replace Resource's transactional() wrapper, which otherwise consumes
+		// the HTTP entry `request.authorize` flag before any internal table read runs in this async scope.
+		ctx.authorize = false;
+		const principal = await resolvePrincipal(ctx);
+		return await fn(principal, ctx);
+	} catch (error) {
+		return errorResponse(error, route);
+	}
 }
 
+// @ts-expect-error — Resource's static verb types carry transactional()'s reliesOnPrototype brand
 export class MemoryResource extends Resource {
-	static loadAsInstance = false;
+	static path = '/Memory/*rest';
 	// Kept out of MCP and OpenAPI auto-export: the generic verbs would not express these routes.
 	static hidden = true;
 
-	async get(target: any) {
-		const [id, sub] = segments(target);
-		try {
-			const context = this.getContext() as object;
-			const principal = await resolvePrincipal(context);
-			if (sub) throw notFound();
-			if (!id) return json({ memories: await searchMemories(parseSearchParams(target), principal, context) });
-			if (id === 'bootstrap') return json(await bootstrapMemories(parseBootstrapParams(target), principal, context));
-			const memory = await getMemory(id, principal, context);
-			if (!memory) throw notFound();
-			return json({ memory });
-		} catch (error) {
-			return errorResponse(error, 'get');
-		}
+	static async get(target: any, context: object) {
+		return handle('get', context, async (principal, ctx) => {
+			if (target?.rest) throw notFound();
+			return json({ memories: await searchMemories(parseSearchParams(target), principal, ctx) });
+		});
 	}
 
-	async post(target: any, data: any) {
-		const [id, action] = segments(target);
-		try {
-			const context = this.getContext() as object;
-			const principal = await resolvePrincipal(context);
-			const input = (await data) ?? {};
-			if (!id) {
-				const { memory, created } = await createMemory(input, principal, context);
-				return json({ memory, created }, created ? 201 : 200);
-			}
-			if (id === 'import' && !action) return json(await importMemories(input, principal, context));
-			switch (action) {
+	static async post(target: any, data: any, context: object) {
+		return handle('post', context, async (principal, ctx) => {
+			if (target?.rest) throw notFound();
+			const { memory, created } = await createMemory(await readBody(data), principal, ctx);
+			return json({ memory, created }, created ? 201 : 200);
+		});
+	}
+}
+
+// @ts-expect-error — Resource's static verb types carry transactional()'s reliesOnPrototype brand
+export class MemoryBootstrapResource extends Resource {
+	static path = '/Memory/bootstrap';
+	static hidden = true;
+
+	static async get(target: any, context: object) {
+		return handle('get', context, async (principal, ctx) => {
+			if (target?.pathname) throw notFound();
+			return json(await bootstrapMemories(parseBootstrapParams(target), principal, ctx));
+		});
+	}
+}
+
+// @ts-expect-error — Resource's static verb types carry transactional()'s reliesOnPrototype brand
+export class MemoryImportResource extends Resource {
+	static path = '/Memory/import';
+	static hidden = true;
+
+	static async post(target: any, data: any, context: object) {
+		return handle('post', context, async (principal, ctx) => {
+			if (target?.pathname) throw notFound();
+			return json(await importMemories(await readBody(data), principal, ctx));
+		});
+	}
+}
+
+// @ts-expect-error — Resource's static verb types carry transactional()'s reliesOnPrototype brand
+export class MemoryItemResource extends Resource {
+	static path = '/Memory/:id';
+	static hidden = true;
+
+	static async get(target: any, context: object) {
+		return handle('get', context, async (principal, ctx) => {
+			const memory = await getMemory(String(target?.id ?? ''), principal, ctx);
+			if (!memory) throw notFound();
+			return json({ memory });
+		});
+	}
+}
+
+// @ts-expect-error — Resource's static verb types carry transactional()'s reliesOnPrototype brand
+export class MemoryActionResource extends Resource {
+	static path = '/Memory/:id/:action';
+	static hidden = true;
+
+	static async post(target: any, data: any, context: object) {
+		return handle('post', context, async (principal, ctx) => {
+			const id = String(target?.id ?? '');
+			const input = await readBody(data);
+			switch (target?.action) {
 				case 'revise':
-					return json({ memory: await reviseMemory(id, input, principal, context) });
+					return json({ memory: await reviseMemory(id, input, principal, ctx) });
 				case 'scopes':
-					return json({ memory: await setMemoryScopes(id, input, principal, context) });
+					return json({ memory: await setMemoryScopes(id, input, principal, ctx) });
 				case 'withdraw':
-					return json({ memory: await withdrawMemory(id, input, principal, context) });
+					return json({ memory: await withdrawMemory(id, input, principal, ctx) });
+				case 'pin':
+					return json(await pinMemory(id, input, principal, ctx));
+				case 'unpin':
+					return json(await unpinMemory(id, input, principal, ctx));
 				default:
 					throw notFound();
 			}
-		} catch (error) {
-			return errorResponse(error, 'post');
-		}
+		});
 	}
 }
+
+export const MEMORY_RESOURCES = [
+	MemoryResource,
+	MemoryBootstrapResource,
+	MemoryImportResource,
+	MemoryItemResource,
+	MemoryActionResource,
+] as const;
