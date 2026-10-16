@@ -25,7 +25,7 @@ type Memory @table(database: "memory", audit: true) {
 	validUntil: Date
 	withdrawnAt: Date
 	withdrawnReason: String
-	# The plugin replaces this embedder when the embeddingModel option is not "default".
+	# The plugin installs its own embedder for every model; it embeds with the model recorded on the row.
 	embedding: [Float] @embed(source: "content", model: "default")
 	embeddingModel: String @indexed
 	text: FullText @fullText(fields: [{ name: "title", weight: 2.0 }, { name: "content" }])

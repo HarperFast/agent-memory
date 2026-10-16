@@ -1,7 +1,7 @@
 import { beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { __test } from 'harper';
+import { __test, models } from 'harper';
 import { importMemories } from '../dist/import.js';
 import { getMemory, putMemory, withdrawMemory } from '../dist/lifecycle.js';
 import { createPrincipal } from '../dist/scopes.js';
@@ -44,6 +44,24 @@ beforeEach(() => {
 describe('importMemories', () => {
 	it('is super_user only', async () => {
 		await rejection(importMemories({ rows: [row(1)] }, alice, context), 403, 'import_forbidden', undefined);
+	});
+
+	it('embeds the rows it will create in one call, before taking any lock', async () => {
+		await importMemories({ rows: [row(1)] }, root, context);
+		const embed = models.embed;
+		const calls = [];
+		models.embed = (input, options) => {
+			calls.push({ input, locks: __test.lockLog.length });
+			return embed.call(models, input, options);
+		};
+		__test.lockLog.length = 0;
+		try {
+			await importMemories({ rows: [row(1), row(2), row(3)] }, root, context);
+		} finally {
+			models.embed = embed;
+		}
+		assert.deepEqual(calls, [{ input: ['imported 2', 'imported 3'], locks: 0 }]);
+		assert.deepEqual(rows().get(idOf(2)).embedding, Array.from(Float32Array.from(__test.embedText('imported 2'))));
 	});
 
 	it('preserves owner, createdAt, typed evidence and links, with status derived from the graph (successor first)', async () => {

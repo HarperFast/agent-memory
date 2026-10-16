@@ -1,6 +1,6 @@
 import { beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { __test, databases } from 'harper';
+import { __test, databases, models } from 'harper';
 import {
 	MEMORY_RESOURCES,
 	MemoryActionResource,
@@ -222,6 +222,18 @@ describe('MemoryResource errors', () => {
 				);
 			};
 			assert.equal((await create('mem-embed-400-id1')).status, 500);
+			Memory.put = put;
+			const embed = models.embed;
+			models.embed = async () => {
+				throw new TypeError('fetch failed', {
+					cause: Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' }),
+				});
+			};
+			try {
+				assert.equal((await create('mem-embed-reset-1')).status, 503);
+			} finally {
+				models.embed = embed;
+			}
 			Memory.put = async () => {
 				throw Object.assign(new Error('Record already exists'), { statusCode: 409 });
 			};

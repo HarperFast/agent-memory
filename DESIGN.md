@@ -168,10 +168,11 @@ planning reads run only for a request that would pass the cheap checks (owner, a
 explicit targets and cited memories readable), so a refused request never locks a citation graph or a
 memory it cites. An operation that supersedes or withdraws takes a 5-minute lease instead of Harper's
 30 s default, since it flags every citer inside the transaction. No model call runs under a lock: a
-`PUT` that writes content embeds it before the transaction and hands the vector to the table's
-embedder (`setEmbedAttribute`, installed for every model), which falls back to embedding only for a
-write whose content it was not given (import, or a pre-read the transaction overtook). An embedding
-failure fails the write before it takes any lock. The plugin is the
+`PUT` that writes content embeds it before the transaction and carries the vector in the write, and
+the table's embedder (`setEmbedAttribute`, installed for every model) uses a carried vector, embedding
+only a write that carries none (import). A `PUT` whose transaction finds it must write content it has
+no vector for (another writer changed the row after the pre-read) releases its locks, embeds, and
+retries. An embedding failure fails the write before it takes any lock. The plugin is the
 only writer of `Memory`, so on one node a read-check-write is serialized: of N concurrent revisions at
 the same `If-Match` revision exactly one succeeds. The locks are node-scoped, because a cluster-scoped
 lock on a replicated database fails closed unless the cluster has opted into replicated record locks
@@ -217,8 +218,8 @@ first-class operation, and the write path proposes it.
 - **Judge**: with `supersession.judge` (a `models.generate` model name), each candidate is classified
   `supersedes | refines | unrelated`. Only a complete one-word answer counts (at most 16 output tokens,
   20 s per candidate); anything else, or a failed call, leaves the candidate without a `verdict`. The
-  judge runs outside every transaction, and not again for a `PUT` that changed nothing (an identical
-  retry gets its candidates unjudged).
+  judge runs outside every transaction, and only for a `PUT` that wrote a new title or content (a
+  retry or a tags-only revise gets its candidates unjudged).
 - **Auto** (`supersession.mode: auto`, requires `judge`; default `suggest`): on a create, the plugin
   searches with the write's vector and judges before the transaction, because `supersedes` cannot
   change after create. Each `supersedes` verdict joins the create's `supersedes` under the explicit rules and
@@ -284,7 +285,8 @@ rebuilding or lagging, a database closing), 423 (a record lock not granted withi
 a lock lease that lapsed before commit, and transient embedding backend failures (429, 5xx, timeout,
 connection failure) on writes — become a 503 `unavailable` to retry, with a rate-limited warning
 in the log. Any other 409 from Harper (for example a sink inserting a row that exists) is a 500. Import
-holds its locks with a 5-minute lease, since a batch embeds every row inside its transaction.
+embeds the rows it will create in one call before its transaction, and holds its locks with a 5-minute
+lease, since a batch writes up to 100 rows and flags their citers inside one transaction.
 
 ## Search and bootstrap
 

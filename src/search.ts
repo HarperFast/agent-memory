@@ -7,6 +7,7 @@ import {
 	STATUS_ACTIVE,
 	STATUS_SUPERSEDED,
 	toMemoryView,
+	type MemoryView,
 } from './lifecycle.ts';
 import { forReader } from './provenance.ts';
 import { anyOf, canRead, isScopeLabel, readableCondition, type Condition, type Principal } from './scopes.ts';
@@ -270,6 +271,8 @@ export async function bootstrapMemories(params: BootstrapParams, principal: Prin
 	const unexpired = unexpiredCondition(new Date());
 	const readable = readableCondition(principal);
 	const recentFirst = { attribute: 'updatedAt', descending: true };
+	// One lookup per flag source for the whole bootstrap, whichever section shows the flag.
+	const access = new Map<string, any>();
 	const loadPinned = async () => {
 		const pins = await collect(
 			MemoryPin.search(
@@ -294,7 +297,7 @@ export async function bootstrapMemories(params: BootstrapParams, principal: Prin
 				context,
 			),
 		);
-		const views = await forReader(assertReadable(records, principal).map(toMemoryView), principal, context);
+		const views = await forReader(assertReadable(records, principal).map(toMemoryView), principal, context, access);
 		const byId = new Map(views.map((view) => [view.id, view]));
 		return pins
 			.map((pin) => byId.get(pin.memoryId))
@@ -302,8 +305,14 @@ export async function bootstrapMemories(params: BootstrapParams, principal: Prin
 	};
 	// The caller's own flagged memories; the indexed mirror of the flag's date keeps this off a scan of every owned row.
 	const loadNeedsReview = async () => {
-		const visible = [];
-		// Flags the caller may not see are skipped, so the limit counts only visible ones.
+		const visible: MemoryView[] = [];
+		let chunk: any[] = [];
+		const admit = async () => {
+			for (const view of await forReader(chunk.map(toMemoryView), principal, context, access)) {
+				if (view.needsReview && visible.length < BOOTSTRAP_REVIEW_LIMIT) visible.push(view);
+			}
+			chunk = [];
+		};
 		for await (const record of Memory.search(
 			{
 				conditions: [
@@ -317,11 +326,12 @@ export async function bootstrapMemories(params: BootstrapParams, principal: Prin
 			},
 			context,
 		)) {
-			const [view] = await forReader([toMemoryView(record)], principal, context);
-			if (!view.needsReview) continue;
-			visible.push(view);
+			chunk.push(record);
+			if (chunk.length < BOOTSTRAP_REVIEW_LIMIT) continue;
+			await admit();
 			if (visible.length === BOOTSTRAP_REVIEW_LIMIT) break;
 		}
+		if (chunk.length > 0) await admit();
 		return visible;
 	};
 	const [pinned, needsReview, recent, relevant] = await Promise.all([
@@ -337,7 +347,7 @@ export async function bootstrapMemories(params: BootstrapParams, principal: Prin
 				},
 				context,
 			),
-		).then((records) => forReader(records.map(toMemoryView), principal, context)),
+		).then((records) => forReader(records.map(toMemoryView), principal, context, access)),
 		params.q
 			? searchMemories(
 					{

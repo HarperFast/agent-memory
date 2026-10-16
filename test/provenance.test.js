@@ -365,9 +365,12 @@ describe('bootstrap', () => {
 			);
 		}
 		const revoked = grant('dave', ['global'], ['global']);
+		__test.searchLog.length = 0;
 		const { memories } = await bootstrapMemories({ budget: 100_000 }, revoked, context);
 		const section = memories.filter((memory) => memory.section === 'needsReview').map((memory) => memory.id);
 		assert.deepEqual(section, [visible.id]);
+		const lookups = __test.searchLog.filter((entry) => entry.query.select?.join() === 'id,ownerId,scopes,status');
+		assert.ok(lookups.length <= 3, `${lookups.length} access lookups for 21 flags`);
 	});
 });
 

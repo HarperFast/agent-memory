@@ -1,4 +1,4 @@
-import { type LockPlan, memoryTable, type MemoryView, STATUS_ACTIVE } from './lifecycle.ts';
+import { memoryTable, type MemoryView, STATUS_ACTIVE } from './lifecycle.ts';
 import { anyOf, canRead, type Principal } from './scopes.ts';
 
 export type ReviewCause = 'superseded' | 'withdrawn';
@@ -32,20 +32,18 @@ export async function activeDependentIds(Memory: any, sourceIds: Iterable<string
 }
 
 /**
- * One hop: nothing here flags the citers of a flagged memory. `extraIds` adds citers the index cannot show yet (rows created in the
- * same transaction). Returns the ids it changed; the caller hands them to sinks after every lock is confirmed.
+ * Flags each of `citerIds` that is active, still cites `source.id` and does not supersede it. The caller found
+ * and locked the citers before its first write, and adds any the index cannot show yet (rows written in the
+ * same transaction). One hop: nothing here flags the citers of a flagged memory. Returns the ids it changed.
  */
 export async function flagDependents(
 	Memory: any,
 	source: { id: string; replacementId?: string },
 	cause: ReviewCause,
-	locks: LockPlan,
+	citerIds: Iterable<string>,
 	context: object,
 	now: Date,
-	extraIds: readonly string[] = [],
 ): Promise<string[]> {
-	const dependentIds = [...new Set([...(await activeDependentIds(Memory, [source.id], context)), ...extraIds])];
-	locks.require(dependentIds);
 	const flag: ReviewFlag = {
 		since: now.toISOString(),
 		cause,
@@ -53,7 +51,7 @@ export async function flagDependents(
 		...(source.replacementId ? { replacementId: source.replacementId } : {}),
 	};
 	const flagged: string[] = [];
-	for (const dependentId of dependentIds) {
+	for (const dependentId of new Set(citerIds)) {
 		const dependent = await Memory.get(dependentId, context);
 		if (
 			dependent?.status !== STATUS_ACTIVE ||
@@ -75,32 +73,35 @@ export async function flagDependents(
 }
 
 /**
- * The caller's views of `views`. A flag names its source and replacement, so it is shown only to a reader who
+ * A flag names its source and replacement, so it is shown only to a reader who
  * can read the source through its labels or owns it (withdrawal ignored: that reader could read it before), and
- * names the replacement only when the reader can read it now. Sinks keep the unredacted views.
+ * names the replacement only when the reader can read it now. Sinks keep the unredacted views. `access` caches
+ * the looked-up rows across calls for one request.
  */
 export async function forReader<T extends MemoryView>(
 	views: readonly T[],
 	principal: Principal,
 	context?: object,
+	access = new Map<string, any>(),
 ): Promise<T[]> {
 	if (principal.superUser || !views.some((view) => view.needsReview)) return [...views];
-	const ids = new Set<string>();
+	const missing = new Set<string>();
 	for (const view of views) {
 		const flag = view.needsReview as ReviewFlag | null;
 		if (!flag) continue;
-		ids.add(flag.sourceId);
-		if (flag.replacementId) ids.add(flag.replacementId);
+		for (const id of [flag.sourceId, flag.replacementId]) if (id && !access.has(id)) missing.add(id);
 	}
-	const access = new Map<string, any>();
-	for await (const record of memoryTable().search(
-		{
-			conditions: [anyOf([...ids].map((id) => ({ attribute: 'id', comparator: 'equals', value: id })))],
-			select: ['id', 'ownerId', 'scopes', 'status'],
-		},
-		context,
-	)) {
-		access.set(record.id, record);
+	if (missing.size > 0) {
+		for (const id of missing) access.set(id, undefined);
+		for await (const record of memoryTable().search(
+			{
+				conditions: [anyOf([...missing].map((id) => ({ attribute: 'id', comparator: 'equals', value: id })))],
+				select: ['id', 'ownerId', 'scopes', 'status'],
+			},
+			context,
+		)) {
+			access.set(record.id, record);
+		}
 	}
 	return views.map((view) => {
 		const flag = view.needsReview as ReviewFlag | null;

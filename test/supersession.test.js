@@ -181,16 +181,47 @@ describe('write-time candidates (suggest)', () => {
 
 	it('does not lock memories a refused write cites', async () => {
 		const hidden = (await putMemory(idFor('hidden'), shared(DISK, { scopes: ['customer:x'] }), carol, context)).memory;
+		const readable = (await putMemory(idFor('readable'), shared(), alice, context)).memory;
 		__test.lockLog.length = 0;
 		await rejection(
 			putMemory(idFor('cites'), shared(DISK, { evidence: [{ kind: 'memory', ref: hidden.id }] }), alice, context),
 			400,
 			'invalid_evidence',
 		);
+		await rejection(
+			putMemory(readable.id, { evidence: [{ kind: 'memory', ref: hidden.id }] }, bob, ifMatch(1)),
+			403,
+			'not_memory_owner',
+		);
+		const own = (await putMemory(idFor('own'), shared('pelican nesting begins in march'), alice, context)).memory;
+		__test.lockLog.length = 0;
+		await rejection(
+			putMemory(own.id, { evidence: [{ kind: 'memory', ref: readable.id }] }, bob, ifMatch(1)),
+			403,
+			'not_memory_owner',
+		);
+		await rejection(
+			putMemory(own.id, { content: 'x', supersedes: [readable.id] }, alice, ifMatch(1)),
+			400,
+			'supersedes_not_allowed',
+		);
 		assert.deepEqual(
 			__test.lockLog.map((entry) => entry.id),
-			[idFor('cites')],
+			[own.id, own.id],
 		);
+	});
+
+	it('spends no embedding on a revise the transaction will refuse', async () => {
+		const own = (await putMemory(idFor('own'), shared(), alice, context)).memory;
+		models.calls.length = 0;
+		await rejection(putMemory(own.id, { content: 'x', supersedes: [idFor('other')] }, alice, ifMatch(1)), 400);
+		await rejection(
+			putMemory(own.id, { content: 'x' }, alice, { ...context, headers: { 'if-match': '"1"', 'if-none-match': '*' } }),
+			412,
+		);
+		await rejection(putMemory(own.id, { content: 'x', scopes: ['customer:x'] }, alice, ifMatch(1)), 403);
+		await rejection(putMemory(own.id, { content: 'x' }, bob, ifMatch(1)), 403);
+		assert.equal(models.calls.length, 0);
 	});
 
 	it('judges each candidate after commit and acts on none of them', async () => {
@@ -210,6 +241,9 @@ describe('write-time candidates (suggest)', () => {
 		assert.equal(retry.created, false);
 		assert.equal(models.generateCalls.length, judged, 'a no-op retry is not judged again');
 		assert.equal(retry.candidates[0].verdict, undefined);
+		const retagged = await putMemory(idFor('new'), { tags: ['disk'] }, bob, ifMatch(1));
+		assert.equal(models.generateCalls.length, judged, 'a revise that leaves title and content alone is not judged');
+		assert.equal(retagged.candidates[0].verdict, undefined);
 		assert.deepEqual(candidates, [
 			{ id: near.id, title: 'Disk saturation', similarity: candidates[0].similarity, verdict: 'supersedes' },
 		]);

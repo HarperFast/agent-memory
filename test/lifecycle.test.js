@@ -626,6 +626,52 @@ describe('embedding model', () => {
 		assert.deepEqual(__test.setEmbedCalls, [{ table: 'Memory', attribute: 'embedding' }]);
 	});
 
+	it('stores the vector each write embedded, even for identical content written concurrently', async () => {
+		const embed = models.embed;
+		let call = 0;
+		models.embed = async (input) => {
+			const vector = new Array(32).fill(0);
+			vector[call++] = 1;
+			return [Float32Array.from(vector)];
+		};
+		try {
+			await Promise.all([
+				putMemory(idFor('twin-a'), validInput(), alice, context),
+				putMemory(idFor('twin-b'), validInput(), alice, context),
+			]);
+		} finally {
+			models.embed = embed;
+		}
+		assert.notDeepEqual(stored(idFor('twin-a')).embedding, stored(idFor('twin-b')).embedding);
+	});
+
+	it('embeds outside the locks when another writer changed the content after the pre-read', async () => {
+		const { memory } = await putMemory(DEFAULT_ID, validInput(), alice, context);
+		await putMemory(memory.id, { content: 'changed by another writer' }, alice, ifMatch(1));
+		const Memory = databases.memory.Memory;
+		const get = Memory.get.bind(Memory);
+		// The pre-read still sees the first content, which this request resends.
+		Memory.get = async (id, ctx) =>
+			ctx?.transaction ? get(id, ctx) : { ...(await get(id, ctx)), content: memory.content };
+		const embed = models.embed;
+		let locksAtEmbed;
+		models.embed = (input, options) => {
+			locksAtEmbed = __test.lockLog.length;
+			return embed.call(models, input, options);
+		};
+		__test.lockLog.length = 0;
+		try {
+			await putMemory(memory.id, { content: memory.content }, alice, { ...context, headers: { 'if-match': '*' } });
+		} finally {
+			Memory.get = get;
+			models.embed = embed;
+		}
+		assert.equal(locksAtEmbed, 1, 'embedded after the first attempt released its lock');
+		assert.equal(__test.lockLog.length, 2);
+		assert.equal(stored(memory.id).content, memory.content);
+		assert.deepEqual(stored(memory.id).embedding, Array.from(Float32Array.from(__test.embedText(memory.content))));
+	});
+
 	it('keeps the stored vector when a revise leaves the content and model unchanged', async () => {
 		const { memory } = await putMemory(DEFAULT_ID, validInput(), alice, context);
 		models.calls.length = 0;
