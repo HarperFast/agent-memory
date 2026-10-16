@@ -170,7 +170,7 @@ memory it cites. An operation that supersedes or withdraws takes a 5-minute leas
 30 s default, since it flags every citer inside the transaction. No model call runs under a lock: a
 `PUT` that writes content embeds it before the transaction and carries the vector in the write, and
 the table's embedder (`setEmbedAttribute`, installed for every model) uses a carried vector, embedding
-only a write that carries none (import). A `PUT` whose transaction finds it must write content it has
+only a write that carries none. A `PUT` whose transaction finds it must write content it has
 no vector for (another writer changed the row after the pre-read) releases its locks, embeds, and
 retries. An embedding failure fails the write before it takes any lock. The plugin is the
 only writer of `Memory`, so on one node a read-check-write is serialized: of N concurrent revisions at

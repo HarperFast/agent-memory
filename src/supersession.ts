@@ -62,7 +62,6 @@ function warnRateLimited(key: string, message: string, error?: unknown): void {
 }
 
 /**
- * The nearest active, unexpired memories the writer can read that share a scope label with the written one.
  * Advisory: it does not wait for index coverage, so a memory committed within the index lag can be missed, and
  * a failed search yields no candidates rather than failing the write.
  */

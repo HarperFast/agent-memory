@@ -211,6 +211,26 @@ describe('write-time candidates (suggest)', () => {
 		);
 	});
 
+	it('locks nothing a create names when it refuses the create for its supersedes', async () => {
+		const hidden = (await putMemory(idFor('hidden'), shared(DISK, { scopes: ['customer:x'] }), carol, context)).memory;
+		const readable = (await putMemory(idFor('readable'), shared('pelican nesting begins in march'), alice, context))
+			.memory;
+		__test.lockLog.length = 0;
+		await rejection(
+			putMemory(
+				idFor('refused'),
+				shared(DISK, { supersedes: [hidden.id], evidence: [{ kind: 'memory', ref: readable.id }] }),
+				alice,
+				context,
+			),
+			404,
+		);
+		assert.deepEqual(
+			__test.lockLog.map((entry) => entry.id),
+			[idFor('refused')],
+		);
+	});
+
 	it('spends no embedding on a revise the transaction will refuse', async () => {
 		const own = (await putMemory(idFor('own'), shared(), alice, context)).memory;
 		models.calls.length = 0;

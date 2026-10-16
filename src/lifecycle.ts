@@ -282,7 +282,7 @@ export function toMemoryView(record: any): MemoryView {
 
 const embedderInstalled = new WeakSet<object>();
 
-// A write the plugin embedded before its transaction carries the vector; any other write (an import) is
+// Every plugin write carries the vector it embedded before its transaction; a write that carries none is
 // embedded here with the model recorded on the row, so the vector and the tag the vector lane filters on are
 // always from the same write.
 async function embedWithRecordModel(record: any, hook?: { signal?: AbortSignal }) {
@@ -304,7 +304,8 @@ export function ensureEmbedder(Memory: any): void {
 
 export async function embedContents(contents: string[], model: string): Promise<number[][]> {
 	const vectors = await models.embed(contents, { model, inputType: 'document' });
-	if (vectors?.length !== contents.length || vectors.some((vector) => !vector)) {
+	// The table's embedder would embed again, under the write's locks, for a missing or empty vector.
+	if (vectors?.length !== contents.length || vectors.some((vector) => !vector?.length)) {
 		throw new Error(`embedding model "${model}" returned no vector`);
 	}
 	return vectors.map((vector) => Array.from(vector));
@@ -420,7 +421,6 @@ function supersedeRefusal(target: any, scopes: readonly string[], principal: Pri
 	return undefined;
 }
 
-/** The scopes a write would leave, or undefined when the transaction is going to refuse them anyway. */
 function plannedScopes(
 	payload: Record<string, any>,
 	principal: Principal,
@@ -628,7 +628,6 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 						locks.require(parsedEvidenceMemoryIds);
 					}
 
-					// Unchanged content under the same model keeps its vector.
 					const contentChanged =
 						parsedContent !== undefined &&
 						(parsedContent !== existing.content || existing.embeddingModel !== settings.embeddingModel);
@@ -675,9 +674,9 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 				const validUntil = parsedValidUntil ?? null;
 
 				await assertReadableEvidence(Memory, evidenceMemoryIds, principal, txn);
-				locks.require(evidenceMemoryIds);
 				const now = new Date();
-				locks.require(supersedes);
+				// Refusals are decided before anything joins the lock set, so a refused create locks nothing it names;
+				// rows read here are re-read under their locks on the attempt the require below restarts into.
 				const targets = [];
 				for (const targetId of supersedes) {
 					const target = await Memory.get(targetId, txn);
@@ -703,12 +702,11 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 				}
 				// Superseding an already superseded memory is not a transition: its citers were flagged the first time.
 				const transitions = pointers.filter(({ target }) => target.status === STATUS_ACTIVE);
-				// Every citer is locked before the first write.
 				const citers = new Map<string, string[]>();
 				for (const { target } of transitions) {
 					citers.set(target.id, await activeDependentIds(Memory, [target.id], txn));
 				}
-				locks.require([...citers.values()].flat());
+				locks.require([...evidenceMemoryIds, ...supersedes, ...[...citers.values()].flat()]);
 
 				if (vector === undefined) throw new VectorNeeded();
 				await Memory.put(
@@ -782,8 +780,9 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 	}
 
 	const { memory } = outcome.written;
+	const [view] = await forReader([memory], principal, requestContext);
 	if (supersession.mode === 'off') {
-		return { id, revision: memory.revision as number, created: outcome.created, memory, candidates: [] };
+		return { id, revision: memory.revision as number, created: outcome.created, memory: view, candidates: [] };
 	}
 	// A concurrent identical create can win the id after this request judged; its proposals then describe nothing.
 	const decided = 'applied' in outcome ? proposals : undefined;
@@ -808,7 +807,7 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 		matches,
 		decided && 'applied' in outcome ? new Set(outcome.applied) : undefined,
 	);
-	return { id, revision: memory.revision as number, created: outcome.created, memory, candidates };
+	return { id, revision: memory.revision as number, created: outcome.created, memory: view, candidates };
 }
 
 function captureWritten(record: any) {
@@ -973,10 +972,6 @@ export async function withdrawMemory(
 	);
 }
 
-/**
- * The owner's record that they reviewed the memory as it stands: clears `needsReview` and records `{ by, at }`.
- * Like a revision, it never flags this memory's own citers.
- */
 export async function confirmMemory(
 	id: unknown,
 	input: unknown = {},

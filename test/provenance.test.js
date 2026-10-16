@@ -5,6 +5,7 @@ import { importMemories } from '../dist/import.js';
 import { confirmMemory, getMemory, pinMemory, putMemory, withdrawMemory } from '../dist/lifecycle.js';
 import { createPrincipal } from '../dist/scopes.js';
 import { bootstrapMemories, searchMemories } from '../dist/search.js';
+import { forReader } from '../dist/provenance.js';
 import { applySettings, parseSettings } from '../dist/settings.js';
 import { registerMemorySink } from '../dist/sinks.js';
 
@@ -309,6 +310,30 @@ describe('who sees a flag', () => {
 		assert.deepEqual((await getMemory(dependent.id, erin)).needsReview, withoutReplacement);
 	});
 
+	it('gives concurrent readers sharing one lookup cache the same answer while the lookup is in flight', async () => {
+		const { dependent } = await scenario();
+		const view = await getMemory(dependent.id, root);
+		const Memory = databases.memory.Memory;
+		const search = Memory.search.bind(Memory);
+		Memory.search = (query, ctx) => {
+			const results = search(query, ctx);
+			if (query.select?.join() !== 'id,ownerId,scopes,status') return results;
+			return (async function* () {
+				await new Promise((resolve) => setTimeout(resolve, 10));
+				yield* results;
+			})();
+		};
+		const access = new Map();
+		let views;
+		try {
+			views = await Promise.all([forReader([view], erin, context, access), forReader([view], erin, context, access)]);
+		} finally {
+			Memory.search = search;
+		}
+		assert.ok(views[0][0].needsReview);
+		assert.deepEqual(views[1][0].needsReview, views[0][0].needsReview);
+	});
+
 	it('shows a withdrawal to the source label readers even though the tombstone itself is hidden', async () => {
 		const source = await create(
 			'source',
@@ -370,6 +395,10 @@ describe('bootstrap', () => {
 		const section = memories.filter((memory) => memory.section === 'needsReview').map((memory) => memory.id);
 		assert.deepEqual(section, [visible.id]);
 		const lookups = __test.searchLog.filter((entry) => entry.query.select?.join() === 'id,ownerId,scopes,status');
+		const scan = __test.searchLog.find((entry) =>
+			entry.query.conditions?.some((condition) => condition.attribute === 'needsReviewSince'),
+		);
+		assert.equal(scan.query.limit, 100, 'hidden flags cannot make bootstrap scan without bound');
 		assert.ok(lookups.length <= 3, `${lookups.length} access lookups for 21 flags`);
 	});
 });

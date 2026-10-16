@@ -32,9 +32,8 @@ export async function activeDependentIds(Memory: any, sourceIds: Iterable<string
 }
 
 /**
- * Flags each of `citerIds` that is active, still cites `source.id` and does not supersede it. The caller found
- * and locked the citers before its first write, and adds any the index cannot show yet (rows written in the
- * same transaction). One hop: nothing here flags the citers of a flagged memory. Returns the ids it changed.
+ * The caller found and locked `citerIds` before its first write, adding any the index cannot show yet (rows
+ * written in the same transaction). One hop: nothing here flags the citers of a flagged memory.
  */
 export async function flagDependents(
 	Memory: any,
@@ -82,7 +81,7 @@ export async function forReader<T extends MemoryView>(
 	views: readonly T[],
 	principal: Principal,
 	context?: object,
-	access = new Map<string, any>(),
+	access = new Map<string, Promise<any>>(),
 ): Promise<T[]> {
 	if (principal.superUser || !views.some((view) => view.needsReview)) return [...views];
 	const missing = new Set<string>();
@@ -92,28 +91,39 @@ export async function forReader<T extends MemoryView>(
 		for (const id of [flag.sourceId, flag.replacementId]) if (id && !access.has(id)) missing.add(id);
 	}
 	if (missing.size > 0) {
-		for (const id of missing) access.set(id, undefined);
-		for await (const record of memoryTable().search(
-			{
-				conditions: [anyOf([...missing].map((id) => ({ attribute: 'id', comparator: 'equals', value: id })))],
-				select: ['id', 'ownerId', 'scopes', 'status'],
-			},
-			context,
-		)) {
-			access.set(record.id, record);
-		}
+		// Cached as a promise, so a concurrent caller waits for this lookup rather than reading an unfinished one.
+		const found = (async () => {
+			const records = new Map<string, any>();
+			for await (const record of memoryTable().search(
+				{
+					conditions: [anyOf([...missing].map((id) => ({ attribute: 'id', comparator: 'equals', value: id })))],
+					select: ['id', 'ownerId', 'scopes', 'status'],
+				},
+				context,
+			)) {
+				records.set(record.id, record);
+			}
+			return records;
+		})();
+		for (const id of missing)
+			access.set(
+				id,
+				found.then((records) => records.get(id)),
+			);
 	}
-	return views.map((view) => {
-		const flag = view.needsReview as ReviewFlag | null;
-		if (!flag) return view;
-		const source = access.get(flag.sourceId);
-		if (!source || !canRead({ ownerId: source.ownerId, scopes: source.scopes }, principal)) {
-			return { ...view, needsReview: null };
-		}
-		if (!flag.replacementId) return view;
-		const replacement = access.get(flag.replacementId);
-		if (replacement && canRead(replacement, principal)) return view;
-		const { replacementId: _unreadable, ...visible } = flag;
-		return { ...view, needsReview: visible };
-	});
+	return Promise.all(
+		views.map(async (view) => {
+			const flag = view.needsReview as ReviewFlag | null;
+			if (!flag) return view;
+			const source = await access.get(flag.sourceId);
+			if (!source || !canRead({ ownerId: source.ownerId, scopes: source.scopes }, principal)) {
+				return { ...view, needsReview: null };
+			}
+			if (!flag.replacementId) return view;
+			const replacement = await access.get(flag.replacementId);
+			if (replacement && canRead(replacement, principal)) return view;
+			const { replacementId: _unreadable, ...visible } = flag;
+			return { ...view, needsReview: visible };
+		}),
+	);
 }

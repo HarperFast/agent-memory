@@ -26,6 +26,8 @@ const BOOTSTRAP_MAX_BUDGET = 100_000;
 const BOOTSTRAP_RECENT_LIMIT = 50;
 const BOOTSTRAP_RELEVANT_LIMIT = 20;
 const BOOTSTRAP_REVIEW_LIMIT = 20;
+// Bounds the rows a bootstrap inspects when most of a caller's flags name sources it can no longer read.
+const BOOTSTRAP_REVIEW_SCAN = 5 * BOOTSTRAP_REVIEW_LIMIT;
 
 const VIEW_FIELDS = [
 	'id',
@@ -271,8 +273,8 @@ export async function bootstrapMemories(params: BootstrapParams, principal: Prin
 	const unexpired = unexpiredCondition(new Date());
 	const readable = readableCondition(principal);
 	const recentFirst = { attribute: 'updatedAt', descending: true };
-	// One lookup per flag source for the whole bootstrap, whichever section shows the flag.
-	const access = new Map<string, any>();
+	// One lookup per flag source across the pinned, needsReview and recent sections.
+	const access = new Map<string, Promise<any>>();
 	const loadPinned = async () => {
 		const pins = await collect(
 			MemoryPin.search(
@@ -323,6 +325,7 @@ export async function bootstrapMemories(params: BootstrapParams, principal: Prin
 				],
 				sort: { attribute: 'needsReviewSince', descending: true },
 				select: VIEW_FIELDS,
+				limit: BOOTSTRAP_REVIEW_SCAN,
 			},
 			context,
 		)) {

@@ -672,6 +672,18 @@ describe('embedding model', () => {
 		assert.deepEqual(stored(memory.id).embedding, Array.from(Float32Array.from(__test.embedText(memory.content))));
 	});
 
+	it('fails a write whose embedding comes back empty, before taking any lock', async () => {
+		const embed = models.embed;
+		models.embed = async () => [new Float32Array(0)];
+		__test.lockLog.length = 0;
+		try {
+			await assert.rejects(putMemory(DEFAULT_ID, validInput(), alice, context), /returned no vector/);
+		} finally {
+			models.embed = embed;
+		}
+		assert.deepEqual(__test.lockLog, []);
+	});
+
 	it('keeps the stored vector when a revise leaves the content and model unchanged', async () => {
 		const { memory } = await putMemory(DEFAULT_ID, validInput(), alice, context);
 		models.calls.length = 0;
