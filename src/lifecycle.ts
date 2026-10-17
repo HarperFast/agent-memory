@@ -1,8 +1,10 @@
 import { databases, models, transaction } from 'harper';
-import { badRequest, memoryError, notFound } from './errors.ts';
+import { badRequest, isCallerSafe, memoryError, notFound, type MemoryError } from './errors.ts';
+import { activeDependentIds, CLEARED_REVIEW, flagDependents, forReader } from './provenance.ts';
 import { assertWritable, canRead, isSuperset, normalizeScopes, type Principal } from './scopes.ts';
-import { DEFAULT_EMBEDDING_MODEL, getSettings, type Settings } from './settings.ts';
+import { DEFAULT_EMBEDDING_MODEL, getSettings } from './settings.ts';
 import { hasSinks, notifySinks } from './sinks.ts';
+import { type Candidate, findCandidates, judgeCandidates, toCandidates } from './supersession.ts';
 
 export const STATUS_ACTIVE = 'active';
 export const STATUS_SUPERSEDED = 'superseded';
@@ -24,6 +26,10 @@ export const WITHDRAW_REASON_MAX_CHARS = 500;
 const SUPERSEDES_MAX_ITEMS = 10;
 export const BOOTSTRAP_PINNED_LIMIT = 50;
 const MEMORY_ID = /^[A-Za-z0-9_-]{16,64}$/;
+// An import writes up to 100 rows, and a transition flags every citer, inside one transaction; Harper's default
+// 30 s lease could lapse before commit.
+export const LONG_LOCK_LEASE_MS = 5 * 60_000;
+const LOCK_PLAN_ATTEMPTS = 3;
 
 const PUT_FIELDS = ['title', 'content', 'tags', 'scopes', 'visibility', 'evidence', 'validUntil', 'supersedes'];
 const WITHDRAW_FIELDS = ['reason'];
@@ -260,7 +266,10 @@ export function toMemoryView(record: any): MemoryView {
 		evidence: (record.evidence ?? []).map((item: any) => ({ ...item })),
 		evidenceMemoryIds: [...(record.evidenceMemoryIds ?? [])],
 		supersedes: [...(record.supersedes ?? [])],
+		autoSupersedes: [...(record.autoSupersedes ?? [])],
 		supersededBy: record.supersededBy ?? null,
+		needsReview: record.needsReview ? { ...record.needsReview } : null,
+		confirmed: record.confirmed ? { ...record.confirmed } : null,
 		author: record.author ?? null,
 		lastEditor: record.lastEditor ?? null,
 		validUntil: iso(record.validUntil),
@@ -273,10 +282,12 @@ export function toMemoryView(record: any): MemoryView {
 
 const embedderInstalled = new WeakSet<object>();
 
-// The row's own `embeddingModel` names the model, so the vector and the tag the vector lane filters on are
+// Every plugin write carries the vector it embedded before its transaction; a write that carries none is
+// embedded here with the model recorded on the row, so the vector and the tag the vector lane filters on are
 // always from the same write.
 async function embedWithRecordModel(record: any, hook?: { signal?: AbortSignal }) {
 	if (record.content == null) return null;
+	if (Array.isArray(record.embedding) && record.embedding.length > 0) return record.embedding;
 	const [vector] = await models.embed(String(record.content), {
 		model: record.embeddingModel ?? DEFAULT_EMBEDDING_MODEL,
 		inputType: 'document',
@@ -285,11 +296,31 @@ async function embedWithRecordModel(record: any, hook?: { signal?: AbortSignal }
 	return vector ? Array.from(vector) : undefined;
 }
 
-/** The schema's @embed hook already uses "default"; any other model needs the per-table override. */
-export function ensureEmbedder(Memory: any, settings: Settings): void {
-	if (settings.embeddingModel === DEFAULT_EMBEDDING_MODEL || embedderInstalled.has(Memory)) return;
+export function ensureEmbedder(Memory: any): void {
+	if (embedderInstalled.has(Memory)) return;
 	Memory.setEmbedAttribute('embedding', embedWithRecordModel);
 	embedderInstalled.add(Memory);
+}
+
+export async function embedContents(contents: string[], model: string): Promise<number[][]> {
+	const vectors = await models.embed(contents, { model, inputType: 'document' });
+	// The table's embedder would embed again, under the write's locks, for a missing or empty vector.
+	if (vectors?.length !== contents.length || vectors.some((vector) => !vector?.length)) {
+		throw new Error(`embedding model "${model}" returned no vector`);
+	}
+	return vectors.map((vector) => Array.from(vector));
+}
+
+async function embedContent(content: string, model: string): Promise<number[]> {
+	return (await embedContents([content], model))[0];
+}
+
+/** The transaction is about to write content it holds no vector for; embedding it there would hold the locks. */
+export class VectorNeeded {
+	readonly ids: string[];
+	constructor(ids: string[] = []) {
+		this.ids = ids;
+	}
 }
 
 /**
@@ -299,7 +330,7 @@ export function ensureEmbedder(Memory: any, settings: Settings): void {
  * database fails closed unless the cluster has opted into replicated record locks; across nodes, concurrent
  * revisions are therefore not serialized (replication keeps the later write).
  */
-export async function lockRows(Memory: any, ids: Iterable<string>, context: object, lease?: number): Promise<void> {
+async function lockRows(Memory: any, ids: Iterable<string>, context: object, lease?: number): Promise<void> {
 	const options = lease ? { scope: 'node', lease } : { scope: 'node' };
 	for (const id of [...new Set(ids)].sort()) await Memory.lock(id, options, context);
 }
@@ -309,15 +340,104 @@ export async function lockRows(Memory: any, ids: Iterable<string>, context: obje
  * the resource turns into a response commit whatever had been staged before it. The new context carries the
  * user so Harper's audit log still attributes the write.
  */
-export function inOwnTransaction<T>(requestContext: any, operation: (context: object) => Promise<T>): Promise<T> {
+function inOwnTransaction<T>(requestContext: any, operation: (context: object) => Promise<T>): Promise<T> {
 	const context = { user: requestContext?.user };
 	return transaction(context, () => operation(context)) as Promise<T>;
+}
+
+export interface LockPlan {
+	/** Aborts the attempt unless every id is already locked; the next attempt locks them up front. */
+	require(ids: Iterable<string>): void;
+}
+
+class LockPlanStale {
+	readonly ids: string[];
+	constructor(ids: string[]) {
+		this.ids = ids;
+	}
+}
+
+/**
+ * Runs `operation` in its own transaction after locking every planned Memory row. Rows the operation discovers
+ * it must change (a dependent, a `supersedes` populated after planning) go through `locks.require` before they
+ * are read or written; an unplanned one aborts the attempt and the next locks the union in one sorted pass, so
+ * no operation ever waits for a lock while holding one out of order.
+ */
+export async function withLockPlan<T>(
+	requestContext: object,
+	planned: Iterable<string>,
+	operation: (context: object, locks: LockPlan) => Promise<T>,
+	lease?: number,
+): Promise<T> {
+	const Memory = memoryTable();
+	const plan = new Set(planned);
+	for (let attempt = 1; ; attempt++) {
+		try {
+			return await inOwnTransaction(requestContext, async (txn) => {
+				await lockRows(Memory, plan, txn, lease);
+				return operation(txn, {
+					require(ids) {
+						const missing = [...ids].filter((id) => !plan.has(id));
+						if (missing.length > 0) throw new LockPlanStale(missing);
+					},
+				});
+			});
+		} catch (error) {
+			if (!(error instanceof LockPlanStale)) throw error;
+			if (attempt === LOCK_PLAN_ATTEMPTS) {
+				throw memoryError('Memories this operation changes kept changing; retry shortly', 503, 'unavailable');
+			}
+			for (const id of error.ids) plan.add(id);
+		}
+	}
 }
 
 export async function getMemory(id: string, principal: Principal, context?: object) {
 	const record = isMemoryId(id) ? await memoryTable().get(id, context) : undefined;
 	if (!record || !canRead(record, principal)) return undefined;
-	return toMemoryView(record);
+	return (await forReader([toMemoryView(record)], principal, context))[0];
+}
+
+function staleWrite(ifMatch: string, revision: number): MemoryError {
+	return memoryError(
+		`Stale write: If-Match ${ifMatch} does not match current revision ${revision}`,
+		412,
+		'precondition_failed',
+	);
+}
+
+/** The explicit-supersede rules. Returned rather than thrown so an auto candidate that fails one is only reported. */
+function supersedeRefusal(target: any, scopes: readonly string[], principal: Principal): MemoryError | undefined {
+	// Same 404 as a missing id, so supersedes is not a probe for another principal's memory.
+	if (!target || !canRead(target, principal)) return notFound();
+	if (target.status === STATUS_WITHDRAWN) return memoryError('Memory has been withdrawn', 409, 'memory_withdrawn');
+	if (!isSuperset(scopes, target.scopes ?? [])) {
+		return memoryError(
+			'A superseding memory must carry every scope label of the memory it supersedes',
+			403,
+			'supersede_scope_narrowing',
+		);
+	}
+	return undefined;
+}
+
+function plannedScopes(
+	payload: Record<string, any>,
+	principal: Principal,
+	ownerId: string,
+	current?: string[],
+): string[] | undefined {
+	try {
+		const scopes =
+			current && payload.scopes == null && payload.visibility == null
+				? current
+				: normalizeScopes(payload.scopes, payload.visibility, ownerId);
+		assertWritable(scopes, principal);
+		return scopes;
+	} catch (error) {
+		if (isCallerSafe(error)) return undefined;
+		throw error;
+	}
 }
 
 export async function putMemory(id: unknown, input: unknown, principal: Principal, requestContext: object = {}) {
@@ -354,181 +474,358 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 	const ifNoneMatch = getHeader(requestContext, 'if-none-match');
 
 	const Memory = memoryTable();
-	ensureEmbedder(Memory, settings);
+	ensureEmbedder(Memory);
+	const { supersession } = settings;
 
-	return inOwnTransaction(requestContext, async (txn) => {
-		await lockRows(Memory, [id, ...supersedes], txn);
-		const existing = await Memory.get(id, txn);
-		if (existing) {
-			if (existing.ownerId !== principal.id && !principal.superUser) {
-				if (!canRead(existing, principal)) {
-					throw memoryError('Memory id is not available', 409, 'id_unavailable');
-				}
-				throw memoryError('Only the owner can modify this memory', 403, 'not_memory_owner');
-			}
-			if (ifNoneMatch !== undefined && matchesIfNoneMatch(ifNoneMatch, existing.revision)) {
-				throw memoryError('Precondition failed: memory already exists', 412, 'precondition_failed');
-			}
-			if (existing.status === STATUS_WITHDRAWN) {
-				throw memoryError('Memory has been withdrawn', 409, 'memory_withdrawn');
-			}
+	// Planning runs again when the transaction finds the pre-read overtaken; `reembed` then guarantees a vector.
+	const newCitations = (record: any): string[] =>
+		(parsedEvidenceMemoryIds ?? []).filter((refId) => !(record?.evidenceMemoryIds ?? []).includes(refId));
+	const plan = async (reembed: boolean) => {
+		// Planning runs only for what looks like a permitted write, so a refused or no-op PUT never pays for an
+		// embedding, a judge call or a citer fan-out. The transaction re-checks everything under its locks.
+		const preExisting = await Memory.get(id, requestContext);
+		const cited = await Promise.all((parsedEvidenceMemoryIds ?? []).map((refId) => Memory.get(refId, requestContext)));
+		const citedReadable = cited.every((record) => record && canRead(record, principal));
+		const createScopes =
+			!preExisting && ifMatch === undefined && parsedTitle !== undefined && parsedContent !== undefined && citedReadable
+				? plannedScopes(payload, principal, principal.id)
+				: undefined;
+		const refused = (target: any) => supersedeRefusal(target, createScopes!, principal) !== undefined;
+		const explicitTargets = createScopes
+			? await Promise.all(supersedes.map((targetId) => Memory.get(targetId, requestContext)))
+			: [];
+		const planningCreate = createScopes !== undefined && !explicitTargets.some(refused);
+		const mayRevise =
+			preExisting &&
+			ifMatch !== undefined &&
+			matchesIfMatch(ifMatch, preExisting.revision) &&
+			(ifNoneMatch === undefined || !matchesIfNoneMatch(ifNoneMatch, preExisting.revision)) &&
+			payload.supersedes === undefined &&
+			(preExisting.ownerId === principal.id || principal.superUser) &&
+			preExisting.status === STATUS_ACTIVE &&
+			citedReadable &&
+			plannedScopes(payload, principal, preExisting.ownerId, preExisting.scopes) !== undefined;
+		const writesContent =
+			parsedContent !== undefined &&
+			(planningCreate ||
+				(mayRevise &&
+					(parsedContent !== preExisting.content || preExisting.embeddingModel !== settings.embeddingModel)));
+		const vector = writesContent || reembed ? await embedContent(parsedContent!, settings.embeddingModel) : undefined;
+		// supersedes never changes after create, so auto verdicts must exist before the create commits.
+		const proposals =
+			planningCreate && supersession.mode === 'auto'
+				? await judgeCandidates(
+						{ title: parsedTitle!, content: parsedContent! },
+						await findCandidates(
+							{
+								vector,
+								embeddingModel: settings.embeddingModel,
+								scopes: createScopes!,
+								excludeIds: [id, ...supersedes],
+							},
+							principal,
+							supersession.similarity,
+							requestContext,
+						),
+						supersession.judge,
+					)
+				: undefined;
+		const autoTargets = (proposals ?? []).filter(
+			(match) => match.verdict === 'supersedes' && !supersedes.includes(match.id),
+		);
+		let plannedDependents: string[] = [];
+		if (planningCreate && supersedes.length + autoTargets.length > 0) {
+			const transitioning = [...explicitTargets, ...autoTargets].filter(
+				(target) => target?.status === STATUS_ACTIVE && !refused(target),
+			);
+			plannedDependents = await activeDependentIds(
+				Memory,
+				transitioning.map((target) => target.id),
+				requestContext,
+			);
+		}
+		const citedLocks = planningCreate || mayRevise ? newCitations(preExisting) : [];
+		return { planningCreate, vector, proposals, autoTargets, plannedDependents, citedLocks };
+	};
 
-			// A private shorthand on an existing memory resolves against the owner, not a super_user editing on their behalf.
-			const resolvedScopes = scopesRequested
-				? payload.scopes == null
-					? normalizeScopes(undefined, payload.visibility, existing.ownerId)
-					: normalizeScopes(payload.scopes, payload.visibility, existing.ownerId)
-				: ifMatch !== undefined
-					? (existing.scopes ?? [])
-					: normalizeScopes(undefined, undefined, existing.ownerId);
+	const write = (planned: Awaited<ReturnType<typeof plan>>) =>
+		withLockPlan(
+			requestContext,
+			[
+				id,
+				...(planned.planningCreate ? supersedes : []),
+				...planned.autoTargets.map((match) => match.id),
+				// A new citation serializes with the cited memory's supersede or withdrawal, so a citer is either flagged
+				// by it or reads the source's new status. A citation the row already has is in the index, where a
+				// transition finds the citer and locks it. A write the cheap checks refuse locks none of them.
+				...planned.citedLocks,
+				...planned.plannedDependents,
+			],
+			async (txn, locks) => {
+				const existing = await Memory.get(id, txn);
+				if (existing) {
+					if (existing.ownerId !== principal.id && !principal.superUser) {
+						if (!canRead(existing, principal)) {
+							throw memoryError('Memory id is not available', 409, 'id_unavailable');
+						}
+						throw memoryError('Only the owner can modify this memory', 403, 'not_memory_owner');
+					}
+					if (ifNoneMatch !== undefined && matchesIfNoneMatch(ifNoneMatch, existing.revision)) {
+						throw memoryError('Precondition failed: memory already exists', 412, 'precondition_failed');
+					}
+					if (existing.status === STATUS_WITHDRAWN) {
+						throw memoryError('Memory has been withdrawn', 409, 'memory_withdrawn');
+					}
 
-			const candidate = {
-				title: parsedTitle !== undefined ? parsedTitle : ifMatch !== undefined ? (existing.title ?? null) : undefined,
-				content: parsedContent !== undefined ? parsedContent : ifMatch !== undefined ? existing.content : undefined,
-				tags: parsedTags !== undefined ? parsedTags : ifMatch !== undefined ? (existing.tags ?? []) : [],
-				scopes: resolvedScopes,
-				evidence:
-					parsedEvidence !== undefined ? parsedEvidence : ifMatch !== undefined ? (existing.evidence ?? []) : [],
-				validUntil:
-					parsedValidUntil !== undefined
-						? parsedValidUntil
+					// A private shorthand on an existing memory resolves against the owner, not a super_user editing on their behalf.
+					const resolvedScopes = scopesRequested
+						? payload.scopes == null
+							? normalizeScopes(undefined, payload.visibility, existing.ownerId)
+							: normalizeScopes(payload.scopes, payload.visibility, existing.ownerId)
 						: ifMatch !== undefined
-							? (existing.validUntil ?? null)
-							: null,
-			};
+							? (existing.scopes ?? [])
+							: normalizeScopes(undefined, undefined, existing.ownerId);
 
-			const supersedesAllowed =
-				payload.supersedes === undefined ||
-				(ifMatch === undefined && sameStringArray(existing.supersedes ?? [], supersedes));
-			if (sameEditableFields(existing, candidate) && supersedesAllowed) {
-				if (ifMatch !== undefined && !matchesIfMatch(ifMatch, existing.revision)) {
-					throw memoryError(
-						`Stale write: If-Match ${ifMatch} does not match current revision ${existing.revision}`,
-						412,
-						'precondition_failed',
+					const candidate = {
+						title:
+							parsedTitle !== undefined ? parsedTitle : ifMatch !== undefined ? (existing.title ?? null) : undefined,
+						content: parsedContent !== undefined ? parsedContent : ifMatch !== undefined ? existing.content : undefined,
+						tags: parsedTags !== undefined ? parsedTags : ifMatch !== undefined ? (existing.tags ?? []) : [],
+						scopes: resolvedScopes,
+						evidence:
+							parsedEvidence !== undefined ? parsedEvidence : ifMatch !== undefined ? (existing.evidence ?? []) : [],
+						validUntil:
+							parsedValidUntil !== undefined
+								? parsedValidUntil
+								: ifMatch !== undefined
+									? (existing.validUntil ?? null)
+									: null,
+					};
+
+					// The links the author sent: an identical retry of an auto-mode create carries only those.
+					const authoredSupersedes = (existing.supersedes ?? []).filter(
+						(targetId: string) => !(existing.autoSupersedes ?? []).includes(targetId),
+					);
+					const supersedesAllowed =
+						payload.supersedes === undefined ||
+						(ifMatch === undefined && sameStringArray(authoredSupersedes, supersedes));
+					if (sameEditableFields(existing, candidate) && supersedesAllowed) {
+						if (ifMatch !== undefined && !matchesIfMatch(ifMatch, existing.revision)) {
+							throw staleWrite(ifMatch, existing.revision);
+						}
+						return { created: false, textChanged: false, written: captureWritten(existing) };
+					}
+
+					if (payload.supersedes !== undefined) {
+						throw badRequest('supersedes is only allowed when creating a memory', 'supersedes_not_allowed');
+					}
+					if (ifMatch === undefined) {
+						throw memoryError('If-Match header is required to revise an existing memory', 428, 'if_match_required');
+					}
+					if (!matchesIfMatch(ifMatch, existing.revision)) throw staleWrite(ifMatch, existing.revision);
+					// Frozen, so `replacement.scopes ⊇ superseded.scopes` keeps holding after the supersede, not only at it.
+					if (existing.status === STATUS_SUPERSEDED) {
+						throw memoryError('Memory has been superseded', 409, 'memory_superseded');
+					}
+
+					// The resulting scopes, not only changed ones: revising a memory that stays global keeps publishing
+					// it globally.
+					assertWritable(candidate.scopes, principal);
+					if (scopesRequested) await assertStillCoversSuperseded(Memory, existing, candidate.scopes, txn);
+					if (parsedEvidenceMemoryIds !== undefined) {
+						await assertReadableEvidence(Memory, parsedEvidenceMemoryIds, principal, txn);
+					}
+					const contentChanged =
+						parsedContent !== undefined &&
+						(parsedContent !== existing.content || existing.embeddingModel !== settings.embeddingModel);
+					if (contentChanged && planned.vector === undefined) throw new VectorNeeded();
+					locks.require(newCitations(existing));
+					const changes: Record<string, any> = {
+						...(parsedTitle !== undefined && { title: parsedTitle }),
+						...(contentChanged && {
+							content: parsedContent,
+							embedding: planned.vector,
+							embeddingModel: settings.embeddingModel,
+						}),
+						...(parsedTags !== undefined && { tags: parsedTags }),
+						...(scopesRequested && { scopes: candidate.scopes }),
+						...(parsedEvidence !== undefined && {
+							evidence: parsedEvidence,
+							evidenceMemoryIds: parsedEvidenceMemoryIds,
+						}),
+						...(parsedValidUntil !== undefined && { validUntil: parsedValidUntil }),
+						// A revision is the owner's review: it clears a flag without re-flagging this memory's own citers.
+						...(existing.needsReview && CLEARED_REVIEW),
+						revision: existing.revision + 1,
+						lastEditor: { principalId: principal.id, source: principal.source, revisedAt: new Date().toISOString() },
+					};
+					// patch, not put: a put would echo @updatedTime back as a caller-supplied value.
+					await Memory.patch(existing.id, changes, txn);
+					const revised = await Memory.get(existing.id, txn);
+					if (hasSinks()) {
+						await notifySinks('write', toMemoryView(revised), txn);
+					}
+					const textChanged = contentChanged || (parsedTitle !== undefined && parsedTitle !== existing.title);
+					return { created: false, textChanged, written: captureWritten(revised) };
+				}
+
+				if (ifMatch !== undefined) {
+					throw memoryError('Precondition failed: memory does not exist', 412, 'precondition_failed');
+				}
+				const title = boundedText(payload.title, 'title', settings.titleChars, true)!;
+				const content = boundedText(payload.content, 'content', settings.contentChars, true)!;
+				const scopes = normalizeScopes(payload.scopes, payload.visibility, principal.id);
+				assertWritable(scopes, principal);
+				const tags = parsedTags ?? [];
+				const evidence = parsedEvidence ?? [];
+				const evidenceMemoryIds = parsedEvidenceMemoryIds ?? [];
+				const validUntil = parsedValidUntil ?? null;
+
+				await assertReadableEvidence(Memory, evidenceMemoryIds, principal, txn);
+				const now = new Date();
+				// Refusals are decided before anything joins the lock set, so a refused create locks nothing it names;
+				// rows read here are re-read under their locks on the attempt the require below restarts into.
+				const targets = [];
+				for (const targetId of supersedes) {
+					const target = await Memory.get(targetId, txn);
+					const refusal = supersedeRefusal(target, scopes, principal);
+					if (refusal) throw refusal;
+					targets.push(target);
+				}
+				const applied: string[] = [];
+				for (const proposal of planned.autoTargets) {
+					const target = await Memory.get(proposal.id, txn);
+					// The judge compared this revision; a later one is content it never saw.
+					if (target?.revision !== proposal.revision || supersedeRefusal(target, scopes, principal)) continue;
+					targets.push(target);
+					applied.push(target.id);
+				}
+				const pointers = [];
+				for (const target of targets) {
+					// The newest superseder wins the pointer, which is not necessarily this one: an imported superseder can
+					// carry a later createdAt, and two creates can share a millisecond.
+					const current = await newestSuperseder(Memory, target.id, txn);
+					const supersededBy = current && compareNewest(current, { id, createdAt: now }) > 0 ? current.id : id;
+					pointers.push({ target, supersededBy });
+				}
+				// Superseding an already superseded memory is not a transition: its citers were flagged the first time.
+				const transitions = pointers.filter(({ target }) => target.status === STATUS_ACTIVE);
+				const citers = new Map<string, string[]>();
+				for (const { target } of transitions) {
+					citers.set(target.id, await activeDependentIds(Memory, [target.id], txn));
+				}
+				if (planned.vector === undefined) throw new VectorNeeded();
+				locks.require([...evidenceMemoryIds, ...supersedes, ...[...citers.values()].flat()]);
+
+				await Memory.put(
+					{
+						id,
+						title,
+						content,
+						embedding: planned.vector,
+						tags,
+						scopes,
+						ownerId: principal.id,
+						status: STATUS_ACTIVE,
+						revision: 1,
+						evidence,
+						evidenceMemoryIds,
+						supersedes: [...supersedes, ...applied],
+						autoSupersedes: applied,
+						supersededBy: null,
+						...CLEARED_REVIEW,
+						confirmed: null,
+						createdAt: now,
+						author: { principalId: principal.id, source: principal.source, authoredAt: now.toISOString() },
+						lastEditor: null,
+						validUntil,
+						withdrawnAt: null,
+						withdrawnReason: null,
+						embeddingModel: settings.embeddingModel,
+					},
+					txn,
+				);
+				for (const { target, supersededBy } of pointers) {
+					await Memory.patch(
+						target.id,
+						{ status: STATUS_SUPERSEDED, supersededBy, revision: target.revision + 1 },
+						txn,
 					);
 				}
-				return { id, revision: existing.revision, created: false, memory: toMemoryView(existing) };
-			}
-
-			if (payload.supersedes !== undefined) {
-				throw badRequest('supersedes is only allowed when creating a memory', 'supersedes_not_allowed');
-			}
-			if (ifMatch === undefined) {
-				throw memoryError('If-Match header is required to revise an existing memory', 428, 'if_match_required');
-			}
-			if (!matchesIfMatch(ifMatch, existing.revision)) {
-				throw memoryError(
-					`Stale write: If-Match ${ifMatch} does not match current revision ${existing.revision}`,
-					412,
-					'precondition_failed',
-				);
-			}
-			// Frozen, so `replacement.scopes ⊇ superseded.scopes` keeps holding after the supersede, not only at it.
-			if (existing.status === STATUS_SUPERSEDED) {
-				throw memoryError('Memory has been superseded', 409, 'memory_superseded');
-			}
-
-			// The resulting scopes, not only changed ones: revising a memory that stays global keeps publishing
-			// it globally.
-			assertWritable(candidate.scopes, principal);
-			if (scopesRequested) await assertStillCoversSuperseded(Memory, existing, candidate.scopes, txn);
-			if (parsedEvidenceMemoryIds !== undefined) {
-				await assertReadableEvidence(Memory, parsedEvidenceMemoryIds, principal, txn);
-			}
-
-			const nextRevision = existing.revision + 1;
-			const changes: Record<string, any> = {
-				...(parsedTitle !== undefined && { title: parsedTitle }),
-				...(parsedContent !== undefined && { content: parsedContent, embeddingModel: settings.embeddingModel }),
-				...(parsedTags !== undefined && { tags: parsedTags }),
-				...(scopesRequested && { scopes: candidate.scopes }),
-				...(parsedEvidence !== undefined && {
-					evidence: parsedEvidence,
-					evidenceMemoryIds: parsedEvidenceMemoryIds,
-				}),
-				...(parsedValidUntil !== undefined && { validUntil: parsedValidUntil }),
-				revision: nextRevision,
-				lastEditor: { principalId: principal.id, source: principal.source, revisedAt: new Date().toISOString() },
-			};
-			// patch, not put: a put would echo @updatedTime back as a caller-supplied value.
-			await Memory.patch(existing.id, changes, txn);
-			const memory = toMemoryView(await Memory.get(existing.id, txn));
-			if (hasSinks()) {
-				await notifySinks('write', memory, txn);
-			}
-			return { id, revision: nextRevision, created: false, memory };
-		}
-
-		if (ifMatch !== undefined) {
-			throw memoryError('Precondition failed: memory does not exist', 412, 'precondition_failed');
-		}
-		const title = boundedText(payload.title, 'title', settings.titleChars, true)!;
-		const content = boundedText(payload.content, 'content', settings.contentChars, true)!;
-		const scopes = normalizeScopes(payload.scopes, payload.visibility, principal.id);
-		assertWritable(scopes, principal);
-		const tags = parsedTags ?? [];
-		const evidence = parsedEvidence ?? [];
-		const evidenceMemoryIds = parsedEvidenceMemoryIds ?? [];
-		const validUntil = parsedValidUntil ?? null;
-
-		await assertReadableEvidence(Memory, evidenceMemoryIds, principal, txn);
-		const now = new Date();
-		const targets = [];
-		for (const targetId of supersedes) {
-			const target = await Memory.get(targetId, txn);
-			// Same 404 as a missing id, so supersedes is not a probe for another principal's memory.
-			if (!target || !canRead(target, principal)) throw notFound();
-			if (target.status === STATUS_WITHDRAWN) throw memoryError('Memory has been withdrawn', 409, 'memory_withdrawn');
-			if (!isSuperset(scopes, target.scopes ?? [])) {
-				throw memoryError(
-					'A superseding memory must carry every scope label of the memory it supersedes',
-					403,
-					'supersede_scope_narrowing',
-				);
-			}
-			// The newest superseder wins the pointer, which is not necessarily this one: an imported superseder can
-			// carry a later createdAt, and two creates can share a millisecond.
-			const current = await newestSuperseder(Memory, targetId, txn);
-			const supersededBy = current && compareNewest(current, { id, createdAt: now }) > 0 ? current.id : id;
-			targets.push({ target, supersededBy });
-		}
-
-		await Memory.put(
-			{
-				id,
-				title,
-				content,
-				tags,
-				scopes,
-				ownerId: principal.id,
-				status: STATUS_ACTIVE,
-				revision: 1,
-				evidence,
-				evidenceMemoryIds,
-				supersedes,
-				supersededBy: null,
-				createdAt: now,
-				author: { principalId: principal.id, source: principal.source, authoredAt: now.toISOString() },
-				lastEditor: null,
-				validUntil,
-				withdrawnAt: null,
-				withdrawnReason: null,
-				embeddingModel: settings.embeddingModel,
+				const flagged: string[] = [];
+				for (const { target, supersededBy } of transitions) {
+					flagged.push(
+						...(await flagDependents(
+							Memory,
+							{ id: target.id, replacementId: supersededBy },
+							'superseded',
+							citers.get(target.id)!,
+							txn,
+							now,
+						)),
+					);
+				}
+				// Re-read inside the transaction: @updatedTime is applied by the database.
+				const created = await Memory.get(id, txn);
+				if (hasSinks()) {
+					await notifySinks('write', toMemoryView(created), txn);
+					for (const changedId of [...pointers.map(({ target }) => target.id), ...flagged]) {
+						await notifySinks('write', toMemoryView(await Memory.get(changedId, txn)), txn);
+					}
+				}
+				return { created: true, textChanged: true, written: captureWritten(created), applied };
 			},
-			txn,
+			supersedes.length + planned.autoTargets.length > 0 ? LONG_LOCK_LEASE_MS : undefined,
 		);
-		for (const { target, supersededBy } of targets) {
-			await Memory.patch(target.id, { status: STATUS_SUPERSEDED, supersededBy, revision: target.revision + 1 }, txn);
-		}
-		// Re-read inside the transaction: @updatedTime is applied by the database.
-		const memory = toMemoryView(await Memory.get(id, txn));
-		if (hasSinks()) {
-			await notifySinks('write', memory, txn);
-			for (const { target } of targets) await notifySinks('write', toMemoryView(await Memory.get(target.id, txn)), txn);
-		}
-		return { id, revision: 1, created: true, memory };
-	});
+	let planned = await plan(false);
+	let outcome;
+	try {
+		outcome = await write(planned);
+	} catch (error) {
+		// Another writer changed the row after the pre-read: plan again, embedding outside the locks, and retry.
+		if (!(error instanceof VectorNeeded)) throw error;
+		planned = await plan(true);
+		outcome = await write(planned);
+	}
+	const { proposals } = planned;
+
+	const { memory } = outcome.written;
+	const [view] = await forReader([memory], principal, requestContext);
+	if (supersession.mode === 'off') {
+		return { id, revision: memory.revision as number, created: outcome.created, memory: view, candidates: [] };
+	}
+	// A concurrent identical create can win the id after this request judged; its proposals then describe nothing.
+	const decided = 'applied' in outcome ? proposals : undefined;
+	const matches =
+		decided ??
+		(await judgeCandidates(
+			memory,
+			await findCandidates(
+				{
+					vector: outcome.written.vector,
+					embeddingModel: outcome.written.embeddingModel,
+					scopes: memory.scopes as string[],
+					excludeIds: [id, ...(memory.supersedes as string[])],
+				},
+				principal,
+				supersession.similarity,
+				requestContext,
+			),
+			outcome.textChanged ? supersession.judge : undefined,
+		));
+	const candidates: Candidate[] = toCandidates(
+		matches,
+		decided && 'applied' in outcome ? new Set(outcome.applied) : undefined,
+	);
+	return { id, revision: memory.revision as number, created: outcome.created, memory: view, candidates };
+}
+
+function captureWritten(record: any) {
+	return {
+		memory: toMemoryView(record),
+		vector: record.embedding ? Array.from(record.embedding as ArrayLike<number>) : undefined,
+		embeddingModel: (record.embeddingModel ?? DEFAULT_EMBEDDING_MODEL) as string,
+	};
 }
 
 async function assertStillCoversSuperseded(Memory: any, existing: any, scopes: string[], context: object) {
@@ -613,24 +910,26 @@ export async function withdrawMemory(
 	if (!isMemoryId(id)) throw notFound();
 	const ifMatch = getHeader(requestContext, 'if-match');
 	const Memory = memoryTable();
-	// A withdrawal also changes the memories it superseded. `supersedes` never changes after create, so a
-	// pre-transaction read plans the lock set and lockRows is the first operation inside the transaction. If the
-	// row was created with `supersedes` between that pre-read and lockRows, abort and retry once with the observed
-	// `supersedes` list so every superseded target is locked before `reconcileSuperseded` runs.
+	// A withdrawal also changes the memories it superseded (`supersedes` never changes after create) and flags the
+	// memories citing it, so a pre-transaction read plans the lock set. Only a withdrawal the caller may make reaches
+	// the dependent fan-out, so a refused request never locks the citation graph.
 	const planned = await Memory.get(id, requestContext);
-	let plannedSupersedes: string[] = planned?.supersedes ?? [];
-	let retrySupersedes: string[] | undefined;
-	const retryLockPlan = Symbol('retryLockPlan');
+	const mayWithdraw =
+		planned &&
+		ifMatch !== undefined &&
+		matchesIfMatch(ifMatch, planned.revision) &&
+		planned.status !== STATUS_WITHDRAWN &&
+		(planned.ownerId === principal.id || principal.superUser);
+	const plan = mayWithdraw
+		? [id, ...(planned.supersedes ?? []), ...(await activeDependentIds(Memory, [id], requestContext))]
+		: [id];
 
-	const runAttempt = () =>
-		inOwnTransaction(requestContext, async (txn) => {
-			await lockRows(Memory, [id, ...plannedSupersedes], txn);
+	return withLockPlan(
+		requestContext,
+		plan,
+		async (txn, locks) => {
 			const existing = await Memory.get(id, txn);
 			if (!existing) throw notFound();
-			if ((existing.supersedes ?? []).some((targetId: string) => !plannedSupersedes.includes(targetId))) {
-				retrySupersedes = existing.supersedes;
-				throw retryLockPlan;
-			}
 			// A caller that cannot read the memory gets the same 404 as a missing one, so a write attempt does not
 			// confirm another principal's memory exists. One that can read it gets an informative 403.
 			if (existing.ownerId !== principal.id && !principal.superUser) {
@@ -643,41 +942,83 @@ export async function withdrawMemory(
 			if (existing.status === STATUS_WITHDRAWN) {
 				throw memoryError('Memory has been withdrawn', 409, 'memory_withdrawn');
 			}
-			if (!matchesIfMatch(ifMatch, existing.revision)) {
-				throw memoryError(
-					`Stale write: If-Match ${ifMatch} does not match current revision ${existing.revision}`,
-					412,
-					'precondition_failed',
-				);
-			}
+			if (!matchesIfMatch(ifMatch, existing.revision)) throw staleWrite(ifMatch, existing.revision);
+			const citers = await activeDependentIds(Memory, [id], txn);
+			locks.require([...(existing.supersedes ?? []), ...citers]);
 
-			// Withdrawal is exempt from assertWritable — locking an owner out of retracting would be worse.
-			const changes = {
-				status: STATUS_WITHDRAWN,
-				withdrawnAt: new Date(),
-				withdrawnReason: reason ?? null,
-				revision: existing.revision + 1,
-			};
+			const now = new Date();
 			const restored = await reconcileSuperseded(Memory, existing, txn);
+			// Withdrawal is exempt from assertWritable — locking an owner out of retracting would be worse.
 			// patch, not put: a put would echo @updatedTime back as a caller-supplied value.
-			await Memory.patch(existing.id, changes, txn);
+			await Memory.patch(
+				existing.id,
+				{
+					status: STATUS_WITHDRAWN,
+					withdrawnAt: now,
+					withdrawnReason: reason ?? null,
+					revision: existing.revision + 1,
+				},
+				txn,
+			);
+			// A memory this withdrawal restored can cite it too; the index does not show the restore yet.
+			const flagged = await flagDependents(
+				Memory,
+				{ id: existing.id, replacementId: existing.supersededBy ?? undefined },
+				'withdrawn',
+				[...citers, ...restored],
+				txn,
+				now,
+			);
 			const memory = toMemoryView(await Memory.get(existing.id, txn));
 			if (hasSinks()) {
 				await notifySinks('withdraw', memory, txn);
-				for (const targetId of restored) {
-					await notifySinks('write', toMemoryView(await Memory.get(targetId, txn)), txn);
+				for (const changedId of new Set([...restored, ...flagged])) {
+					await notifySinks('write', toMemoryView(await Memory.get(changedId, txn)), txn);
 				}
 			}
-			return memory;
-		});
+			return (await forReader([memory], principal, txn))[0];
+		},
+		LONG_LOCK_LEASE_MS,
+	);
+}
 
-	try {
-		return await runAttempt();
-	} catch (error) {
-		if (error !== retryLockPlan) throw error;
-		plannedSupersedes = retrySupersedes ?? [];
-		return await runAttempt();
-	}
+export async function confirmMemory(
+	id: unknown,
+	input: unknown = {},
+	principal: Principal,
+	requestContext: object = {},
+) {
+	rejectUnknownFields(input, [], 'confirm');
+	if (!isMemoryId(id)) throw notFound();
+	const ifMatch = getHeader(requestContext, 'if-match');
+	const Memory = memoryTable();
+	return withLockPlan(requestContext, [id], async (txn) => {
+		const existing = await Memory.get(id, txn);
+		if (!existing) throw notFound();
+		if (existing.ownerId !== principal.id && !principal.superUser) {
+			if (!canRead(existing, principal)) throw notFound();
+			throw memoryError('Only the owner can modify this memory', 403, 'not_memory_owner');
+		}
+		if (existing.status === STATUS_WITHDRAWN) throw memoryError('Memory has been withdrawn', 409, 'memory_withdrawn');
+		if (existing.status === STATUS_SUPERSEDED) {
+			throw memoryError('Memory has been superseded', 409, 'memory_superseded');
+		}
+		if (ifMatch !== undefined && !matchesIfMatch(ifMatch, existing.revision)) {
+			throw staleWrite(ifMatch, existing.revision);
+		}
+		await Memory.patch(
+			id,
+			{
+				...CLEARED_REVIEW,
+				confirmed: { by: principal.id, at: new Date().toISOString() },
+				revision: existing.revision + 1,
+			},
+			txn,
+		);
+		const memory = toMemoryView(await Memory.get(id, txn));
+		if (hasSinks()) await notifySinks('write', memory, txn);
+		return memory;
+	});
 }
 
 export async function pinMemory(id: unknown, input: unknown = {}, principal: Principal, requestContext: object = {}) {
@@ -731,7 +1072,7 @@ export async function pinMemory(id: unknown, input: unknown = {}, principal: Pri
 				txn,
 			);
 		}
-		return { pinned: true, memoryId: id, memory: toMemoryView(record) };
+		return { pinned: true, memoryId: id, memory: (await forReader([toMemoryView(record)], principal, txn))[0] };
 	});
 }
 
@@ -747,6 +1088,6 @@ export async function unpinMemory(id: unknown, input: unknown = {}, principal: P
 		const record = await Memory.get(id, txn);
 		// Missing and unreadable both omit `memory`, so unpinning a descoped pin works without probing existence.
 		if (!record || !canRead(record, principal)) return { pinned: false, memoryId: id };
-		return { pinned: false, memoryId: id, memory: toMemoryView(record) };
+		return { pinned: false, memoryId: id, memory: (await forReader([toMemoryView(record)], principal, txn))[0] };
 	});
 }

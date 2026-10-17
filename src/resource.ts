@@ -2,7 +2,7 @@
 import { logger, Resource } from 'harper';
 import { badRequest, isCallerSafe, memoryError, notFound } from './errors.ts';
 import { importMemories } from './import.ts';
-import { getMemory, pinMemory, putMemory, unpinMemory, withdrawMemory } from './lifecycle.ts';
+import { confirmMemory, getMemory, pinMemory, putMemory, unpinMemory, withdrawMemory } from './lifecycle.ts';
 import { resolvePrincipal } from './principal.ts';
 import type { Principal } from './scopes.ts';
 import { bootstrapMemories, parseBootstrapParams, parseSearchParams, searchMemories } from './search.ts';
@@ -24,8 +24,9 @@ async function readBody(data: unknown): Promise<unknown> {
 
 // Harper's retryable failures: 503 (an index rebuilding or lagging, a database closing), 423 (a record lock not
 // granted in time), the 409 a lock lease that lapsed before commit raises, and transient embedding backend
-// failures (429, 5xx, timeout, connection failure) wrapped by Harper's embedHook. Any other 409 (a sink
-// inserting a row that exists) is a defect, not a reason to retry.
+// failures (429, 5xx, timeout, connection failure), whether wrapped by Harper's embedHook or raised by the
+// plugin's own embedding before a write. Any other 409 (a sink inserting a row that exists) is a defect, not a
+// reason to retry.
 function isRetryable(error: any): boolean {
 	const status = error?.statusCode;
 	const message = String(error?.message ?? '');
@@ -33,6 +34,7 @@ function isRetryable(error: any): boolean {
 	const upstream = error?.upstreamStatus ?? error?.cause?.upstreamStatus ?? error?.cause?.status;
 	if (upstream === 429 || (typeof upstream === 'number' && upstream >= 500 && upstream <= 599)) return true;
 	if (error?.name === 'AbortError' || error?.name === 'TimeoutError') return true;
+	if (error?.name === 'TypeError' && message === 'fetch failed') return true;
 	return /^Failed to compute embedding for attribute "embedding"(?: \[(?:AbortError|TimeoutError|TypeError)\]|.*\(backend HTTP (?:429|5\d\d)\))/.test(
 		message,
 	);
@@ -78,9 +80,11 @@ async function handle(
 	}
 }
 
+const MEMORY_ACTIONS = ['pin', 'unpin', 'confirm'];
+
 function rejectUnsupportedVerb(target: any): never {
 	if (target?.rest || target?.pathname) throw notFound();
-	if (target?.action !== undefined && target.action !== 'pin' && target.action !== 'unpin') throw notFound();
+	if (target?.action !== undefined && !MEMORY_ACTIONS.includes(target.action)) throw notFound();
 	throw memoryError('Method not allowed', 405, 'method_not_allowed');
 }
 
@@ -156,8 +160,13 @@ export class MemoryItemResource extends MemoryEndpoint {
 
 	static async put(target: any, data: any, context: object) {
 		return handle('put', context, async (principal, ctx) => {
-			const { id, revision, created } = await putMemory(String(target?.id ?? ''), await readBody(data), principal, ctx);
-			return json({ id, revision }, created ? 201 : 200);
+			const { id, revision, created, candidates } = await putMemory(
+				String(target?.id ?? ''),
+				await readBody(data),
+				principal,
+				ctx,
+			);
+			return json({ id, revision, candidates }, created ? 201 : 200);
 		});
 	}
 
@@ -182,6 +191,8 @@ export class MemoryActionResource extends MemoryEndpoint {
 					return json(await pinMemory(id, input, principal, ctx));
 				case 'unpin':
 					return json(await unpinMemory(id, input, principal, ctx));
+				case 'confirm':
+					return json({ memory: await confirmMemory(id, input, principal, ctx) });
 				default:
 					throw notFound();
 			}

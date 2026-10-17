@@ -11,15 +11,21 @@ type Memory @table(database: "memory", audit: true) {
 	status: String @indexed # active | superseded | withdrawn
 	revision: Int
 	supersedes: [ID] @indexed
+	# The subset of supersedes the auto judge added, so an identical retry compares only what the author sent.
+	autoSupersedes: [ID]
 	supersededBy: ID @indexed
 	evidence: Any
 	evidenceMemoryIds: [ID] @indexed
+	needsReview: Any # { since, cause: superseded | withdrawn, sourceId, replacementId? }
+	# needsReview.since, indexed because Harper does not index object values; never in a view.
+	needsReviewSince: Date @indexed
+	confirmed: Any # { by, at }
 	author: Any
 	lastEditor: Any
 	validUntil: Date
 	withdrawnAt: Date
 	withdrawnReason: String
-	# The plugin replaces this embedder when the embeddingModel option is not "default".
+	# The plugin installs its own embedder for every model; it embeds with the model recorded on the row.
 	embedding: [Float] @embed(source: "content", model: "default")
 	embeddingModel: String @indexed
 	text: FullText @fullText(fields: [{ name: "title", weight: 2.0 }, { name: "content" }])

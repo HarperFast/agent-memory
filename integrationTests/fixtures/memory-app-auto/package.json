@@ -1,0 +1,6 @@
+{
+	"name": "agent-memory-auto-fixture-app",
+	"private": true,
+	"type": "module",
+	"description": "Integration-test host app with supersession auto mode. scripts/install-fixtures.js installs the packed @harperfast/agent-memory into it."
+}
