@@ -1,11 +1,14 @@
 // Memory ids are 16-64 characters, so the 9-char `bootstrap` and 6-char `import` path segments cannot collide with one.
 import { logger, Resource } from 'harper';
-import { badRequest, isCallerSafe, memoryError, notFound } from './errors.ts';
+import { badRequest, isCallerSafe, memoryError, notFound, type MemoryError } from './errors.ts';
+import { subscribeMemory, subscribeMemoryEvents, watchMemories } from './events.ts';
 import { importMemories } from './import.ts';
 import { confirmMemory, getMemory, pinMemory, putMemory, unpinMemory, withdrawMemory } from './lifecycle.ts';
+import { MEMORY_MCP_METHODS, MEMORY_MCP_RESOURCES, MEMORY_MCP_TOOLS } from './mcp.ts';
 import { resolvePrincipal } from './principal.ts';
 import type { Principal } from './scopes.ts';
 import { bootstrapMemories, parseBootstrapParams, parseSearchParams, searchMemories } from './search.ts';
+import { getSettings } from './settings.ts';
 
 function json(data: unknown, status = 200, extraHeaders?: Record<string, string>): Response {
 	return new Response(JSON.stringify(data), {
@@ -43,12 +46,8 @@ function isRetryable(error: any): boolean {
 const RETRYABLE_WARN_INTERVAL_MS = 60_000;
 let lastRetryableWarning = 0;
 
-function errorResponse(error: unknown, route: string): Response {
-	if (isCallerSafe(error)) {
-		const body: Record<string, unknown> = { error: error.message, code: error.code };
-		if (error.index !== undefined) body.index = error.index;
-		return json(body, error.statusCode);
-	}
+export function normalizeError(error: unknown, route: string): MemoryError {
+	if (isCallerSafe(error)) return error;
 	// The fixed message keeps Harper's text, which is not vetted for callers, out of the response; the log keeps
 	// a persistent condition diagnosable without logging every request.
 	if (isRetryable(error)) {
@@ -57,10 +56,28 @@ function errorResponse(error: unknown, route: string): Response {
 			lastRetryableWarning = now;
 			logger.warn?.(`[agent-memory] ${route} answered 503 for a retryable failure`, error);
 		}
-		return json({ error: 'Temporarily unavailable; retry shortly', code: 'unavailable' }, 503);
+		return memoryError('Temporarily unavailable; retry shortly', 503, 'unavailable');
 	}
 	logger.error?.(`[agent-memory] ${route} failed`, error);
-	return json({ error: 'Internal error', code: 'internal_error' }, 500);
+	return memoryError('Internal error', 500, 'internal_error');
+}
+
+function errorResponse(error: unknown, route: string): Response {
+	const safe = normalizeError(error, route);
+	const body: Record<string, unknown> = { error: safe.message, code: safe.code };
+	if (safe.index !== undefined) body.index = safe.index;
+	return json(body, safe.statusCode);
+}
+
+async function prepareContext(
+	context: object | undefined,
+): Promise<{ principal: Principal; ctx: Record<string, unknown> }> {
+	const ctx = (context ?? {}) as Record<string, unknown>;
+	// Static verb overrides replace Resource's transactional() wrapper, which otherwise consumes
+	// the HTTP entry `request.authorize` flag before any internal table read runs in this async scope.
+	ctx.authorize = false;
+	const principal = await resolvePrincipal(ctx);
+	return { principal, ctx };
 }
 
 async function handle(
@@ -69,15 +86,66 @@ async function handle(
 	fn: (principal: Principal, ctx: object) => Promise<Response>,
 ): Promise<Response> {
 	try {
-		const ctx = (context ?? {}) as Record<string, unknown>;
-		// Static verb overrides replace Resource's transactional() wrapper, which otherwise consumes
-		// the HTTP entry `request.authorize` flag before any internal table read runs in this async scope.
-		ctx.authorize = false;
-		const principal = await resolvePrincipal(ctx);
+		const { principal, ctx } = await prepareContext(context);
 		return await fn(principal, ctx);
 	} catch (error) {
 		return errorResponse(error, route);
 	}
+}
+
+async function handleSubscribe<T>(
+	context: object | undefined,
+	fn: (principal: Principal, ctx: object) => Promise<T>,
+): Promise<T> {
+	try {
+		const { principal, ctx } = await prepareContext(context);
+		return await fn(principal, ctx);
+	} catch (error) {
+		throw normalizeError(error, 'subscribe');
+	}
+}
+
+function drainIncomingMessages(incomingMessages: any): void {
+	if (!incomingMessages) return;
+	if (typeof incomingMessages.on === 'function') {
+		incomingMessages.on('data', () => {});
+		incomingMessages.on('error', () => {});
+		return;
+	}
+	if (typeof incomingMessages[Symbol.asyncIterator] === 'function') {
+		void (async () => {
+			try {
+				for await (const _ of incomingMessages) {
+					// Subscription streams are server-to-client only; ignore client frames.
+				}
+			} catch {
+				// Ignore disconnect errors on the incoming side.
+			}
+		})();
+	}
+}
+
+// Node's http.ServerResponse defers transmitting headers after writeHead() until the first body byte or
+// an explicit flushHeaders() call; an SSE stream yields nothing until a memory event fires, so flush
+// once the HTTP adapter has written the 200 status and headers.
+function scheduleFlushHeaders(context: any): void {
+	const nodeRes = context?._nodeResponse;
+	if (typeof nodeRes?.flushHeaders !== 'function') return;
+	const attempt = (remaining: number) => {
+		setImmediate(() => {
+			try {
+				if (nodeRes.writableEnded || nodeRes.destroyed) return;
+				if (nodeRes.headersSent) {
+					nodeRes.flushHeaders();
+				} else if (remaining > 0) {
+					attempt(remaining - 1);
+				}
+			} catch {
+				// Ignore if the client disconnected before headers flushed.
+			}
+		});
+	};
+	attempt(5);
 }
 
 const MEMORY_ACTIONS = ['pin', 'unpin', 'confirm'];
@@ -90,7 +158,7 @@ function rejectUnsupportedVerb(target: any): never {
 
 // @ts-expect-error — Resource's static verb types carry transactional()'s reliesOnPrototype brand
 class MemoryEndpoint extends Resource {
-	// Kept out of MCP and OpenAPI auto-export: the generic verbs would not express these routes.
+	// Kept out of MCP and OpenAPI auto-export unless explicitly enabled on MemoryResource.
 	static hidden = true;
 
 	static async get(target: any, context: object) {
@@ -112,10 +180,46 @@ class MemoryEndpoint extends Resource {
 	static async patch(target: any, _data: any, context: object) {
 		return handle('patch', context, async () => rejectUnsupportedVerb(target));
 	}
+
+	static async subscribe(target: any, context: object): Promise<any> {
+		return handleSubscribe(context, async () => rejectUnsupportedVerb(target));
+	}
+
+	static async connect(target: any, incomingMessages: any, context: object): Promise<any> {
+		// SSE calls connect(target, null, request) and accepts a Response on error; WebSocket passes incomingMessages
+		// and translates thrown statusCode errors into close frames.
+		if (incomingMessages == null) {
+			try {
+				const stream = await this.subscribe(target, context);
+				scheduleFlushHeaders(context);
+				return stream;
+			} catch (error) {
+				return errorResponse(error, 'connect');
+			}
+		}
+		drainIncomingMessages(incomingMessages);
+		try {
+			return await this.subscribe(target, context);
+		} catch (error) {
+			throw normalizeError(error, 'connect');
+		}
+	}
 }
 
 export class MemoryResource extends MemoryEndpoint {
 	static path = '/Memory/*rest';
+
+	static override get hidden(): boolean {
+		return !getSettings().mcp;
+	}
+
+	static get mcpTools() {
+		return getSettings().mcp ? MEMORY_MCP_TOOLS : [];
+	}
+
+	static get mcpResources() {
+		return getSettings().mcp ? MEMORY_MCP_RESOURCES : [];
+	}
 
 	static async get(target: any, context: object) {
 		return handle('get', context, async (principal, ctx) => {
@@ -123,7 +227,13 @@ export class MemoryResource extends MemoryEndpoint {
 			return json({ memories: await searchMemories(parseSearchParams(target), principal, ctx) });
 		});
 	}
+
+	static override async subscribe(target: any, context: object) {
+		return handleSubscribe(context, (principal, ctx) => subscribeMemory(target, principal, ctx));
+	}
 }
+
+Object.assign(MemoryResource.prototype, MEMORY_MCP_METHODS);
 
 export class MemoryBootstrapResource extends MemoryEndpoint {
 	static path = '/Memory/bootstrap';
@@ -143,6 +253,17 @@ export class MemoryImportResource extends MemoryEndpoint {
 		return handle('post', context, async (principal, ctx) => {
 			if (target?.pathname) throw notFound();
 			return json(await importMemories(await readBody(data), principal, ctx));
+		});
+	}
+}
+
+export class MemoryWatchResource extends MemoryEndpoint {
+	static path = '/Memory/watch';
+
+	static async post(target: any, data: any, context: object) {
+		return handle('post', context, async (principal, ctx) => {
+			if (target?.pathname) throw notFound();
+			return json(await watchMemories(await readBody(data), principal, ctx));
 		});
 	}
 }
@@ -177,6 +298,10 @@ export class MemoryItemResource extends MemoryEndpoint {
 			return json({ memory: await withdrawMemory(String(target?.id ?? ''), input, principal, ctx) });
 		});
 	}
+
+	static override async subscribe(target: any, context: object) {
+		return handleSubscribe(context, (principal, ctx) => subscribeMemory(target, principal, ctx));
+	}
 }
 
 export class MemoryActionResource extends MemoryEndpoint {
@@ -200,10 +325,20 @@ export class MemoryActionResource extends MemoryEndpoint {
 	}
 }
 
+export class MemoryEventsResource extends MemoryEndpoint {
+	static path = '/MemoryEvents';
+
+	static override async subscribe(target: any, context: object) {
+		return handleSubscribe(context, (principal, ctx) => subscribeMemoryEvents(target, principal, ctx));
+	}
+}
+
 export const MEMORY_RESOURCES = [
 	MemoryResource,
 	MemoryBootstrapResource,
 	MemoryImportResource,
+	MemoryWatchResource,
 	MemoryItemResource,
 	MemoryActionResource,
+	MemoryEventsResource,
 ] as const;

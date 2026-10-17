@@ -216,6 +216,7 @@ export async function importMemories(input: unknown, principal: Principal, reque
 							...state,
 							embedding: vectors.get(row.id),
 							revision: 1,
+							lastEventKind: 'created',
 							autoSupersedes: [],
 							...CLEARED_REVIEW,
 							confirmed: null,
@@ -235,7 +236,7 @@ export async function importMemories(input: unknown, principal: Principal, reque
 					if (!target || target.status === STATUS_WITHDRAWN) continue;
 					const next = await graphState(targetId);
 					if (next.status === target.status && next.supersededBy === target.supersededBy) continue;
-					await Memory.patch(targetId, { ...next, revision: target.revision + 1 }, txn);
+					await Memory.patch(targetId, { ...next, lastEventKind: 'superseded', revision: target.revision + 1 }, txn);
 					changed.push(targetId);
 					if (target.status === STATUS_ACTIVE) transitions.push({ id: targetId, replacementId: next.supersededBy! });
 				}

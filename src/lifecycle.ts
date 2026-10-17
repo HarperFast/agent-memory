@@ -43,6 +43,10 @@ export function memoryPinTable(): any {
 	return (databases as any).memory.MemoryPin;
 }
 
+export function memoryWatchTable(): any {
+	return (databases as any).memory.MemoryWatch;
+}
+
 function memoryPinIdFor(principalId: string, memoryId: string): string {
 	return `${principalId}:${memoryId}`;
 }
@@ -340,7 +344,7 @@ async function lockRows(Memory: any, ids: Iterable<string>, context: object, lea
  * the resource turns into a response commit whatever had been staged before it. The new context carries the
  * user so Harper's audit log still attributes the write.
  */
-function inOwnTransaction<T>(requestContext: any, operation: (context: object) => Promise<T>): Promise<T> {
+export function inOwnTransaction<T>(requestContext: any, operation: (context: object) => Promise<T>): Promise<T> {
 	const context = { user: requestContext?.user };
 	return transaction(context, () => operation(context)) as Promise<T>;
 }
@@ -656,6 +660,7 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 						...(parsedValidUntil !== undefined && { validUntil: parsedValidUntil }),
 						// A revision is the owner's review: it clears a flag without re-flagging this memory's own citers.
 						...(existing.needsReview && CLEARED_REVIEW),
+						lastEventKind: 'revised',
 						revision: existing.revision + 1,
 						lastEditor: { principalId: principal.id, source: principal.source, revisedAt: new Date().toISOString() },
 					};
@@ -728,6 +733,7 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 						ownerId: principal.id,
 						status: STATUS_ACTIVE,
 						revision: 1,
+						lastEventKind: 'created',
 						evidence,
 						evidenceMemoryIds,
 						supersedes: [...supersedes, ...applied],
@@ -748,7 +754,7 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 				for (const { target, supersededBy } of pointers) {
 					await Memory.patch(
 						target.id,
-						{ status: STATUS_SUPERSEDED, supersededBy, revision: target.revision + 1 },
+						{ status: STATUS_SUPERSEDED, supersededBy, lastEventKind: 'superseded', revision: target.revision + 1 },
 						txn,
 					);
 				}
@@ -889,8 +895,8 @@ async function reconcileSuperseded(Memory: any, withdrawn: any, context: object)
 		if (target?.status !== STATUS_SUPERSEDED) continue;
 		const newest = await newestSuperseder(Memory, targetId, context, withdrawn.id);
 		const next = newest
-			? { status: STATUS_SUPERSEDED, supersededBy: newest.id }
-			: { status: STATUS_ACTIVE, supersededBy: null };
+			? { status: STATUS_SUPERSEDED, supersededBy: newest.id, lastEventKind: 'superseded' }
+			: { status: STATUS_ACTIVE, supersededBy: null, lastEventKind: 'restored' };
 		if (next.status === target.status && next.supersededBy === target.supersededBy) continue;
 		await Memory.patch(targetId, { ...next, revision: target.revision + 1 }, context);
 		changed.push(targetId);
@@ -956,6 +962,7 @@ export async function withdrawMemory(
 					status: STATUS_WITHDRAWN,
 					withdrawnAt: now,
 					withdrawnReason: reason ?? null,
+					lastEventKind: 'withdrawn',
 					revision: existing.revision + 1,
 				},
 				txn,
@@ -1011,6 +1018,7 @@ export async function confirmMemory(
 			{
 				...CLEARED_REVIEW,
 				confirmed: { by: principal.id, at: new Date().toISOString() },
+				lastEventKind: 'revised',
 				revision: existing.revision + 1,
 			},
 			txn,

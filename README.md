@@ -7,9 +7,11 @@ Shared, permissioned, live memory for agents and people, as a Harper plugin.
 - First-class supersession: replacing a memory hides the old one from default search, and withdrawing the replacement restores it
 - Write-time supersession candidates: every `PUT` returns the similar memories it may replace, optionally classified by a judge model, which `auto` mode can act on
 - Provenance flags: when a memory is superseded or withdrawn, the memories citing it as evidence get `needsReview` until their owner revises or confirms them
+- Live updates: Level 1 real-time subscriptions on `/Memory` and `/Memory/<id>` (SSE, WebSocket, MQTT) with delivery-time read checks, and Level 2 watches (`POST /Memory/watch`, `watch=true` on search/bootstrap) delivered with own `needsReview` flags on `/MemoryEvents`
+- MCP surface (`mcp: true`): `remember`, `revise`, `recall`, `get`, `withdraw`, `pin`, `unpin`, `confirm`, `watch` tools and `memory:///{id}` resource
 - Extension points: `registerMemorySink` runs inside the lifecycle transaction for apps that mirror memories elsewhere, `setPrincipalResolver` maps app-defined identities
 
-Status: pre-release (v0 core). Live updates are designed but not yet built. Design and contracts: [DESIGN.md](DESIGN.md).
+Status: pre-release (v0). Design and contracts: [DESIGN.md](DESIGN.md).
 
 ## Quick start
 
@@ -23,7 +25,8 @@ Requires Harper 5.3.1 or later on RocksDB (the default).
    rest: true
    '@harperfast/agent-memory':
      package: '@harperfast/agent-memory'
-     # urlPath: 'Memory'          # mount path
+     # urlPath: 'Memory'          # mount path (watch stream mounts at '<urlPath>Events')
+     # mcp: false                 # expose MCP tools and memory:///{id} on Harper's /mcp endpoint
      # embeddingModel: 'default'  # logical model name from Harper's models config
      # supersession:
      #   similarity: 0.82         # candidates returned on PUT at or above this cosine similarity

@@ -55,9 +55,10 @@ describe('parseSearchParams', () => {
 			limit: 10,
 			includeSuperseded: false,
 			includeExpired: false,
+			watch: false,
 		});
 		assert.deepEqual(
-			params('q=%20disk%20&tag=a&tag=b&scope=team:x&limit=5&includeSuperseded=true&includeExpired=true'),
+			params('q=%20disk%20&tag=a&tag=b&scope=team:x&limit=5&includeSuperseded=true&includeExpired=true&watch=true'),
 			{
 				q: 'disk',
 				tags: ['a', 'b'],
@@ -65,6 +66,7 @@ describe('parseSearchParams', () => {
 				limit: 5,
 				includeSuperseded: true,
 				includeExpired: true,
+				watch: true,
 			},
 		);
 		for (const bad of [
@@ -74,6 +76,7 @@ describe('parseSearchParams', () => {
 			'scope=team:*',
 			'includeSuperseded=yes',
 			'includeExpired=yes',
+			'watch=yes',
 			`q=${'x'.repeat(1001)}`,
 		]) {
 			assert.throws(
@@ -84,10 +87,19 @@ describe('parseSearchParams', () => {
 		}
 	});
 
-	it('bounds the bootstrap budget', () => {
-		assert.equal(parseBootstrapParams(new URLSearchParams('')).budget, 8000);
+	it('bounds the bootstrap budget and validates watch', () => {
+		assert.deepEqual(parseBootstrapParams(new URLSearchParams('')), { q: undefined, budget: 8000, watch: false });
+		assert.deepEqual(parseBootstrapParams(new URLSearchParams('watch=true')), {
+			q: undefined,
+			budget: 8000,
+			watch: true,
+		});
 		assert.throws(
 			() => parseBootstrapParams(new URLSearchParams('budget=100001')),
+			(error) => error.statusCode === 400,
+		);
+		assert.throws(
+			() => parseBootstrapParams(new URLSearchParams('watch=1')),
 			(error) => error.statusCode === 400,
 		);
 	});

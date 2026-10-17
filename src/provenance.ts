@@ -63,7 +63,7 @@ export async function flagDependents(
 		}
 		await Memory.patch(
 			dependentId,
-			{ needsReview: flag, needsReviewSince: now, revision: dependent.revision + 1 },
+			{ needsReview: flag, needsReviewSince: now, lastEventKind: 'flagged', revision: dependent.revision + 1 },
 			context,
 		);
 		flagged.push(dependentId);

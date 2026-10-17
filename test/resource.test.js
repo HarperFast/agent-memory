@@ -25,10 +25,18 @@ beforeEach(() => {
 });
 
 describe('MEMORY_RESOURCES static surface', () => {
-	it('declares static path, static hidden = true, and static REST verbs without loadAsInstance or instance verbs', () => {
+	it('declares static path, static hidden = true (unless mcp is enabled on MemoryResource), and static REST verbs without loadAsInstance or instance verbs', () => {
 		assert.deepEqual(
 			MEMORY_RESOURCES.map((ResourceClass) => ResourceClass.path),
-			['/Memory/*rest', '/Memory/bootstrap', '/Memory/import', '/Memory/:id', '/Memory/:id/:action'],
+			[
+				'/Memory/*rest',
+				'/Memory/bootstrap',
+				'/Memory/import',
+				'/Memory/watch',
+				'/Memory/:id',
+				'/Memory/:id/:action',
+				'/MemoryEvents',
+			],
 		);
 		for (const ResourceClass of MEMORY_RESOURCES) {
 			assert.equal(ResourceClass.hidden, true);
@@ -38,6 +46,22 @@ describe('MEMORY_RESOURCES static surface', () => {
 			assert.equal(Object.hasOwn(ResourceClass.prototype, 'put'), false);
 			assert.equal(Object.hasOwn(ResourceClass.prototype, 'delete'), false);
 			assert.equal(Object.hasOwn(ResourceClass.prototype, 'segments'), false);
+		}
+		assert.deepEqual(MemoryResource.mcpTools, []);
+		assert.deepEqual(MemoryResource.mcpResources, []);
+
+		applySettings(parseSettings({ mcp: true }));
+		assert.equal(MemoryResource.hidden, false);
+		assert.deepEqual(
+			MemoryResource.mcpTools.map((t) => t.name),
+			['remember', 'revise', 'recall', 'get', 'withdraw', 'pin', 'unpin', 'confirm', 'watch'],
+		);
+		assert.deepEqual(
+			MemoryResource.mcpResources.map((r) => [r.name, r.uriTemplate, r.method, r.read]),
+			[['memory', 'memory:///{id}', 'mcpReadMemory', 'mcpReadMemory']],
+		);
+		for (const ResourceClass of MEMORY_RESOURCES.filter((R) => R !== MemoryResource)) {
+			assert.equal(ResourceClass.hidden, true);
 		}
 	});
 

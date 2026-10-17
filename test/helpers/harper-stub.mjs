@@ -67,6 +67,7 @@ function matchesCondition(record, condition) {
 }
 
 const stores = new Map();
+const subscribers = new Map();
 const searchLog = [];
 const lockLog = [];
 const setEmbedCalls = [];
@@ -76,9 +77,26 @@ class StubTable {
 		this.name = name;
 		this.embedders = {};
 		stores.set(name, new Map());
+		subscribers.set(name, new Set());
 	}
 	#rows(context) {
 		return context?.transaction?.rows.get(this.name) ?? stores.get(this.name);
+	}
+	#stageWrite(record, context) {
+		if (context?.transaction) {
+			context.transaction.writes.get(this.name).push({ id: record.id, value: structuredClone(record) });
+		} else {
+			this.#emitWrite({ id: record.id, value: structuredClone(record) });
+		}
+	}
+	#emitWrite(event) {
+		for (const sub of subscribers.get(this.name)) {
+			if (sub.id !== undefined && sub.id !== event.id) continue;
+			sub.push({ id: event.id, type: 'put', value: Object.freeze(structuredClone(event.value)) });
+		}
+	}
+	emitCommittedWrites(writes) {
+		for (const write of writes) this.#emitWrite(write);
 	}
 	setEmbedAttribute(attribute, embedder) {
 		this.embedders[attribute] = embedder;
@@ -102,8 +120,9 @@ class StubTable {
 		const next = structuredClone(record);
 		await this.#embed(next);
 		next.createdAt ??= rows.get(record.id)?.createdAt ?? stamp();
-		if (this.name !== 'MemoryPin') next.updatedAt = stamp();
+		if (this.name !== 'MemoryPin' && this.name !== 'MemoryWatch') next.updatedAt = stamp();
 		rows.set(record.id, next);
+		this.#stageWrite(next, context);
 	}
 	async patch(id, changes, context) {
 		const rows = this.#rows(context);
@@ -111,9 +130,46 @@ class StubTable {
 		await this.#embed(changes.content === undefined ? {} : next);
 		next.updatedAt = stamp();
 		rows.set(id, next);
+		this.#stageWrite(next, context);
 	}
 	async delete(id, context) {
 		return this.#rows(context).delete(id);
+	}
+	async subscribe(options = {}) {
+		const buffer = [];
+		const waiters = [];
+		let closed = false;
+		const sub = {
+			id: options.id,
+			push(item) {
+				if (closed) return;
+				const waiter = waiters.shift();
+				if (waiter) waiter({ value: item, done: false });
+				else buffer.push(item);
+			},
+			end() {
+				if (closed) return;
+				closed = true;
+				subscribers.get(name)?.delete(sub);
+				while (waiters.length > 0) waiters.shift()({ value: undefined, done: true });
+			},
+			[Symbol.asyncIterator]() {
+				return {
+					next() {
+						if (buffer.length > 0) return Promise.resolve({ value: buffer.shift(), done: false });
+						if (closed) return Promise.resolve({ value: undefined, done: true });
+						return new Promise((resolve) => waiters.push(resolve));
+					},
+					return() {
+						sub.end();
+						return Promise.resolve({ value: undefined, done: true });
+					},
+				};
+			},
+		};
+		const name = this.name;
+		subscribers.get(name).add(sub);
+		return sub;
 	}
 	search(query, context) {
 		searchLog.push({ table: this.name, query });
@@ -153,6 +209,7 @@ export const databases = {
 	memory: {
 		Memory: new StubTable('Memory'),
 		MemoryPin: new StubTable('MemoryPin'),
+		MemoryWatch: new StubTable('MemoryWatch'),
 		ScopeGrant: new StubTable('ScopeGrant'),
 	},
 };
@@ -166,10 +223,14 @@ export function transaction(contextOrCallback, maybeCallback) {
 	if (context.transaction) return callback(context.transaction);
 	const run = chain.then(async () => {
 		const rows = new Map([...stores].map(([name, entries]) => [name, new Map(entries)]));
-		context.transaction = { rows };
+		const writes = new Map([...stores.keys()].map((name) => [name, []]));
+		context.transaction = { rows, writes };
 		try {
 			const result = await callback(context.transaction);
 			for (const [name, entries] of rows) stores.set(name, entries);
+			for (const [name, tableWrites] of writes) {
+				databases.memory[name]?.emitCommittedWrites(tableWrites);
+			}
 			return result;
 		} finally {
 			delete context.transaction;
@@ -219,6 +280,10 @@ export const __test = {
 	embedText,
 	reset() {
 		for (const entries of stores.values()) entries.clear();
+		for (const subs of subscribers.values()) {
+			for (const sub of subs) sub.end();
+			subs.clear();
+		}
 		searchLog.length = 0;
 		lockLog.length = 0;
 		models.calls.length = 0;

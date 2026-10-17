@@ -1,12 +1,12 @@
 import type { Scope } from 'harper';
-import { MEMORY_RESOURCES } from './resource.ts';
+import { MEMORY_RESOURCES, MemoryItemResource, MemoryResource } from './resource.ts';
 import { applySettings, parseSettings } from './settings.ts';
 
 export { registerMemorySink, type MemorySink } from './sinks.ts';
 export { setPrincipalResolver, type PrincipalResolver, type PrincipalResolution } from './principal.ts';
 
 function routePathFor(basePath: string, resource: { path: string }): string {
-	return resource.path.replace(/^\/Memory\b/, basePath);
+	return resource.path.replace(/^\/Memory(?=\/|$|Events\b)/, basePath);
 }
 
 export async function handleApplication(scope: Scope): Promise<void> {
@@ -17,9 +17,15 @@ export async function handleApplication(scope: Scope): Promise<void> {
 	// Validates before publishing anything, so a rejected reload leaves the previous configuration serving.
 	const configure = () => {
 		const settings = parseSettings((scope.options.getAll() ?? {}) as Record<string, any>);
+		applySettings(settings);
 		if (settings.urlPath !== mountedPath) {
 			for (const ResourceClass of MEMORY_RESOURCES) {
-				resources.set(routePathFor(settings.urlPath, ResourceClass), ResourceClass);
+				const routePath = routePathFor(settings.urlPath, ResourceClass);
+				resources.set(routePath, ResourceClass);
+				if (ResourceClass === MemoryResource || ResourceClass === MemoryItemResource) {
+					const route = resources.paramRoutes?.find((r) => r.pattern === routePath);
+					if (route?.entry) route.entry.path = settings.urlPath;
+				}
 			}
 			if (mountedPath !== undefined) {
 				for (const ResourceClass of MEMORY_RESOURCES) {
@@ -33,7 +39,6 @@ export async function handleApplication(scope: Scope): Promise<void> {
 			}
 			mountedPath = settings.urlPath;
 		}
-		applySettings(settings);
 	};
 
 	configure();

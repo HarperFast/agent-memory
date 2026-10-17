@@ -39,8 +39,10 @@ describe('handleApplication', () => {
 				'agent-memory/*rest',
 				'agent-memory/bootstrap',
 				'agent-memory/import',
+				'agent-memory/watch',
 				'agent-memory/:id',
 				'agent-memory/:id/:action',
+				'agent-memoryEvents',
 			],
 		);
 		assert.equal(harness.entries.get('agent-memory/*rest').Resource, MemoryResource);
@@ -48,7 +50,7 @@ describe('handleApplication', () => {
 		harness.setOptions({ urlPath: 'mem' });
 		assert.deepEqual(
 			[...harness.entries.keys()],
-			['mem/*rest', 'mem/bootstrap', 'mem/import', 'mem/:id', 'mem/:id/:action'],
+			['mem/*rest', 'mem/bootstrap', 'mem/import', 'mem/watch', 'mem/:id', 'mem/:id/:action', 'memEvents'],
 		);
 	});
 
@@ -73,14 +75,17 @@ describe('handleApplication', () => {
 });
 
 describe('parseSettings', () => {
-	it('applies defaults and validates limits', () => {
+	it('applies defaults and validates limits and mcp flag', () => {
 		assert.deepEqual(parseSettings({}), {
 			urlPath: 'Memory',
 			embeddingModel: 'default',
 			titleChars: 200,
 			contentChars: 20000,
 			supersession: { mode: 'suggest', similarity: 0.82 },
+			mcp: false,
 		});
+		assert.equal(parseSettings({ mcp: true }).mcp, true);
+		assert.throws(() => parseSettings({ mcp: 'true' }), /mcp/);
 		assert.throws(() => parseSettings({ limits: { titleChars: 1001 } }));
 		assert.throws(() => parseSettings({ embeddingModel: '' }));
 		assert.throws(() => parseSettings({ urlPath: '/' }));

@@ -19,6 +19,8 @@ type Memory @table(database: "memory", audit: true) {
 	needsReview: Any # { since, cause: superseded | withdrawn, sourceId, replacementId? }
 	# needsReview.since, indexed because Harper does not index object values; never in a view.
 	needsReviewSince: Date @indexed
+	# The transition kind of the latest write, read from the audit entry by live subscriptions; never in a view.
+	lastEventKind: String
 	confirmed: Any # { by, at }
 	author: Any
 	lastEditor: Any
