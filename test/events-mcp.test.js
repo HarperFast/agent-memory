@@ -12,6 +12,7 @@ import {
 	MemoryResource,
 	MemoryWatchResource,
 } from '../dist/resource.js';
+import { setPrincipalResolver } from '../dist/principal.js';
 import { applySettings, parseSettings } from '../dist/settings.js';
 
 const aliceUser = { username: 'alice' };
@@ -798,11 +799,17 @@ describe('Level 2: MemoryWatch, watch=true on search/bootstrap, and /MemoryEvent
 		await MemoryWatchResource.post(queryTarget(''), { ids: citerIds, ttlSeconds: 300 }, { user: bobUser });
 		await MemoryWatchResource.post(queryTarget(''), { ids: citerIds, ttlSeconds: 300 }, { user: daveUser });
 
+		let customResolverCalls = 0;
+		setPrincipalResolver(async (ctx, next) => {
+			customResolverCalls += 1;
+			return next(ctx);
+		});
+
 		const subAlice = collectEvents(await MemoryResource.subscribe(queryTarget('', { rest: '' }), { user: aliceUser }));
 		const subBob = collectEvents(await MemoryEventsResource.connect(queryTarget(''), null, { user: bobUser }));
 		const subDave = collectEvents(await MemoryEventsResource.connect(queryTarget(''), null, { user: daveUser }));
 
-		// Warm each subscriber once so initial watch seeding and ScopeGrant cache fill are complete before measuring the burst.
+		// Warm each subscriber once so initial watch seeding and per-listener principal cache fill are complete before measuring the burst.
 		await MemoryItemResource.put(
 			queryTarget('', { id: citerIds[0] }),
 			{ content: 'warm burst check' },
@@ -821,9 +828,19 @@ describe('Level 2: MemoryWatch, watch=true on search/bootstrap, and /MemoryEvent
 		let memorySearchCalls = 0;
 		let watchGetCalls = 0;
 		let grantGetCalls = 0;
-		Memory.search = function (...args) {
+		let failFirstSourceLookup = true;
+		Memory.search = function (query, ...rest) {
 			memorySearchCalls += 1;
-			return origMemorySearch.apply(this, args);
+			// Simulate one transient search error on the first flagAccessCache lookup to verify failed promises are evicted and retried.
+			if (failFirstSourceLookup && query?.conditions?.[0]?.attribute === 'id') {
+				failFirstSourceLookup = false;
+				return {
+					async *[Symbol.asyncIterator]() {
+						throw new Error('transient search failure');
+					},
+				};
+			}
+			return origMemorySearch.call(this, query, ...rest);
 		};
 		MemoryWatch.get = function (...args) {
 			watchGetCalls += 1;
@@ -835,22 +852,25 @@ describe('Level 2: MemoryWatch, watch=true on search/bootstrap, and /MemoryEvent
 		};
 
 		try {
+			customResolverCalls = 0;
 			// Withdrawing sourceId writes 1 withdrawn event + 6 flagged citer events across 3 open subscribers (21 listener checks).
-			// withdrawMemory runs 2 activeDependentIds Memory.search calls (pre-lock plan + in-txn check), and flagAccessCache shares
-			// at most 1 Memory.search([sourceId]) across all 6 flagged events x 3 subscribers (instead of 6 x 3 = 18 searches).
+			// The first flagged event hits the simulated transient search failure (which clears flagAccessCache), and the remaining
+			// 5 flagged events retry and share a single successful Memory.search([sourceId]).
 			await MemoryItemResource.delete(queryTarget('', { id: sourceId }), {
 				user: aliceUser,
 				headers: { 'if-match': '"1"' },
 			});
-			await subAlice.waitForCount(8);
-			await subBob.waitForCount(7);
-			await subDave.waitForCount(7);
+			await subAlice.waitForCount(7);
+			await subBob.waitForCount(6);
+			await subDave.waitForCount(6);
 
-			assert.ok(memorySearchCalls <= 3, `expected <= 3 Memory.search calls, got ${memorySearchCalls}`);
+			assert.ok(memorySearchCalls <= 4, `expected <= 4 Memory.search calls, got ${memorySearchCalls}`);
 			assert.equal(watchGetCalls, 0);
 			// Only the DELETE request's own prepareContext resolves user:alice once; all 21 subscriber checks hit principalCache.
 			assert.equal(grantGetCalls, 1);
+			assert.equal(customResolverCalls, 1);
 		} finally {
+			setPrincipalResolver(null);
 			Memory.search = origMemorySearch;
 			MemoryWatch.get = origWatchGet;
 			ScopeGrant.get = origGrantGet;
@@ -859,16 +879,30 @@ describe('Level 2: MemoryWatch, watch=true on search/bootstrap, and /MemoryEvent
 			await subDave.close();
 		}
 
-		// A stalled subscriber that does not drain its iterator is closed once > 256 events accumulate.
+		// 1) A draining subscriber survives a synchronous burst of 300 events even when the first filter step awaits I/O.
+		// 2) A stalled subscriber that does not drain its iterator is closed once > 256 events accumulate in its client buffer.
 		const origSubscribe = Memory.subscribe;
-		let pushUpstream;
+		let upstreamQueue = [];
+		let upstreamWaiter;
+		const emitUpstream = (ev) => {
+			if (upstreamWaiter) {
+				const resolve = upstreamWaiter;
+				upstreamWaiter = undefined;
+				resolve({ value: ev, done: false });
+			} else {
+				upstreamQueue.push(ev);
+			}
+		};
 		Memory.subscribe = async () => ({
 			end() {},
 			[Symbol.asyncIterator]() {
 				return {
 					next() {
+						if (upstreamQueue.length > 0) {
+							return Promise.resolve({ value: upstreamQueue.shift(), done: false });
+						}
 						return new Promise((resolve) => {
-							pushUpstream = (ev) => resolve({ value: ev, done: false });
+							upstreamWaiter = resolve;
 						});
 					},
 					return() {
@@ -879,10 +913,20 @@ describe('Level 2: MemoryWatch, watch=true on search/bootstrap, and /MemoryEvent
 		});
 
 		try {
-			const stalledStream = await MemoryResource.subscribe(queryTarget('', { rest: '' }), { user: bobUser });
-			for (let rev = 1; rev <= 260; rev += 1) {
-				const send = pushUpstream;
-				send({
+			let firstLookup = true;
+			setPrincipalResolver(async (ctx, next) => {
+				if (firstLookup) {
+					firstLookup = false;
+					await new Promise((resolve) => setTimeout(resolve, 5));
+				}
+				return next(ctx);
+			});
+			const drainingSub = collectEvents(
+				await MemoryResource.subscribe(queryTarget('', { rest: '' }), { user: bobUser }),
+			);
+			const stalledStream = await MemoryResource.subscribe(queryTarget('', { rest: '' }), { user: daveUser });
+			for (let rev = 1; rev <= 300; rev += 1) {
+				emitUpstream({
 					id: 'mem-overflow-0001',
 					type: 'put',
 					value: {
@@ -894,14 +938,18 @@ describe('Level 2: MemoryWatch, watch=true on search/bootstrap, and /MemoryEvent
 						lastEventKind: 'revised',
 					},
 				});
-				await new Promise((resolve) => setImmediate(resolve));
 			}
-			const drained = [];
+			await drainingSub.waitForCount(300);
+			assert.equal(drainingSub.received.length, 300);
+			await drainingSub.close();
+
+			const drainedStalled = [];
 			for await (const ev of stalledStream) {
-				drained.push(ev);
+				drainedStalled.push(ev);
 			}
-			assert.equal(drained.length, 256);
+			assert.equal(drainedStalled.length, 256);
 		} finally {
+			setPrincipalResolver(null);
 			Memory.subscribe = origSubscribe;
 		}
 	});

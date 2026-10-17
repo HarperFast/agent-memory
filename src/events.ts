@@ -53,6 +53,7 @@ class SubscriptionQueue implements AsyncIterable<MemoryEvent> {
 		if (waiter) {
 			waiter({ value: event, done: false });
 		} else if (this.#buffer.length >= MAX_PENDING_EVENTS_PER_LISTENER) {
+			logStreamOverflow();
 			this.close();
 		} else {
 			this.#buffer.push(event);
@@ -106,10 +107,20 @@ export const WATCH_MAX_IDS = 100;
 const WATCH_FIELDS = ['ids', 'ttlSeconds'];
 
 const MAX_PENDING_EVENTS_PER_LISTENER = 256;
+const FILTER_STALL_TIMEOUT_MS = 30_000;
 const MAX_DEDUP_ENTRIES = 1024;
-const MAX_WATCHES_PER_PRINCIPAL = 4096;
+const WATCH_PRUNE_THRESHOLD = 4096;
 const ERROR_LOG_INTERVAL_MS = 60_000;
 const PRINCIPAL_CACHE_TTL_MS = 5_000;
+
+let lastOverflowLogAt = 0;
+function logStreamOverflow(): void {
+	const now = Date.now();
+	if (now - lastOverflowLogAt >= ERROR_LOG_INTERVAL_MS) {
+		lastOverflowLogAt = now;
+		normalizeError(new Error('Subscription stream closed: pending event buffer exceeded 256 events'), 'subscribe');
+	}
+}
 
 function memoryWatchIdFor(principalId: string, memoryId: string): string {
 	return `${principalId}:${memoryId}`;
@@ -127,7 +138,8 @@ const seedingWatchPrincipals = new Map<string, Promise<void>>();
 const flagAccessCache = new Map<string, Promise<any>>();
 
 function recordWatchInMemory(principalId: string, memoryId: string, expiresAtMs: number, keepLonger = true): void {
-	if (!Number.isFinite(expiresAtMs) || expiresAtMs <= Date.now()) return;
+	const now = Date.now();
+	if (!Number.isFinite(expiresAtMs) || expiresAtMs <= now) return;
 	if (!seededWatchPrincipals.has(principalId) && !seedingWatchPrincipals.has(principalId)) return;
 	let bucket = watchesByPrincipal.get(principalId);
 	if (!bucket) {
@@ -136,9 +148,10 @@ function recordWatchInMemory(principalId: string, memoryId: string, expiresAtMs:
 	}
 	const previous = bucket.get(memoryId);
 	if (keepLonger && previous !== undefined && previous >= expiresAtMs) return;
-	if (previous === undefined && bucket.size >= MAX_WATCHES_PER_PRINCIPAL) {
-		const oldestKey = bucket.keys().next().value;
-		if (oldestKey !== undefined) bucket.delete(oldestKey);
+	if (previous === undefined && bucket.size >= WATCH_PRUNE_THRESHOLD) {
+		for (const [k, exp] of bucket) {
+			if (exp <= now) bucket.delete(k);
+		}
 	}
 	bucket.set(memoryId, expiresAtMs);
 }
@@ -219,6 +232,7 @@ interface CachedPrincipal {
 
 const principalCache = new Map<string, CachedPrincipal>();
 const inflightPrincipals = new Map<string, Promise<Principal>>();
+let nextListenerCacheId = 0;
 
 function scopeGrantTable(): any {
 	return (databases as any).memory?.ScopeGrant;
@@ -238,8 +252,11 @@ function harperUserCacheKey(context: Record<string, unknown>): string | undefine
 	return `${user.username}\0${roleName}\0${isSuper}`;
 }
 
-async function resolveSubscriberPrincipal(authContext: Record<string, unknown>): Promise<Principal> {
-	const key = harperUserCacheKey(authContext);
+async function resolveSubscriberPrincipal(
+	authContext: Record<string, unknown>,
+	fallbackKey?: string,
+): Promise<Principal> {
+	const key = harperUserCacheKey(authContext) ?? fallbackKey;
 	if (!key) {
 		return resolvePrincipal(authContext);
 	}
@@ -273,7 +290,7 @@ async function putWatchKeepingLongerTtl(
 	txn: object,
 ): Promise<Date> {
 	const id = memoryWatchIdFor(principalId, memoryId);
-	await MemoryWatch.lock?.(id, { scope: 'node' }, txn);
+	await MemoryWatch.lock(id, { scope: 'node' }, txn);
 	const existing = await MemoryWatch.get(id, txn);
 	if (existing?.expiresAt) {
 		const existingExpiresAt = new Date(existing.expiresAt);
@@ -372,13 +389,19 @@ interface DeliverableEvent {
 
 async function hasVisibleFlag(record: any, principal: Principal): Promise<boolean> {
 	if (flagAccessCache.size >= MAX_DEDUP_ENTRIES) flagAccessCache.clear();
-	const [view] = await forReader([toMemoryView(record)], principal, {}, flagAccessCache);
-	return Boolean(view?.needsReview);
+	try {
+		const [view] = await forReader([toMemoryView(record)], principal, {}, flagAccessCache);
+		return Boolean(view?.needsReview);
+	} catch (error) {
+		flagAccessCache.clear();
+		throw error;
+	}
 }
 
 async function resolveDeliverableEvent(
 	raw: any,
 	context: Record<string, unknown>,
+	listenerCacheKey?: string,
 ): Promise<DeliverableEvent | undefined> {
 	const eventRecord = raw?.value;
 	const id = String(raw?.id ?? eventRecord?.id ?? '');
@@ -394,7 +417,7 @@ async function resolveDeliverableEvent(
 	});
 	let currentPrincipal: Principal;
 	try {
-		currentPrincipal = await resolveSubscriberPrincipal(authContext);
+		currentPrincipal = await resolveSubscriberPrincipal(authContext, listenerCacheKey);
 	} catch (error) {
 		if (isCallerSafe(error) && error.statusCode === 401) return undefined;
 		throw error;
@@ -527,7 +550,9 @@ async function ensureHubSubscription(): Promise<void> {
 					} catch (error) {
 						if (watchHubSub === watchSub) normalizeError(error, 'subscribe');
 					} finally {
-						if (watchHubSub === watchSub) teardownActiveHub();
+						if (watchHubSub === watchSub) {
+							teardownActiveHub();
+						}
 					}
 				})();
 			}
@@ -543,7 +568,9 @@ async function ensureHubSubscription(): Promise<void> {
 					} catch (error) {
 						if (grantHubSub === grantSub) normalizeError(error, 'subscribe');
 					} finally {
-						if (grantHubSub === grantSub) teardownActiveHub();
+						if (grantHubSub === grantSub) {
+							teardownActiveHub();
+						}
 					}
 				})();
 			}
@@ -587,12 +614,14 @@ interface FilteredDelivery {
 }
 
 async function attachToHub(
-	filter: (raw: any) => Promise<FilteredDelivery | undefined>,
+	filter: (raw: any, listenerCacheKey: string) => Promise<FilteredDelivery | undefined>,
 	targetId?: string,
+	prefilter?: (raw: any) => boolean,
 ): Promise<SubscriptionQueue> {
-	const connectedAtMs = Date.now();
+	const listenerCacheKey = `listener:${++nextListenerCacheId}`;
 	const lastSeenById = new Map<string, string>();
 	let pendingCount = 0;
+	let lastFilterProgressAt = Date.now();
 	let chain: Promise<void> = Promise.resolve();
 	let lastErrorLogAt = 0;
 	let listener: HubListener;
@@ -604,14 +633,19 @@ async function attachToHub(
 		close: () => queue.close(),
 		enqueue: (raw) => {
 			if (queue.closed) return;
-			const rawTs =
-				typeof raw?.timestamp === 'number'
-					? raw.timestamp
-					: typeof raw?.localTime === 'number'
-						? raw.localTime
-						: undefined;
-			if (rawTs !== undefined && rawTs < connectedAtMs) return;
-			if (pendingCount + queue.bufferedCount >= MAX_PENDING_EVENTS_PER_LISTENER) {
+			const eventRecord = raw?.value;
+			const id = String(raw?.id ?? eventRecord?.id ?? '');
+			const kind = eventRecord?.lastEventKind;
+			const revision = eventRecord?.revision;
+			if (!id || !isEventKind(kind) || typeof revision !== 'number') return;
+			if (prefilter && !prefilter(raw)) return;
+			const now = Date.now();
+			if (pendingCount === 0) lastFilterProgressAt = now;
+			if (
+				queue.bufferedCount >= MAX_PENDING_EVENTS_PER_LISTENER ||
+				(pendingCount >= MAX_PENDING_EVENTS_PER_LISTENER && now - lastFilterProgressAt >= FILTER_STALL_TIMEOUT_MS)
+			) {
+				logStreamOverflow();
 				queue.close();
 				return;
 			}
@@ -619,7 +653,7 @@ async function attachToHub(
 			chain = chain.then(async () => {
 				try {
 					if (queue.closed) return;
-					const delivered = await filter(raw);
+					const delivered = await filter(raw, listenerCacheKey);
 					if (!delivered || queue.closed) return;
 					const { event, dedupToken } = delivered;
 					const previousToken = lastSeenById.get(event.id);
@@ -633,13 +667,14 @@ async function attachToHub(
 					lastSeenById.set(event.id, dedupToken);
 					queue.push(event);
 				} catch (error) {
-					const now = Date.now();
-					if (now - lastErrorLogAt >= ERROR_LOG_INTERVAL_MS) {
-						lastErrorLogAt = now;
+					const errNow = Date.now();
+					if (errNow - lastErrorLogAt >= ERROR_LOG_INTERVAL_MS) {
+						lastErrorLogAt = errNow;
 						normalizeError(error, 'subscribe');
 					}
 				} finally {
 					pendingCount -= 1;
+					lastFilterProgressAt = Date.now();
 				}
 			});
 		},
@@ -679,11 +714,11 @@ export async function subscribeMemory(
 		const id = String(rawId);
 		const existing = isMemoryId(id) ? await Memory.get(id, ctx) : undefined;
 		if (!existing || !canRead(existing, principal)) throw notFound();
-		return attachToHub(async (raw) => resolveDeliverableEvent(raw, ctx), id);
+		return attachToHub(async (raw, cacheKey) => resolveDeliverableEvent(raw, ctx, cacheKey), id);
 	}
 
 	if (target?.rest || target?.pathname) throw notFound();
-	return attachToHub(async (raw) => resolveDeliverableEvent(raw, ctx));
+	return attachToHub(async (raw, cacheKey) => resolveDeliverableEvent(raw, ctx, cacheKey));
 }
 
 export async function subscribeMemoryEvents(
@@ -698,47 +733,54 @@ export async function subscribeMemoryEvents(
 		throw notFound();
 	}
 
-	const queue = await attachToHub(async (raw) => {
+	const matchesWatchOrOwnFlag = (raw: any): { maybeOwnFlagged: boolean; watchConfirmed: boolean } | undefined => {
 		const eventRecord = raw?.value;
 		const id = String(raw?.id ?? eventRecord?.id ?? '');
 		const kind = eventRecord?.lastEventKind;
 		if (!id || !isEventKind(kind)) return undefined;
-
-		await ensurePrincipalWatchesSeeded(principal.id);
-
-		// Check in-memory watch/ownership before resolving the subscriber's ScopeGrant or redacting provenance, so
-		// unwatched events for other principals do not trigger ScopeGrant or Memory reads.
 		const hasFoldedOrDirectFlag =
 			kind === 'flagged' || ((kind === 'restored' || kind === 'created') && Boolean(eventRecord?.needsReview));
 		const maybeOwnFlagged = hasFoldedOrDirectFlag && (!eventRecord?.ownerId || eventRecord.ownerId === principal.id);
-		let watchConfirmed = false;
-		if (!maybeOwnFlagged) {
-			if (!hasActiveWatch(principal.id, id)) return undefined;
-			watchConfirmed = true;
-		}
+		if (maybeOwnFlagged) return { maybeOwnFlagged: true, watchConfirmed: false };
+		if (!hasActiveWatch(principal.id, id)) return undefined;
+		return { maybeOwnFlagged: false, watchConfirmed: true };
+	};
 
-		const deliverable = await resolveDeliverableEvent(raw, ctx);
-		if (!deliverable) return undefined;
-		const { event, record, currentPrincipal, dedupToken } = deliverable;
+	const queue = await attachToHub(
+		async (raw, cacheKey) => {
+			await ensurePrincipalWatchesSeeded(principal.id);
 
-		if (
-			(event.kind === 'flagged' ||
-				((event.kind === 'restored' || event.kind === 'created') && Boolean(record.needsReview))) &&
-			record.ownerId === currentPrincipal.id
-		) {
-			if (event.kind === 'flagged' || (await hasVisibleFlag(record, currentPrincipal))) {
-				return { event, dedupToken };
+			// Check in-memory watch/ownership before resolving the subscriber's ScopeGrant or redacting provenance, so
+			// unwatched events for other principals do not trigger ScopeGrant or Memory reads.
+			const precheck = matchesWatchOrOwnFlag(raw);
+			if (!precheck) return undefined;
+			const { watchConfirmed } = precheck;
+
+			const deliverable = await resolveDeliverableEvent(raw, ctx, cacheKey);
+			if (!deliverable) return undefined;
+			const { event, record, currentPrincipal, dedupToken } = deliverable;
+
+			if (
+				(event.kind === 'flagged' ||
+					((event.kind === 'restored' || event.kind === 'created') && Boolean(record.needsReview))) &&
+				record.ownerId === currentPrincipal.id
+			) {
+				if (event.kind === 'flagged' || (await hasVisibleFlag(record, currentPrincipal))) {
+					return { event, dedupToken };
+				}
 			}
-		}
 
-		if (!watchConfirmed || currentPrincipal.id !== principal.id) {
-			if (currentPrincipal.id !== principal.id) {
-				await ensurePrincipalWatchesSeeded(currentPrincipal.id);
+			if (!watchConfirmed || currentPrincipal.id !== principal.id) {
+				if (currentPrincipal.id !== principal.id) {
+					await ensurePrincipalWatchesSeeded(currentPrincipal.id);
+				}
+				if (!hasActiveWatch(currentPrincipal.id, event.id)) return undefined;
 			}
-			if (!hasActiveWatch(currentPrincipal.id, event.id)) return undefined;
-		}
-		return { event, dedupToken };
-	});
+			return { event, dedupToken };
+		},
+		undefined,
+		(raw) => !seededWatchPrincipals.has(principal.id) || Boolean(matchesWatchOrOwnFlag(raw)),
+	);
 
 	try {
 		await ensurePrincipalWatchesSeeded(principal.id);

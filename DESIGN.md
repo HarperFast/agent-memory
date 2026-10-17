@@ -352,25 +352,30 @@ Three levels, built in order:
 
 1. **Record changes**: `Memory` (`/Memory` and `/Memory/<id>`) supports Harper real-time subscriptions
    over WebSocket and SSE (`Accept: text/event-stream`). Every event is checked against the subscriber's
-   read rule (`canRead`) at delivery time: `ScopeGrant` rows are cached for up to 5 s and invalidated via
-   the worker hub's `ScopeGrant` subscription (and any custom principal resolver is called on each event),
-   so a scope narrowing or grant revocation revokes visibility mid-subscription; Harper user role
-   assignments on `context.user` are captured when the connection opens and take effect on reconnect. For
-   `withdrawn`, read access checks the memory's scope labels ignoring `status = withdrawn` (matching
-   Provenance), so label readers and watchers learn that a shared memory they could read was withdrawn
-   (`GET /Memory/<id>` still returns 404 to non-owners). Events carry `{ id, kind, revision }` — never
-   content — with `kind` one of `created`, `revised`, `superseded`, `withdrawn`, `restored`, or `flagged`
-   (`needsReview` set), so a reader re-reads through the guarded `GET`. Subscriptions are live-only
-   (`omitCurrent: true`, ignoring upstream events whose audit timestamp predates the subscription start)
-   with at-most-once delivery and no replay across disconnects; if a slow subscriber accumulates more than
-   256 pending events its stream is closed so the client reconnects and re-reads watched ids (comparing
-   `revision`) or re-bootstraps (`watch=true`) to catch up.
+   read rule (`canRead`) at delivery time: `ScopeGrant` rows and custom principal resolver results are
+   cached for up to 5 s and invalidated via the worker hub's `ScopeGrant` subscription, so a scope
+   narrowing or grant revocation revokes visibility mid-subscription; Harper user role assignments on
+   `context.user` are captured when the connection opens and take effect on reconnect. For `withdrawn`,
+   read access checks the memory's scope labels ignoring `status = withdrawn` (matching Provenance), so
+   label readers and watchers learn that a shared memory they could read was withdrawn (`GET /Memory/<id>`
+   still returns 404 to non-owners). Events carry `{ id, kind, revision }` — never content — with `kind`
+   one of `created`, `revised`, `superseded`, `withdrawn`, `restored`, or `flagged` (`needsReview` set),
+   so a reader re-reads through the guarded `GET`. Subscriptions are live-only (`omitCurrent: true`) with
+   at-most-once delivery and no replay across disconnects; if Harper core re-emits existing rows on a
+   table reload (`copyApply`, `harper-pro#495`) beyond the per-connection 1,024-entry deduplication
+   window, rows may replay their stored `lastEventKind`, which clients handle idempotently by comparing
+   `revision`. If a slow subscriber accumulates more than 256 undrained events in its client buffer (or
+   its filter stalls for 30 s with 256 pending events), or if the worker's `Memory`, `MemoryWatch`, or
+   `ScopeGrant` subscription ends, active streams close so the client reconnects and re-reads watched ids
+   (comparing `revision`) or re-bootstraps (`watch=true`) to catch up.
 2. **Watches**: `POST /Memory/watch { ids, ttlSeconds? }` (1–100 ids; `ttlSeconds` integer in
    `1..86400`, default 3600) and `watch=true` on search and bootstrap record `MemoryWatch` rows
    (`<principalId>:<memoryId>`, `expiresAt @expiresAt`), keeping whichever `expiresAt` is later when a
-   watch already exists and returning the earliest effective `expiresAt` across the watched ids.
-   `POST /Memory/watch` requires read access on every requested id and rejects unreadable ids with the
-   same 404 (`memory_not_found`) as missing ones before writing any watch. A per-caller event stream at
+   watch already exists and returning the earliest effective `expiresAt` across the watched ids. Each
+   worker indexes active watches per principal in memory (lazily pruning expired entries on lookup and
+   sweeping expired entries whenever a principal's bucket reaches 4,096 watches). `POST /Memory/watch`
+   requires read access on every requested id and rejects unreadable ids with the same 404
+   (`memory_not_found`) as missing ones before writing any watch. A per-caller event stream at
    `/MemoryEvents` (`<urlPath>Events` when `urlPath` is customized; identity comes from `context`, with no
    principal in the path — `/MemoryEvents/<principal>` returns 404) delivers `{ id, kind, revision }` over
    SSE or WebSocket whenever:
