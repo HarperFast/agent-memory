@@ -325,10 +325,11 @@ sends identical rows.
   (`global` counts as readable by every imported principal, as the scope mapping already assumes). No
   sent row references a row outside the import set.
 - **Order**: successors before the rows they supersede, so after an interrupted run every committed
-  `superseded` row has its replacement committed, and the CLI reports any created row whose replacement
+  `superseded` row has its replacement committed, and the CLI reports any imported row whose replacement
   came back `conflict` (`dependsOnConflict`).
 - **Not imported**: `ephemeral` rows (the only Flair tier with `expiresAt`; the target has no expiry),
-  `durability`, embeddings (the target re-embeds through `@embed`), and Flair bookkeeping fields.
+  rows outside the target's content or tag limits (`skipped.invalid`), `durability`, embeddings (the
+  target re-embeds through `@embed`), and Flair bookkeeping fields.
 
 ## Not in v0
 

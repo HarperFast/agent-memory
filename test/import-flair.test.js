@@ -8,9 +8,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { __test } from 'harper';
 import { importMemories } from '../dist/import.js';
+import { memoryTable } from '../dist/lifecycle.js';
 import { createPrincipal } from '../dist/scopes.js';
 import { applySettings, parseSettings } from '../dist/settings.js';
 import {
+	DEFAULT_MAX_CONTENT_CHARS,
 	MAX_BATCH_SIZE,
 	mapFlairMemories,
 	memoryIdFor,
@@ -245,6 +247,52 @@ describe('mapFlairMemories', () => {
 		assert.equal(summary.byStatus.active, 1);
 	});
 
+	it('skips rows that fail server content or tag limits and resolves links to them as skipped', () => {
+		const base = { agentId: 'agent-ann', createdAt: '2026-01-01T00:00:00Z' };
+		const input = [
+			{ ...base, id: 'blank', content: '   ' },
+			{ ...base, id: 'overlong', content: 'x'.repeat(11) },
+			{ ...base, id: 'many-tags', content: 'ok', tags: Array.from({ length: 21 }, (_, index) => `t${index}`) },
+			{ ...base, id: 'empty-tag', content: 'ok', tags: ['valid', ' '] },
+			{ ...base, id: 'long-tag', content: 'ok', tags: ['y'.repeat(65)] },
+			{ ...base, id: 'valid', content: 'ok', createdAt: '2026-01-02T00:00:00Z', supersedes: 'blank' },
+		];
+		const { rows, summary } = mapFlairMemories(input, principalMap, { maxContentChars: 10 });
+		assert.deepEqual(
+			rows.map((row) => row.id),
+			[memoryIdFor('valid')],
+		);
+		assert.equal(rows[0].supersedes, undefined);
+		assert.deepEqual(summary.skipped.invalid, [
+			{ id: 'blank', reason: 'content_required' },
+			{ id: 'empty-tag', reason: 'invalid_tags' },
+			{ id: 'long-tag', reason: 'tags_too_long' },
+			{ id: 'many-tags', reason: 'tags_too_many' },
+			{ id: 'overlong', reason: 'content_too_long' },
+		]);
+		assert.deepEqual(summary.supersedes.unresolved, [{ from: 'valid', to: 'blank', reason: 'skipped' }]);
+	});
+
+	it('breaks createdAt ties by target id to match the server newest-superseder rule', async () => {
+		// Flair order: "c" < "d", but sha256("flair:c") = "fbea..." > sha256("flair:d") = "44ed...".
+		assert.ok(memoryIdFor('c') > memoryIdFor('d'));
+		const tied = [
+			{ id: 'old', agentId: 'agent-ann', content: 'old', createdAt: '2026-01-01T00:00:00Z' },
+			{ id: 'c', agentId: 'agent-ann', content: 'c', createdAt: '2026-01-02T00:00:00Z', supersedes: 'old' },
+			{ id: 'd', agentId: 'agent-ann', content: 'd', createdAt: '2026-01-02T00:00:00Z', supersedes: 'old' },
+		];
+		const { rows } = mapFlairMemories(tied, principalMap);
+		const oldRow = rows.find((row) => row.id === memoryIdFor('old'));
+		assert.equal(oldRow.supersededBy, memoryIdFor('c'));
+
+		__test.reset();
+		applySettings(parseSettings({}));
+		const root = createPrincipal({ id: 'root', superUser: true });
+		await importMemories({ rows }, root, {});
+		const stored = await memoryTable().get(memoryIdFor('old'), {});
+		assert.equal(stored.supersededBy, oldRow.supersededBy);
+	});
+
 	it('sends only allowlisted fields accepted by importMemories, never embeddings or Flair bookkeeping', async () => {
 		const allowed = new Set([
 			'id',
@@ -269,11 +317,26 @@ describe('mapFlairMemories', () => {
 		__test.reset();
 		applySettings(parseSettings({}));
 		const root = createPrincipal({ id: 'root', superUser: true });
-		const first = await importMemories({ rows }, root, {});
-		assert.deepEqual(
-			first.results,
-			rows.map((row) => ({ id: row.id, result: 'created' })),
-		);
+		const Memory = memoryTable();
+		for (let start = 0; start < rows.length; start += 4) {
+			const batch = rows.slice(start, start + 4);
+			const first = await importMemories({ rows: batch }, root, {});
+			assert.deepEqual(
+				first.results,
+				batch.map((row) => ({ id: row.id, result: 'created' })),
+			);
+			for (const committed of rows.slice(0, start + batch.length)) {
+				const stored = await Memory.get(committed.id, {});
+				if (stored.status === 'superseded') {
+					assert.ok(await Memory.get(stored.supersededBy, {}), 'every superseded row has its replacement committed');
+				}
+			}
+		}
+		for (const row of rows) {
+			const stored = await Memory.get(row.id, {});
+			assert.equal(stored.status, row.status);
+			assert.equal(stored.supersededBy, row.supersededBy ?? null);
+		}
 		const second = await importMemories({ rows }, root, {});
 		assert.deepEqual(
 			second.results,
@@ -289,6 +352,7 @@ describe('mapFlairMemories', () => {
 		assert.throws(() => mapFlairMemories([{ ...base, archived: 'yes' }], principalMap), /archived/);
 		assert.throws(() => mapFlairMemories([base, base], principalMap), /more than once/);
 		assert.throws(() => mapFlairMemories([{ ...base, id: undefined }], principalMap), /#1 has no string id/);
+		assert.throws(() => mapFlairMemories([base], principalMap, { maxContentChars: 0 }), /maxContentChars/);
 		assert.throws(() => parseJsonl('{"id":"a"}\n{nope\n'), /line 2/);
 	});
 
@@ -326,9 +390,7 @@ describe('import-flair CLI', () => {
 	});
 
 	it('posts ordered batches with target credentials from the environment and tallies results', async () => {
-		const target = await stubServer(
-			importHandler((row) => (row.id === memoryIdFor('m04') ? 'conflict' : 'created')),
-		);
+		const target = await stubServer(importHandler((row) => (row.id === memoryIdFor('m04') ? 'conflict' : 'created')));
 		try {
 			const result = await cli(
 				['--from-jsonl', FIXTURE, '--principal-map', PRINCIPAL_MAP, '--target', `${target.url}/`, '--batch-size', '4'],
@@ -420,15 +482,21 @@ describe('import-flair CLI', () => {
 			assert.match(result.stderr, /batch 2\/3 failed: HTTP 400, code invalid_id, row 1 \([0-9a-f]{32}\)/);
 			assert.ok(result.stderr.includes(secondBatch[1].id));
 			assert.doesNotMatch(result.stderr, /SECRET/);
+			const partial = JSON.parse(result.stdout);
+			assert.equal(partial.partial, true);
+			assert.equal(partial.result.created, 4);
 		} finally {
 			target.close();
 		}
 	});
 
-	it('lists created rows whose replacement came back as a conflict', async () => {
-		for (const batchSize of ['4', '100']) {
+	it('lists created or unchanged rows whose replacement came back as a conflict', async () => {
+		for (const [batchSize, nonConflictResult] of [
+			['4', 'created'],
+			['100', 'unchanged'],
+		]) {
 			const target = await stubServer(
-				importHandler((row) => (row.id === memoryIdFor('m03') ? 'conflict' : 'created')),
+				importHandler((row) => (row.id === memoryIdFor('m03') ? 'conflict' : nonConflictResult)),
 			);
 			try {
 				const result = await cli(
@@ -544,6 +612,10 @@ describe('import-flair CLI', () => {
 					String(MAX_BATCH_SIZE + 1),
 				],
 				/--batch-size/,
+			],
+			[
+				['--from-jsonl', FIXTURE, '--principal-map', PRINCIPAL_MAP, '--dry-run', '--max-content-chars', '100001'],
+				/--max-content-chars/,
 			],
 			[['--bogus'], /bogus/],
 		]) {

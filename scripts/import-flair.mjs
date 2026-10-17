@@ -1,11 +1,15 @@
 #!/usr/bin/env node
 import { createHash } from 'node:crypto';
 import { realpathSync } from 'node:fs';
-import { link, readFile, unlink, writeFile } from 'node:fs/promises';
+import { link, open, readFile, unlink } from 'node:fs/promises';
 import { parseArgs } from 'node:util';
 
 export const MAX_BATCH_SIZE = 100;
-const REQUEST_TIMEOUT_MS = 120_000;
+export const DEFAULT_MAX_CONTENT_CHARS = 20_000;
+const MAX_CONTENT_CHARS_LIMIT = 100_000;
+const TAGS_MAX_ITEMS = 20;
+const TAG_MAX_CHARS = 64;
+const REQUEST_TIMEOUT_MS = 300_000;
 const FLAIR_FIELDS = [
 	'id',
 	'agentId',
@@ -26,12 +30,10 @@ const LOOPBACK_HOSTS = new Set(['localhost', '[::1]']);
 
 class UsageError extends Error {}
 
-// DESIGN.md "Import": the Flair import client derives id from sha256('flair:' + flairId)[:32].
 export function memoryIdFor(flairId) {
 	return createHash('sha256').update(`flair:${flairId}`).digest('hex').slice(0, 32);
 }
 
-// DESIGN.md "Identity": principal ids must fit a 128-character `user:<id>` scope label.
 function isValidPrincipalId(id) {
 	return typeof id === 'string' && id.length > 0 && id.length <= 122 && !/[\s:*]/.test(id);
 }
@@ -101,11 +103,29 @@ function validateFlairRow(row, index) {
 	}
 }
 
+function flairRowLimitReason(row, maxContentChars) {
+	const contentLength = row.content.trim().length;
+	if (contentLength === 0) return 'content_required';
+	if (contentLength > maxContentChars) return 'content_too_long';
+	if (row.tags) {
+		if (row.tags.length > TAGS_MAX_ITEMS) return 'tags_too_many';
+		for (const tag of row.tags) {
+			const trimmed = tag.trim();
+			if (trimmed.length === 0) return 'invalid_tags';
+			if (trimmed.length > TAG_MAX_CHARS) return 'tags_too_long';
+		}
+	}
+	return null;
+}
+
 function increment(counts, key) {
 	counts.set(key, (counts.get(key) ?? 0) + 1);
 }
 
-export function mapFlairMemories(flairRows, principalMap) {
+export function mapFlairMemories(flairRows, principalMap, { maxContentChars = DEFAULT_MAX_CONTENT_CHARS } = {}) {
+	if (!Number.isInteger(maxContentChars) || maxContentChars < 1 || maxContentChars > MAX_CONTENT_CHARS_LIMIT) {
+		throw new Error(`maxContentChars must be an integer from 1 to ${MAX_CONTENT_CHARS_LIMIT}`);
+	}
 	const byFlairId = new Map();
 	const createdMs = new Map();
 	flairRows.forEach((row, index) => {
@@ -122,6 +142,7 @@ export function mapFlairMemories(flairRows, principalMap) {
 	const unknownVisibility = new Map();
 	const byStatus = { active: 0, superseded: 0, withdrawn: 0 };
 	const unresolved = [];
+	const invalid = [];
 	let ephemeral = 0;
 
 	const eligible = new Map();
@@ -138,6 +159,11 @@ export function mapFlairMemories(flairRows, principalMap) {
 			ephemeral++;
 			continue;
 		}
+		const limitReason = flairRowLimitReason(row, maxContentChars);
+		if (limitReason) {
+			invalid.push({ id: row.id, reason: limitReason });
+			continue;
+		}
 		// Flair reads only the literal "private" as owner-only; any other value is readable by every agent.
 		const scopes = row.visibility === 'private' ? [`user:${ownerId}`] : ['global'];
 		if (row.visibility != null && row.visibility !== 'private' && row.visibility !== 'shared') {
@@ -151,7 +177,6 @@ export function mapFlairMemories(flairRows, principalMap) {
 		const target = entry.flair.supersedes;
 		if (!target) continue;
 		const predecessor = eligible.get(target);
-		// DESIGN.md supersession: every reader of the old memory must be able to read its replacement.
 		// `global` covers every imported principal, as the visibility mapping already assumes.
 		const narrows =
 			predecessor &&
@@ -197,6 +222,13 @@ export function mapFlairMemories(flairRows, principalMap) {
 		order.push(flairId);
 	}
 
+	const compareByTargetNewest = (a, b) => {
+		const delta = createdMs.get(a) - createdMs.get(b);
+		if (delta !== 0) return delta;
+		const idA = eligible.get(a).id;
+		const idB = eligible.get(b).id;
+		return idA < idB ? -1 : idA > idB ? 1 : 0;
+	};
 	const latestLiveSuccessor = new Map();
 	for (const flairId of order) {
 		const target = predecessorOf.get(flairId);
@@ -204,7 +236,7 @@ export function mapFlairMemories(flairRows, principalMap) {
 			continue;
 		}
 		const current = latestLiveSuccessor.get(target);
-		if (!current || compareByCreated(current, flairId) < 0) latestLiveSuccessor.set(target, flairId);
+		if (!current || compareByTargetNewest(current, flairId) < 0) latestLiveSuccessor.set(target, flairId);
 	}
 
 	const rows = order.map((flairId) => {
@@ -230,7 +262,7 @@ export function mapFlairMemories(flairRows, principalMap) {
 		source: 'flair',
 		read: flairRows.length,
 		toImport: rows.length,
-		skipped: { unmappedAgents: Object.fromEntries(unmappedAgents), ephemeral },
+		skipped: { unmappedAgents: Object.fromEntries(unmappedAgents), ephemeral, invalid },
 		byOwner: Object.fromEntries(byOwner),
 		byScope: Object.fromEntries(byScope),
 		byStatus,
@@ -267,15 +299,33 @@ function basicAuth(env, userVar, passVar, defaultUser) {
 	return `Basic ${Buffer.from(`${user}:${pass}`).toString('base64')}`;
 }
 
+function requestFailureCode(error) {
+	const candidate = error?.cause?.code ?? error?.code ?? error?.name;
+	return typeof candidate === 'string' && ERROR_CODE.test(candidate) ? candidate : 'request_failed';
+}
+
 async function readFlairLive(flairBase, authorization) {
-	const response = await fetch(`${flairBase}/Memory/?select(${FLAIR_FIELDS.join(',')})`, {
-		headers: { Authorization: authorization, Accept: 'application/json' },
-		redirect: 'error',
-		signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-	});
+	let response;
+	try {
+		response = await fetch(`${flairBase}/Memory/?select(${FLAIR_FIELDS.join(',')})`, {
+			headers: { Authorization: authorization, Accept: 'application/json' },
+			redirect: 'error',
+			signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+		});
+	} catch (error) {
+		throw new Error(`reading Flair memories failed: ${requestFailureCode(error)}`, { cause: error });
+	}
 	if (!response.ok) throw new Error(`reading Flair memories failed: HTTP ${response.status}`);
-	// A JSON parse error message quotes the body, which is memory content.
-	const rows = await response.json().catch(() => null);
+	let rows;
+	try {
+		// A JSON parse error message quotes the body, which is memory content.
+		rows = await response.json();
+	} catch (error) {
+		if (error?.name !== 'SyntaxError') {
+			throw new Error(`reading Flair memories failed: ${requestFailureCode(error)}`, { cause: error });
+		}
+		rows = null;
+	}
 	if (!Array.isArray(rows)) throw new Error('reading Flair memories failed: response is not a JSON array');
 	return rows;
 }
@@ -299,28 +349,45 @@ async function postBatches(rows, { target, authorization, batchSize, stderr }) {
 	const result = { created: 0, unchanged: 0, conflict: 0, conflicts: [], dependsOnConflict: [] };
 	const conflictIds = new Set();
 	const batchCount = Math.ceil(rows.length / batchSize);
+	const failBatch = (batch, detail, cause) => {
+		const error = new Error(
+			`batch ${batch}/${batchCount} failed: ${detail}; earlier batches are committed and a re-run resumes`,
+			cause ? { cause } : undefined,
+		);
+		if (batch > 1) error.partialResult = result;
+		return error;
+	};
 	for (let start = 0, batch = 1; start < rows.length; start += batchSize, batch++) {
 		const batchRows = rows.slice(start, start + batchSize);
-		const response = await fetch(url, {
-			method: 'POST',
-			headers: { Authorization: authorization, 'Content-Type': 'application/json', Accept: 'application/json' },
-			body: JSON.stringify({ rows: batchRows }),
-			redirect: 'error',
-			signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-		});
-		if (!response.ok) {
-			throw new Error(
-				`batch ${batch}/${batchCount} failed: HTTP ${response.status}${await errorDetail(response, batchRows)}; earlier batches are committed and a re-run resumes`,
-			);
+		let response;
+		try {
+			response = await fetch(url, {
+				method: 'POST',
+				headers: { Authorization: authorization, 'Content-Type': 'application/json', Accept: 'application/json' },
+				body: JSON.stringify({ rows: batchRows }),
+				redirect: 'error',
+				signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+			});
+		} catch (error) {
+			throw failBatch(batch, requestFailureCode(error), error);
 		}
-		const body = await response.json().catch(() => null);
+		if (!response.ok) {
+			throw failBatch(batch, `HTTP ${response.status}${await errorDetail(response, batchRows)}`);
+		}
+		let body;
+		try {
+			body = await response.json();
+		} catch (error) {
+			if (error?.name !== 'SyntaxError') throw failBatch(batch, requestFailureCode(error), error);
+			body = null;
+		}
 		const results = body?.results;
 		if (
 			!Array.isArray(results) ||
 			results.length !== batchRows.length ||
 			!results.every((entry, index) => entry?.id === batchRows[index].id && IMPORT_RESULTS.has(entry.result))
 		) {
-			throw new Error(`batch ${batch}/${batchCount}: response does not carry one result per row in order`);
+			throw failBatch(batch, 'response does not carry one result per row in order');
 		}
 		results.forEach((entry) => {
 			result[entry.result]++;
@@ -332,7 +399,7 @@ async function postBatches(rows, { target, authorization, batchSize, stderr }) {
 		// Successors come first, so a conflicted successor is already known when its predecessor's result arrives.
 		results.forEach((entry, index) => {
 			const { id, supersededBy } = batchRows[index];
-			if (entry.result === 'created' && conflictIds.has(supersededBy)) {
+			if (entry.result !== 'conflict' && conflictIds.has(supersededBy)) {
 				result.dependsOnConflict.push({ id, supersededBy });
 			}
 		});
@@ -341,17 +408,20 @@ async function postBatches(rows, { target, authorization, batchSize, stderr }) {
 	return result;
 }
 
-// Written aside and linked into place, so an interrupted write never leaves a truncated snapshot under the
-// final name, and an existing file is never replaced.
+// Written aside, fsynced and linked into place, so an interrupted write never leaves a truncated snapshot
+// under the final name, and an existing file is never replaced.
 async function writeSnapshot(path, flairRows) {
 	const partial = `${path}.${process.pid}.partial`;
+	let handle;
 	try {
-		await writeFile(partial, flairRows.map((row) => JSON.stringify(row)).join('\n') + '\n', {
-			mode: 0o600,
-			flag: 'wx',
-		});
+		handle = await open(partial, 'wx', 0o600);
+		await handle.writeFile(flairRows.map((row) => JSON.stringify(row)).join('\n') + '\n');
+		await handle.sync();
+		await handle.close();
+		handle = null;
 		await link(partial, path);
 	} finally {
+		await handle?.close().catch(() => {});
 		await unlink(partial).catch(() => {});
 	}
 }
@@ -363,18 +433,21 @@ const OPTIONS = {
 	'principal-map': { type: 'string' },
 	target: { type: 'string' },
 	'batch-size': { type: 'string', default: String(MAX_BATCH_SIZE) },
+	'max-content-chars': { type: 'string', default: String(DEFAULT_MAX_CONTENT_CHARS) },
 	'dry-run': { type: 'boolean', default: false },
 	help: { type: 'boolean', default: false },
 };
 
 const USAGE = `Usage: node scripts/import-flair.mjs (--flair <url> [--snapshot <file>] | --from-jsonl <file>)
        --principal-map <file> (--dry-run | --target <url>) [--batch-size <1-${MAX_BATCH_SIZE}>]
+       [--max-content-chars <1-${MAX_CONTENT_CHARS_LIMIT}>]
 
 Environment: FLAIR_ADMIN_USER (default admin), FLAIR_ADMIN_PASS for --flair;
              AGENT_MEMORY_USER, AGENT_MEMORY_PASS (a super_user) for --target.
 `;
 
 export async function run(argv, env, { stdout = process.stdout, stderr = process.stderr } = {}) {
+	let mappedSummary;
 	try {
 		const { values } = parseArgs({ args: argv, options: OPTIONS, strict: true });
 		if (values.help) {
@@ -390,6 +463,10 @@ export async function run(argv, env, { stdout = process.stdout, stderr = process
 		const batchSize = Number(values['batch-size']);
 		if (!Number.isInteger(batchSize) || batchSize < 1 || batchSize > MAX_BATCH_SIZE) {
 			throw new UsageError(`--batch-size must be an integer from 1 to ${MAX_BATCH_SIZE}`);
+		}
+		const maxContentChars = Number(values['max-content-chars']);
+		if (!Number.isInteger(maxContentChars) || maxContentChars < 1 || maxContentChars > MAX_CONTENT_CHARS_LIMIT) {
+			throw new UsageError(`--max-content-chars must be an integer from 1 to ${MAX_CONTENT_CHARS_LIMIT}`);
 		}
 		const target = values['dry-run'] ? null : assertSafeUrl(values.target, '--target');
 		const targetAuthorization = target && basicAuth(env, 'AGENT_MEMORY_USER', 'AGENT_MEMORY_PASS');
@@ -422,7 +499,8 @@ export async function run(argv, env, { stdout = process.stdout, stderr = process
 			flairRows = parseJsonl(text);
 		}
 
-		const { rows, summary } = mapFlairMemories(flairRows, principalMap);
+		const { rows, summary } = mapFlairMemories(flairRows, principalMap, { maxContentChars });
+		mappedSummary = summary;
 		if (values['dry-run']) {
 			stdout.write(JSON.stringify({ dryRun: true, summary }, null, '\t') + '\n');
 			return 0;
@@ -431,8 +509,18 @@ export async function run(argv, env, { stdout = process.stdout, stderr = process
 		stdout.write(JSON.stringify({ dryRun: false, summary, result }, null, '\t') + '\n');
 		return 0;
 	} catch (error) {
-		const cause = error.cause?.code ?? error.cause?.message;
-		stderr.write(`import-flair: ${error.message}${cause ? ` (${cause})` : ''}\n`);
+		if (error.partialResult && mappedSummary) {
+			stdout.write(
+				JSON.stringify(
+					{ dryRun: false, partial: true, summary: mappedSummary, result: error.partialResult },
+					null,
+					'\t',
+				) + '\n',
+			);
+		}
+		const cause = error.cause?.code ?? error.code;
+		const suffix = cause && !error.message.includes(cause) ? ` (${cause})` : '';
+		stderr.write(`import-flair: ${error.message}${suffix}\n`);
 		if (error instanceof UsageError || error.code?.startsWith?.('ERR_PARSE_ARGS')) {
 			stderr.write(USAGE);
 			return 2;
