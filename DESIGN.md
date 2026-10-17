@@ -281,8 +281,9 @@ one of its supports changing.
 
 Mounted at `urlPath` (default `Memory`, with the per-caller watch stream at `<urlPath>Events`, default
 `MemoryEvents`); every HTTP route class stays `hidden = true`, while `MemoryMcpResource` (registered at
-`MemoryMcp` with `static path = '/MemoryMcp'` and no HTTP verb methods) is mounted with `hidden = false`
-only when the plugin option `mcp` is `true` (default `false`).
+`MemoryMcp` with `static path = '/MemoryMcp'`, no prototype CRUD methods, and `MemoryEndpoint`'s static
+verb and `connect` overrides so direct HTTP, SSE, or WebSocket requests to `/MemoryMcp` return `405`) is
+mounted with `hidden = false` only when the plugin option `mcp` is `true` (default `false`).
 
 | Route                                                                          | Purpose                                                                                                  |
 | ------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------- |
@@ -360,8 +361,10 @@ Three levels, built in order:
    (`GET /Memory/<id>` still returns 404 to non-owners). Events carry `{ id, kind, revision }` — never
    content — with `kind` one of `created`, `revised`, `superseded`, `withdrawn`, `restored`, or `flagged`
    (`needsReview` set), so a reader re-reads through the guarded `GET`. Subscriptions are live-only
-   (`omitCurrent: true`) with at-most-once delivery and no replay across disconnects; reconnecting clients
-   re-read watched ids (comparing `revision`) or re-bootstrap (`watch=true`) to catch up.
+   (`omitCurrent: true`, ignoring upstream events whose audit timestamp predates the subscription start)
+   with at-most-once delivery and no replay across disconnects; if a slow subscriber accumulates more than
+   256 pending events its stream is closed so the client reconnects and re-reads watched ids (comparing
+   `revision`) or re-bootstraps (`watch=true`) to catch up.
 2. **Watches**: `POST /Memory/watch { ids, ttlSeconds? }` (1–100 ids; `ttlSeconds` integer in
    `1..86400`, default 3600) and `watch=true` on search and bootstrap record `MemoryWatch` rows
    (`<principalId>:<memoryId>`, `expiresAt @expiresAt`), keeping whichever `expiresAt` is later when a
@@ -373,10 +376,10 @@ Three levels, built in order:
    SSE or WebSocket whenever:
    - a memory with an unexpired `MemoryWatch` for the caller changes and passes the caller's delivery-time
      read check, or
-   - one of the caller's own memories (`ownerId === principal.id`) is flagged `needsReview` (`kind:
-'flagged'`, or `restored` / `created` with a newly folded `needsReview` flag visible to the caller).
-     The notification fires when "a memory you relied on changed, or your own memory needs review", not on
-     every write.
+   - one of the caller's own memories (`ownerId === principal.id`) is flagged `needsReview`
+     (`kind: 'flagged'`, or `restored` / `created` with a newly folded `needsReview` flag visible to the
+     caller). The notification fires when "a memory you relied on changed, or your own memory needs
+     review", not on every write.
    - **MCP resource subscriptions (`resources/subscribe`)**: Harper core's `resources/subscribe` handler
      (`subscribeToResource` in `components/mcp/resources.ts`) only accepts `harper+rest://` and `http(s)://`
      URIs and rejects custom `mcpResources` URI schemes such as `memory:///{id}` with
@@ -390,9 +393,10 @@ Three levels, built in order:
 ## MCP surface
 
 Behind the plugin option `mcp` (`boolean`, default `false`), `handleApplication` mounts `MemoryMcpResource`
-(`static path = '/MemoryMcp'`, `static hidden = false`, with no HTTP verb methods) to expose MCP tools and
-a resource template on Harper's native `/mcp` endpoint (`src/mcp.ts`), each delegating to the same
-lifecycle, search, and watch functions and enforcing the same permission checks as REST:
+(`static path = '/MemoryMcp'`, `static hidden = false`, extending `MemoryEndpoint` with no prototype CRUD
+methods) to expose MCP tools and a resource template on Harper's native `/mcp` endpoint (`src/mcp.ts`),
+each delegating to the same lifecycle, search, and watch functions and enforcing the same permission checks
+as REST:
 
 - **`static mcpTools`**:
   - `remember` — create a memory (`PUT`; generates a UUID when `id` is omitted, or idempotently retries an

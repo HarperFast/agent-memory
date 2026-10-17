@@ -43,14 +43,14 @@ type MemoryPin @table(database: "memory") @sealed {
 }
 
 # Keyed "role:<roleName>" or "user:<username>". Patterns are exact labels or "<namespace>:*".
-type ScopeGrant @table(database: "memory") {
+type ScopeGrant @table(database: "memory", audit: true) {
 	id: ID @primaryKey
 	read: [String]
 	write: [String]
 	updatedAt: Date @updatedTime
 }
 
-type MemoryWatch @table(database: "memory") {
+type MemoryWatch @table(database: "memory", audit: true) {
 	id: ID @primaryKey
 	principalId: String @indexed
 	memoryId: ID @indexed

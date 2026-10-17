@@ -1,7 +1,7 @@
 // Memory ids are 16-64 characters, so the 9-char `bootstrap`, 6-char `import`, and 5-char `watch` path segments cannot collide with one.
 import { Resource } from 'harper';
 import { badRequest, memoryError, normalizeError, notFound } from './errors.ts';
-import { subscribeMemory, subscribeMemoryEvents, watchMemories } from './events.ts';
+import { subscribeMemory, subscribeMemoryEvents, watchMemories, type SubscriptionStream } from './events.ts';
 import { importMemories } from './import.ts';
 import { confirmMemory, getMemory, pinMemory, putMemory, unpinMemory, withdrawMemory } from './lifecycle.ts';
 import { MEMORY_MCP_METHODS, MEMORY_MCP_RESOURCES, MEMORY_MCP_TOOLS } from './mcp.ts';
@@ -91,7 +91,6 @@ function drainIncomingMessages(incomingMessages: any, onClose: () => void): { is
 		void (async () => {
 			try {
 				for await (const _ of incomingMessages) {
-					// Drain incoming frames until the socket closes.
 				}
 			} catch {
 			} finally {
@@ -130,8 +129,6 @@ function rejectUnsupportedVerb(target: any): never {
 	if (target?.action !== undefined && !MEMORY_ACTIONS.includes(target.action)) throw notFound();
 	throw memoryError('Method not allowed', 405, 'method_not_allowed');
 }
-
-type SubscriptionStream = AsyncIterable<{ id: string; kind: string; revision: number }> & { end?: () => void };
 
 // @ts-expect-error — Resource's static verb types carry transactional()'s reliesOnPrototype brand
 class MemoryEndpoint extends Resource {
@@ -212,9 +209,9 @@ export class MemoryResource extends MemoryEndpoint {
 }
 
 // Mounted only when `mcp: true`; `hidden = false` lets Harper's MCP server discover `mcpTools` and `mcpResources`.
-export class MemoryMcpResource extends Resource {
+export class MemoryMcpResource extends MemoryEndpoint {
 	static path = '/MemoryMcp';
-	static hidden = false;
+	static override hidden = false;
 	static mcpTools = MEMORY_MCP_TOOLS;
 	static mcpResources = MEMORY_MCP_RESOURCES;
 }

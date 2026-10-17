@@ -340,7 +340,7 @@ describe('Level 1: record-change subscriptions on Memory', () => {
 		ScopeGrant.get = async (id, ctx) => {
 			if (failRemaining > 0 && id === 'user:bob') {
 				failRemaining -= 1;
-				throw new Error('transient lmdb read error');
+				throw new Error('transient storage read error');
 			}
 			return origGet.call(ScopeGrant, id, ctx);
 		};
@@ -518,6 +518,7 @@ describe('Level 1: record-change subscriptions on Memory', () => {
 			MemoryImportResource,
 			MemoryWatchResource,
 			MemoryActionResource,
+			MemoryMcpResource,
 		]) {
 			const res = await parse(
 				await ResourceClass.connect(queryTarget('', { id: 'mem-sub-publ-0001', action: 'pin' }), null, {
@@ -526,6 +527,7 @@ describe('Level 1: record-change subscriptions on Memory', () => {
 			);
 			assert.equal(res.status, 405);
 		}
+		assert.equal((await parse(await MemoryMcpResource.get(queryTarget(''), { user: aliceUser }))).status, 405);
 	});
 });
 
@@ -585,7 +587,11 @@ describe('Level 2: MemoryWatch, watch=true on search/bootstrap, and /MemoryEvent
 		);
 		assert.equal(longWatch.status, 200);
 		assert.deepEqual(longWatch.body.watched, [pubId]);
-		assert.ok(__test.lockLog.some((entry) => entry.table === 'MemoryWatch' && entry.id === `bob:${pubId}`));
+		assert.ok(
+			__test.lockLog.some(
+				(entry) => entry.table === 'MemoryWatch' && entry.id === `bob:${pubId}` && entry.inTransaction,
+			),
+		);
 		const longExpiry = Date.parse(longWatch.body.expiresAt);
 		assert.ok(Number.isFinite(longExpiry));
 		const storedLong = await databases.memory.MemoryWatch.get(`bob:${pubId}`);
@@ -593,12 +599,17 @@ describe('Level 2: MemoryWatch, watch=true on search/bootstrap, and /MemoryEvent
 		assert.equal(storedLong.memoryId, pubId);
 		assert.equal(storedLong.expiresAt.getTime(), longExpiry);
 
-		// A shorter explicit watch or watch=true search (default 3600s) must keep the longer 7200s expiry,
-		// while a multi-id watch reports the earliest effective expiresAt across the watched set.
+		// Locks are acquired in deterministic sorted id order even when caller passes [pubId2, pubId],
+		// while `watched` preserves caller input order; a shorter explicit watch or watch=true search
+		// (default 3600s) keeps the longer 7200s expiry and reports the earliest effective expiresAt.
+		__test.lockLog.length = 0;
 		const shortWatch = await parse(
-			await MemoryWatchResource.post(queryTarget(''), { ids: [pubId, pubId2], ttlSeconds: 60 }, { user: bobUser }),
+			await MemoryWatchResource.post(queryTarget(''), { ids: [pubId2, pubId], ttlSeconds: 60 }, { user: bobUser }),
 		);
 		assert.equal(shortWatch.status, 200);
+		assert.deepEqual(shortWatch.body.watched, [pubId2, pubId]);
+		const watchLocks = __test.lockLog.filter((entry) => entry.table === 'MemoryWatch').map((entry) => entry.id);
+		assert.deepEqual(watchLocks, [`bob:${pubId}`, `bob:${pubId2}`]);
 		const storedShort2 = await databases.memory.MemoryWatch.get(`bob:${pubId2}`);
 		assert.equal(Date.parse(shortWatch.body.expiresAt), storedShort2.expiresAt.getTime());
 		assert.ok(Date.parse(shortWatch.body.expiresAt) < longExpiry);
@@ -760,6 +771,139 @@ describe('Level 2: MemoryWatch, watch=true on search/bootstrap, and /MemoryEvent
 			{ id: bobOwnCiterId, kind: 'flagged', revision: 2 },
 			{ id: bobFoldedCiterId, kind: 'created', revision: 1 },
 		]);
+	});
+
+	it('bounds database reads during flagged fan-out across multiple subscribers and closes a stalled subscriber whose pending queue exceeds 256 events', async () => {
+		const sourceId = 'mem-fanout-src-01';
+		await MemoryItemResource.put(
+			queryTarget('', { id: sourceId }),
+			{ title: 'shared source', content: 'source body', visibility: 'shared' },
+			{ user: aliceUser },
+		);
+		const citerIds = [];
+		for (let i = 0; i < 6; i += 1) {
+			const citerId = `mem-fanout-cit-0${i}`;
+			citerIds.push(citerId);
+			await MemoryItemResource.put(
+				queryTarget('', { id: citerId }),
+				{
+					title: `citer ${i}`,
+					content: `cites ${sourceId}`,
+					visibility: 'shared',
+					evidence: [{ kind: 'memory', ref: sourceId }],
+				},
+				{ user: i % 2 === 0 ? bobUser : aliceUser },
+			);
+		}
+		await MemoryWatchResource.post(queryTarget(''), { ids: citerIds, ttlSeconds: 300 }, { user: bobUser });
+		await MemoryWatchResource.post(queryTarget(''), { ids: citerIds, ttlSeconds: 300 }, { user: daveUser });
+
+		const subAlice = collectEvents(await MemoryResource.subscribe(queryTarget('', { rest: '' }), { user: aliceUser }));
+		const subBob = collectEvents(await MemoryEventsResource.connect(queryTarget(''), null, { user: bobUser }));
+		const subDave = collectEvents(await MemoryEventsResource.connect(queryTarget(''), null, { user: daveUser }));
+
+		// Warm each subscriber once so initial watch seeding and ScopeGrant cache fill are complete before measuring the burst.
+		await MemoryItemResource.put(
+			queryTarget('', { id: citerIds[0] }),
+			{ content: 'warm burst check' },
+			{ user: bobUser, headers: { 'if-match': '"1"' } },
+		);
+		await subAlice.waitForCount(1);
+		await subBob.waitForCount(1);
+		await subDave.waitForCount(1);
+
+		const Memory = databases.memory.Memory;
+		const MemoryWatch = databases.memory.MemoryWatch;
+		const ScopeGrant = databases.memory.ScopeGrant;
+		const origMemorySearch = Memory.search;
+		const origWatchGet = MemoryWatch.get;
+		const origGrantGet = ScopeGrant.get;
+		let memorySearchCalls = 0;
+		let watchGetCalls = 0;
+		let grantGetCalls = 0;
+		Memory.search = function (...args) {
+			memorySearchCalls += 1;
+			return origMemorySearch.apply(this, args);
+		};
+		MemoryWatch.get = function (...args) {
+			watchGetCalls += 1;
+			return origWatchGet.apply(this, args);
+		};
+		ScopeGrant.get = function (...args) {
+			grantGetCalls += 1;
+			return origGrantGet.apply(this, args);
+		};
+
+		try {
+			// Withdrawing sourceId writes 1 withdrawn event + 6 flagged citer events across 3 open subscribers (21 listener checks).
+			// withdrawMemory runs 2 activeDependentIds Memory.search calls (pre-lock plan + in-txn check), and flagAccessCache shares
+			// at most 1 Memory.search([sourceId]) across all 6 flagged events x 3 subscribers (instead of 6 x 3 = 18 searches).
+			await MemoryItemResource.delete(queryTarget('', { id: sourceId }), {
+				user: aliceUser,
+				headers: { 'if-match': '"1"' },
+			});
+			await subAlice.waitForCount(8);
+			await subBob.waitForCount(7);
+			await subDave.waitForCount(7);
+
+			assert.ok(memorySearchCalls <= 3, `expected <= 3 Memory.search calls, got ${memorySearchCalls}`);
+			assert.equal(watchGetCalls, 0);
+			// Only the DELETE request's own prepareContext resolves user:alice once; all 21 subscriber checks hit principalCache.
+			assert.equal(grantGetCalls, 1);
+		} finally {
+			Memory.search = origMemorySearch;
+			MemoryWatch.get = origWatchGet;
+			ScopeGrant.get = origGrantGet;
+			await subAlice.close();
+			await subBob.close();
+			await subDave.close();
+		}
+
+		// A stalled subscriber that does not drain its iterator is closed once > 256 events accumulate.
+		const origSubscribe = Memory.subscribe;
+		let pushUpstream;
+		Memory.subscribe = async () => ({
+			end() {},
+			[Symbol.asyncIterator]() {
+				return {
+					next() {
+						return new Promise((resolve) => {
+							pushUpstream = (ev) => resolve({ value: ev, done: false });
+						});
+					},
+					return() {
+						return Promise.resolve({ value: undefined, done: true });
+					},
+				};
+			},
+		});
+
+		try {
+			const stalledStream = await MemoryResource.subscribe(queryTarget('', { rest: '' }), { user: bobUser });
+			for (let rev = 1; rev <= 260; rev += 1) {
+				const send = pushUpstream;
+				send({
+					id: 'mem-overflow-0001',
+					type: 'put',
+					value: {
+						id: 'mem-overflow-0001',
+						ownerId: 'alice',
+						scopes: ['global'],
+						status: 'active',
+						revision: rev,
+						lastEventKind: 'revised',
+					},
+				});
+				await new Promise((resolve) => setImmediate(resolve));
+			}
+			const drained = [];
+			for await (const ev of stalledStream) {
+				drained.push(ev);
+			}
+			assert.equal(drained.length, 256);
+		} finally {
+			Memory.subscribe = origSubscribe;
+		}
 	});
 });
 

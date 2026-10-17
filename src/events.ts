@@ -13,13 +13,21 @@ import { forReader } from './provenance.ts';
 import { canRead, type Principal } from './scopes.ts';
 
 const EVENT_KINDS = ['created', 'revised', 'superseded', 'withdrawn', 'restored', 'flagged'] as const;
-export type MemoryEventKind = (typeof EVENT_KINDS)[number];
+type MemoryEventKind = (typeof EVENT_KINDS)[number];
 
-export interface MemoryEvent {
+interface MemoryEvent {
 	id: string;
 	kind: MemoryEventKind;
 	revision: number;
 }
+
+export type SubscriptionStream = AsyncIterable<{
+	id: string;
+	kind: 'created' | 'revised' | 'superseded' | 'withdrawn' | 'restored' | 'flagged';
+	revision: number;
+}> & {
+	end(): void;
+};
 
 class SubscriptionQueue implements AsyncIterable<MemoryEvent> {
 	#buffer: MemoryEvent[] = [];
@@ -35,11 +43,17 @@ class SubscriptionQueue implements AsyncIterable<MemoryEvent> {
 		return this.#closed;
 	}
 
+	get bufferedCount(): number {
+		return this.#buffer.length;
+	}
+
 	push(event: MemoryEvent): void {
 		if (this.#closed) return;
 		const waiter = this.#waiters.shift();
 		if (waiter) {
 			waiter({ value: event, done: false });
+		} else if (this.#buffer.length >= MAX_PENDING_EVENTS_PER_LISTENER) {
+			this.close();
 		} else {
 			this.#buffer.push(event);
 		}
@@ -93,6 +107,7 @@ const WATCH_FIELDS = ['ids', 'ttlSeconds'];
 
 const MAX_PENDING_EVENTS_PER_LISTENER = 256;
 const MAX_DEDUP_ENTRIES = 1024;
+const MAX_WATCHES_PER_PRINCIPAL = 4096;
 const ERROR_LOG_INTERVAL_MS = 60_000;
 const PRINCIPAL_CACHE_TTL_MS = 5_000;
 
@@ -108,9 +123,12 @@ function isEventKind(value: unknown): value is MemoryEventKind {
 // watch writes, initial seeding when `/MemoryEvents` opens, and the hub's `MemoryWatch` subscription.
 const watchesByPrincipal = new Map<string, Map<string, number>>();
 const seededWatchPrincipals = new Set<string>();
+const seedingWatchPrincipals = new Map<string, Promise<void>>();
+const flagAccessCache = new Map<string, Promise<any>>();
 
 function recordWatchInMemory(principalId: string, memoryId: string, expiresAtMs: number, keepLonger = true): void {
 	if (!Number.isFinite(expiresAtMs) || expiresAtMs <= Date.now()) return;
+	if (!seededWatchPrincipals.has(principalId) && !seedingWatchPrincipals.has(principalId)) return;
 	let bucket = watchesByPrincipal.get(principalId);
 	if (!bucket) {
 		bucket = new Map();
@@ -118,6 +136,10 @@ function recordWatchInMemory(principalId: string, memoryId: string, expiresAtMs:
 	}
 	const previous = bucket.get(memoryId);
 	if (keepLonger && previous !== undefined && previous >= expiresAtMs) return;
+	if (previous === undefined && bucket.size >= MAX_WATCHES_PER_PRINCIPAL) {
+		const oldestKey = bucket.keys().next().value;
+		if (oldestKey !== undefined) bucket.delete(oldestKey);
+	}
 	bucket.set(memoryId, expiresAtMs);
 }
 
@@ -160,12 +182,11 @@ function hasActiveWatch(principalId: string, memoryId: string): boolean {
 	return true;
 }
 
-const seedingWatchPrincipals = new Map<string, Promise<void>>();
-
 async function ensurePrincipalWatchesSeeded(principalId: string): Promise<void> {
 	if (seededWatchPrincipals.has(principalId)) return;
 	const existing = seedingWatchPrincipals.get(principalId);
 	if (existing) return existing;
+	const watchSubAtStart = watchHubSub;
 	const promise = (async () => {
 		try {
 			const MemoryWatch = memoryWatchTable();
@@ -180,7 +201,9 @@ async function ensurePrincipalWatchesSeeded(principalId: string): Promise<void> 
 					recordWatchInMemory(principalId, row.memoryId, expMs);
 				}
 			}
-			seededWatchPrincipals.add(principalId);
+			if (watchHubSub && watchHubSub === watchSubAtStart) {
+				seededWatchPrincipals.add(principalId);
+			}
 		} finally {
 			seedingWatchPrincipals.delete(principalId);
 		}
@@ -196,7 +219,6 @@ interface CachedPrincipal {
 
 const principalCache = new Map<string, CachedPrincipal>();
 const inflightPrincipals = new Map<string, Promise<Principal>>();
-let lastScopeGrantGet: unknown;
 
 function scopeGrantTable(): any {
 	return (databases as any).memory?.ScopeGrant;
@@ -217,11 +239,6 @@ function harperUserCacheKey(context: Record<string, unknown>): string | undefine
 }
 
 async function resolveSubscriberPrincipal(authContext: Record<string, unknown>): Promise<Principal> {
-	const currentGrantGet = scopeGrantTable()?.get;
-	if (currentGrantGet !== lastScopeGrantGet) {
-		lastScopeGrantGet = currentGrantGet;
-		clearPrincipalCache();
-	}
 	const key = harperUserCacheKey(authContext);
 	if (!key) {
 		return resolvePrincipal(authContext);
@@ -256,7 +273,7 @@ async function putWatchKeepingLongerTtl(
 	txn: object,
 ): Promise<Date> {
 	const id = memoryWatchIdFor(principalId, memoryId);
-	await MemoryWatch.lock?.(id, {}, txn);
+	await MemoryWatch.lock?.(id, { scope: 'node' }, txn);
 	const existing = await MemoryWatch.get(id, txn);
 	if (existing?.expiresAt) {
 		const existingExpiresAt = new Date(existing.expiresAt);
@@ -283,13 +300,13 @@ export async function recordWatches(
 	requestContext: object = {},
 ): Promise<string> {
 	const expiresAt = new Date(Date.now() + ttlSeconds * 1000);
-	const uniqueIds = [...new Set(ids)];
-	if (uniqueIds.length === 0) return expiresAt.toISOString();
+	const sortedIds = [...new Set(ids)].sort();
+	if (sortedIds.length === 0) return expiresAt.toISOString();
 	const MemoryWatch = memoryWatchTable();
 	let earliest: Date | undefined;
 	const written: Array<[string, number]> = [];
 	await inOwnTransaction(requestContext, async (txn) => {
-		for (const memoryId of uniqueIds) {
+		for (const memoryId of sortedIds) {
 			const kept = await putWatchKeepingLongerTtl(MemoryWatch, principal.id, memoryId, expiresAt, txn);
 			if (!earliest || kept.getTime() < earliest.getTime()) earliest = kept;
 			written.push([memoryId, kept.getTime()]);
@@ -320,19 +337,20 @@ export async function watchMemories(input: unknown, principal: Principal, reques
 	}
 	const ttlSeconds = (payload.ttlSeconds ?? WATCH_DEFAULT_TTL_SECONDS) as number;
 	const uniqueIds = [...new Set(payload.ids as string[])];
+	const sortedIds = [...uniqueIds].sort();
 	const Memory = memoryTable();
 	const MemoryWatch = memoryWatchTable();
 	const written: Array<[string, number]> = [];
 
 	const result = await inOwnTransaction(requestContext, async (txn) => {
-		for (const memoryId of uniqueIds) {
+		for (const memoryId of sortedIds) {
 			const record = await Memory.get(memoryId, txn);
 			// Same 404 whether missing or unreadable, so watch cannot probe another principal's memory.
 			if (!record || !canRead(record, principal)) throw notFound();
 		}
 		const expiresAt = new Date(Date.now() + ttlSeconds * 1000);
 		let earliest: Date | undefined;
-		for (const memoryId of uniqueIds) {
+		for (const memoryId of sortedIds) {
 			const kept = await putWatchKeepingLongerTtl(MemoryWatch, principal.id, memoryId, expiresAt, txn);
 			if (!earliest || kept.getTime() < earliest.getTime()) earliest = kept;
 			written.push([memoryId, kept.getTime()]);
@@ -352,6 +370,12 @@ interface DeliverableEvent {
 	dedupToken: string;
 }
 
+async function hasVisibleFlag(record: any, principal: Principal): Promise<boolean> {
+	if (flagAccessCache.size >= MAX_DEDUP_ENTRIES) flagAccessCache.clear();
+	const [view] = await forReader([toMemoryView(record)], principal, {}, flagAccessCache);
+	return Boolean(view?.needsReview);
+}
+
 async function resolveDeliverableEvent(
 	raw: any,
 	context: Record<string, unknown>,
@@ -362,7 +386,6 @@ async function resolveDeliverableEvent(
 	const revision = eventRecord?.revision;
 	if (!id || !isEventKind(kind) || typeof revision !== 'number') return undefined;
 
-	// Re-resolve at delivery time so a scope grant or principal change revokes visibility mid-subscription.
 	const authContext = Object.assign(Object.create(context), {
 		user: context.user,
 		headers: context.headers,
@@ -391,9 +414,8 @@ async function resolveDeliverableEvent(
 			: canRead(record, currentPrincipal);
 	if (!readable) return undefined;
 
-	if (kind === 'flagged') {
-		const [view] = await forReader([toMemoryView(record)], currentPrincipal);
-		if (!view?.needsReview) return undefined;
+	if (kind === 'flagged' && !(await hasVisibleFlag(record, currentPrincipal))) {
+		return undefined;
 	}
 	const updatedStamp =
 		record.updatedAt instanceof Date ? String(record.updatedAt.getTime()) : String(record.updatedAt ?? '');
@@ -433,10 +455,19 @@ function resetHubState(): void {
 	watchesByPrincipal.clear();
 	seededWatchPrincipals.clear();
 	seedingWatchPrincipals.clear();
+	flagAccessCache.clear();
 	clearPrincipalCache();
 	closeUpstreamSub(activeMem);
 	closeUpstreamSub(activeWatch);
 	closeUpstreamSub(activeGrant);
+}
+
+function teardownActiveHub(): void {
+	resetHubState();
+	const remaining = [...tableListeners, ...[...itemListeners.values()].flatMap((set) => [...set])];
+	tableListeners.clear();
+	itemListeners.clear();
+	for (const listener of remaining) listener.close();
 }
 
 function removeHubListener(listener: HubListener): void {
@@ -459,16 +490,21 @@ async function ensureHubSubscription(): Promise<void> {
 	if (hubOpening) return hubOpening;
 	let opening: Promise<void> | undefined;
 	opening = (async () => {
+		let rawSub: UpstreamSub | undefined;
+		let rawWatchSub: UpstreamSub | undefined;
+		let rawGrantSub: UpstreamSub | undefined;
 		try {
+			await null;
 			const Memory = memoryTable();
 			const MemoryWatch = memoryWatchTable();
 			const ScopeGrant = scopeGrantTable();
-			const rawSub = await Memory.subscribe({ omitCurrent: true, includeSuperseded: true }, {});
-			const rawWatchSub =
+			const memSub: UpstreamSub = await Memory.subscribe({ omitCurrent: true, includeSuperseded: true }, {});
+			rawSub = memSub;
+			rawWatchSub =
 				typeof MemoryWatch?.subscribe === 'function'
 					? await MemoryWatch.subscribe({ omitCurrent: true }, {})
 					: undefined;
-			const rawGrantSub =
+			rawGrantSub =
 				typeof ScopeGrant?.subscribe === 'function' ? await ScopeGrant.subscribe({ omitCurrent: true }, {}) : undefined;
 			if (tableListeners.size === 0 && itemListeners.size === 0) {
 				closeUpstreamSub(rawSub);
@@ -476,37 +512,48 @@ async function ensureHubSubscription(): Promise<void> {
 				closeUpstreamSub(rawGrantSub);
 				return;
 			}
-			hubSub = rawSub;
+			hubSub = memSub;
 			watchHubSub = rawWatchSub;
 			grantHubSub = rawGrantSub;
 
 			if (rawWatchSub) {
+				const watchSub = rawWatchSub;
 				void (async () => {
 					try {
-						for await (const raw of rawWatchSub) {
-							if (watchHubSub !== rawWatchSub) break;
+						for await (const raw of watchSub) {
+							if (watchHubSub !== watchSub) break;
 							applyWatchEvent(raw);
 						}
-					} catch {}
+					} catch (error) {
+						if (watchHubSub === watchSub) normalizeError(error, 'subscribe');
+					} finally {
+						if (watchHubSub === watchSub) teardownActiveHub();
+					}
 				})();
 			}
 
 			if (rawGrantSub) {
+				const grantSub = rawGrantSub;
 				void (async () => {
 					try {
-						for await (const _ of rawGrantSub) {
-							if (grantHubSub !== rawGrantSub) break;
+						for await (const _ of grantSub) {
+							if (grantHubSub !== grantSub) break;
 							clearPrincipalCache();
 						}
-					} catch {}
+					} catch (error) {
+						if (grantHubSub === grantSub) normalizeError(error, 'subscribe');
+					} finally {
+						if (grantHubSub === grantSub) teardownActiveHub();
+					}
 				})();
 			}
 
 			void (async () => {
 				try {
-					for await (const raw of rawSub) {
-						if (hubSub !== rawSub) break;
+					for await (const raw of memSub) {
+						if (hubSub !== memSub) break;
 						const id = String(raw?.id ?? raw?.value?.id ?? '');
+						if (id) flagAccessCache.delete(id);
 						const byId = id ? itemListeners.get(id) : undefined;
 						const snapshot = [...tableListeners, ...(byId ? [...byId] : [])];
 						for (const listener of snapshot) {
@@ -514,19 +561,16 @@ async function ensureHubSubscription(): Promise<void> {
 						}
 					}
 				} catch (error) {
-					if (hubSub === rawSub) {
-						normalizeError(error, 'subscribe');
-					}
+					if (hubSub === memSub) normalizeError(error, 'subscribe');
 				} finally {
-					if (hubSub === rawSub) {
-						resetHubState();
-						const remaining = [...tableListeners, ...[...itemListeners.values()].flatMap((set) => [...set])];
-						tableListeners.clear();
-						itemListeners.clear();
-						for (const listener of remaining) listener.close();
-					}
+					if (hubSub === memSub) teardownActiveHub();
 				}
 			})();
+		} catch (error) {
+			closeUpstreamSub(rawSub);
+			closeUpstreamSub(rawWatchSub);
+			closeUpstreamSub(rawGrantSub);
+			throw error;
 		} finally {
 			if (hubOpening === opening) {
 				hubOpening = undefined;
@@ -546,7 +590,8 @@ async function attachToHub(
 	filter: (raw: any) => Promise<FilteredDelivery | undefined>,
 	targetId?: string,
 ): Promise<SubscriptionQueue> {
-	const lastSeenById = new Map<string, { revision: number; token: string }>();
+	const connectedAtMs = Date.now();
+	const lastSeenById = new Map<string, string>();
 	let pendingCount = 0;
 	let chain: Promise<void> = Promise.resolve();
 	let lastErrorLogAt = 0;
@@ -558,7 +603,18 @@ async function attachToHub(
 		targetId,
 		close: () => queue.close(),
 		enqueue: (raw) => {
-			if (queue.closed || pendingCount >= MAX_PENDING_EVENTS_PER_LISTENER) return;
+			if (queue.closed) return;
+			const rawTs =
+				typeof raw?.timestamp === 'number'
+					? raw.timestamp
+					: typeof raw?.localTime === 'number'
+						? raw.localTime
+						: undefined;
+			if (rawTs !== undefined && rawTs < connectedAtMs) return;
+			if (pendingCount + queue.bufferedCount >= MAX_PENDING_EVENTS_PER_LISTENER) {
+				queue.close();
+				return;
+			}
 			pendingCount += 1;
 			chain = chain.then(async () => {
 				try {
@@ -566,15 +622,15 @@ async function attachToHub(
 					const delivered = await filter(raw);
 					if (!delivered || queue.closed) return;
 					const { event, dedupToken } = delivered;
-					const previous = lastSeenById.get(event.id);
-					if (previous !== undefined) {
-						if (event.revision < previous.revision || previous.token === dedupToken) return;
+					const previousToken = lastSeenById.get(event.id);
+					if (previousToken !== undefined) {
+						if (previousToken === dedupToken) return;
 						lastSeenById.delete(event.id);
 					} else if (lastSeenById.size >= MAX_DEDUP_ENTRIES) {
 						const oldestKey = lastSeenById.keys().next().value;
 						if (oldestKey !== undefined) lastSeenById.delete(oldestKey);
 					}
-					lastSeenById.set(event.id, { revision: event.revision, token: dedupToken });
+					lastSeenById.set(event.id, dedupToken);
 					queue.push(event);
 				} catch (error) {
 					const now = Date.now();
@@ -611,7 +667,7 @@ export async function subscribeMemory(
 	target: any,
 	principal: Principal,
 	context: object = {},
-): Promise<SubscriptionQueue> {
+): Promise<SubscriptionStream> {
 	const ctx = context as Record<string, unknown>;
 	const Memory = memoryTable();
 
@@ -634,7 +690,7 @@ export async function subscribeMemoryEvents(
 	target: any,
 	principal: Principal,
 	context: object = {},
-): Promise<SubscriptionQueue> {
+): Promise<SubscriptionStream> {
 	const ctx = context as Record<string, unknown>;
 	const rawId = target?.id;
 	const isWildcard = rawId === '#' || rawId === '+';
@@ -647,6 +703,8 @@ export async function subscribeMemoryEvents(
 		const id = String(raw?.id ?? eventRecord?.id ?? '');
 		const kind = eventRecord?.lastEventKind;
 		if (!id || !isEventKind(kind)) return undefined;
+
+		await ensurePrincipalWatchesSeeded(principal.id);
 
 		// Check in-memory watch/ownership before resolving the subscriber's ScopeGrant or redacting provenance, so
 		// unwatched events for other principals do not trigger ScopeGrant or Memory reads.
@@ -668,9 +726,9 @@ export async function subscribeMemoryEvents(
 				((event.kind === 'restored' || event.kind === 'created') && Boolean(record.needsReview))) &&
 			record.ownerId === currentPrincipal.id
 		) {
-			if (event.kind === 'flagged') return { event, dedupToken };
-			const [view] = await forReader([toMemoryView(record)], currentPrincipal);
-			if (view?.needsReview) return { event, dedupToken };
+			if (event.kind === 'flagged' || (await hasVisibleFlag(record, currentPrincipal))) {
+				return { event, dedupToken };
+			}
 		}
 
 		if (!watchConfirmed || currentPrincipal.id !== principal.id) {
