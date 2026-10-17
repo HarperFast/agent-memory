@@ -26,13 +26,9 @@ const LOOPBACK_HOSTS = new Set(['localhost', '[::1]']);
 
 class UsageError extends Error {}
 
-export function importKey(flairId) {
-	return `import:flair:${flairId}`;
-}
-
-// DESIGN.md "Lifecycle": the create id formula; the import endpoint recomputes and rejects a mismatch.
-export function memoryIdFor(ownerId, idempotencyKey) {
-	return createHash('sha256').update(`memory:${ownerId}:${idempotencyKey}`).digest('hex').slice(0, 32);
+// DESIGN.md "Import": the Flair import client derives id from sha256('flair:' + flairId)[:32].
+export function memoryIdFor(flairId) {
+	return createHash('sha256').update(`flair:${flairId}`).digest('hex').slice(0, 32);
 }
 
 // DESIGN.md "Identity": principal ids must fit a 128-character `user:<id>` scope label.
@@ -142,13 +138,12 @@ export function mapFlairMemories(flairRows, principalMap) {
 			ephemeral++;
 			continue;
 		}
-		const idempotencyKey = importKey(row.id);
 		// Flair reads only the literal "private" as owner-only; any other value is readable by every agent.
 		const scopes = row.visibility === 'private' ? [`user:${ownerId}`] : ['global'];
 		if (row.visibility != null && row.visibility !== 'private' && row.visibility !== 'shared') {
 			increment(unknownVisibility, row.visibility);
 		}
-		eligible.set(row.id, { flair: row, id: memoryIdFor(ownerId, idempotencyKey), idempotencyKey, ownerId, scopes });
+		eligible.set(row.id, { flair: row, id: memoryIdFor(row.id), ownerId, scopes });
 	}
 
 	const predecessorOf = new Map();
@@ -213,12 +208,11 @@ export function mapFlairMemories(flairRows, principalMap) {
 	}
 
 	const rows = order.map((flairId) => {
-		const { flair, id, idempotencyKey, ownerId, scopes } = eligible.get(flairId);
+		const { flair, id, ownerId, scopes } = eligible.get(flairId);
 		const successor = latestLiveSuccessor.get(flairId);
 		const status = flair.archived === true ? 'withdrawn' : successor ? 'superseded' : 'active';
-		const row = { id, idempotencyKey, ownerId, content: flair.content, scopes, status, createdAt: flair.createdAt };
+		const row = { id, ownerId, content: flair.content, scopes, status, createdAt: flair.createdAt };
 		if (flair.tags?.length) row.tags = flair.tags;
-		if (flair.durability != null) row.durability = flair.durability;
 		const target = predecessorOf.get(flairId);
 		if (target !== undefined) row.supersedes = [eligible.get(target).id];
 		if (successor) row.supersededBy = eligible.get(successor).id;
@@ -292,7 +286,7 @@ async function errorDetail(response, rows) {
 		const parts = [];
 		if (typeof body?.code === 'string' && ERROR_CODE.test(body.code)) parts.push(`code ${body.code}`);
 		if (Number.isInteger(body?.index) && rows[body.index]) {
-			parts.push(`row ${body.index} (${rows[body.index].idempotencyKey})`);
+			parts.push(`row ${body.index} (${rows[body.index].id})`);
 		}
 		return parts.length ? `, ${parts.join(', ')}` : '';
 	} catch {
@@ -328,18 +322,18 @@ async function postBatches(rows, { target, authorization, batchSize, stderr }) {
 		) {
 			throw new Error(`batch ${batch}/${batchCount}: response does not carry one result per row in order`);
 		}
-		results.forEach((entry, index) => {
+		results.forEach((entry) => {
 			result[entry.result]++;
 			if (entry.result === 'conflict') {
 				conflictIds.add(entry.id);
-				result.conflicts.push({ id: entry.id, idempotencyKey: batchRows[index].idempotencyKey });
+				result.conflicts.push({ id: entry.id });
 			}
 		});
 		// Successors come first, so a conflicted successor is already known when its predecessor's result arrives.
 		results.forEach((entry, index) => {
-			const { id, idempotencyKey, supersededBy } = batchRows[index];
+			const { id, supersededBy } = batchRows[index];
 			if (entry.result === 'created' && conflictIds.has(supersededBy)) {
-				result.dependsOnConflict.push({ id, idempotencyKey, supersededBy });
+				result.dependsOnConflict.push({ id, supersededBy });
 			}
 		});
 		stderr.write(`batch ${batch}/${batchCount}: ${batchRows.length} rows\n`);

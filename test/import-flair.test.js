@@ -6,9 +6,12 @@ import { mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promise
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { __test } from 'harper';
+import { importMemories } from '../dist/import.js';
+import { createPrincipal } from '../dist/scopes.js';
+import { applySettings, parseSettings } from '../dist/settings.js';
 import {
 	MAX_BATCH_SIZE,
-	importKey,
 	mapFlairMemories,
 	memoryIdFor,
 	parseJsonl,
@@ -21,13 +24,15 @@ const PRINCIPAL_MAP = new URL('./fixtures/principal-map.json', import.meta.url).
 const flairRows = parseJsonl(await readFile(FIXTURE, 'utf8'));
 const principalMap = parsePrincipalMap(JSON.parse(await readFile(PRINCIPAL_MAP, 'utf8')));
 
-function idOf(ownerId, flairId) {
-	return createHash('sha256').update(`memory:${ownerId}:import:flair:${flairId}`).digest('hex').slice(0, 32);
+function idOf(flairId) {
+	return createHash('sha256').update(`flair:${flairId}`).digest('hex').slice(0, 32);
 }
+
+const flairById = new Map(flairRows.map((row) => [idOf(row.id), row.id]));
 
 function mapped() {
 	const { rows, summary } = mapFlairMemories(flairRows, principalMap);
-	const byKey = new Map(rows.map((row) => [row.idempotencyKey.slice('import:flair:'.length), row]));
+	const byKey = new Map(rows.map((row) => [flairById.get(row.id), row]));
 	return { rows, summary, byKey };
 }
 
@@ -84,25 +89,24 @@ describe('mapFlairMemories', () => {
 		assert.deepEqual(summary.byScope, { 'user:ann': 3, 'user:bob': 1, global: 7 });
 	});
 
-	it('keys every row import:flair:<flairId> with the create id formula, deterministically', () => {
+	it('derives every row id from sha256("flair:" + flairId)[:32], deterministically', () => {
 		const first = mapFlairMemories(flairRows, principalMap);
 		const second = mapFlairMemories(structuredClone(flairRows), principalMap);
 		assert.deepEqual(second, first);
-		const row = first.rows.find((candidate) => candidate.idempotencyKey === importKey('m01'));
-		assert.equal(row.id, idOf('ann', 'm01'));
-		assert.equal(row.id, memoryIdFor('ann', 'import:flair:m01'));
+		const row = first.rows.find((candidate) => candidate.id === memoryIdFor('m01'));
+		assert.equal(row.id, idOf('m01'));
 		assert.equal(row.ownerId, 'ann');
 		assert.equal(new Set(first.rows.map((candidate) => candidate.id)).size, first.rows.length);
 	});
 
 	it('rewrites supersedes to target ids and derives status and supersededBy', () => {
 		const { byKey, summary } = mapped();
-		assert.deepEqual(byKey.get('m02').supersedes, [idOf('ann', 'm01')]);
-		assert.deepEqual(byKey.get('m03').supersedes, [idOf('ann', 'm02')], 'cross-owner links resolve');
+		assert.deepEqual(byKey.get('m02').supersedes, [idOf('m01')]);
+		assert.deepEqual(byKey.get('m03').supersedes, [idOf('m02')], 'cross-owner links resolve');
 		assert.equal(byKey.get('m01').status, 'superseded');
-		assert.equal(byKey.get('m01').supersededBy, idOf('ann', 'm02'));
+		assert.equal(byKey.get('m01').supersededBy, idOf('m02'));
 		assert.equal(byKey.get('m02').status, 'superseded');
-		assert.equal(byKey.get('m02').supersededBy, idOf('bob', 'm03'));
+		assert.equal(byKey.get('m02').supersededBy, idOf('m03'));
 		assert.equal(byKey.get('m03').status, 'active');
 		assert.equal(byKey.get('m03').supersededBy, undefined);
 		assert.equal(byKey.get('m01').validUntil, '2026-01-02T00:00:00.000Z');
@@ -133,7 +137,7 @@ describe('mapFlairMemories', () => {
 	it('skips memories of unmapped agents and reports them by agent', () => {
 		const { rows, summary } = mapped();
 		assert.deepEqual(summary.skipped.unmappedAgents, { 'agent-ghost': 1 });
-		assert.ok(!rows.some((row) => row.idempotencyKey === importKey('m05')));
+		assert.ok(!rows.some((row) => row.id === memoryIdFor('m05')));
 		assert.deepEqual(summary.byOwner, { ann: 8, bob: 3 });
 		assert.equal(summary.read, 13);
 		assert.equal(summary.toImport, 11);
@@ -142,7 +146,7 @@ describe('mapFlairMemories', () => {
 	it('skips ephemeral memories, which carry an expiry the target cannot honor', () => {
 		const { rows, summary } = mapped();
 		assert.equal(summary.skipped.ephemeral, 1);
-		assert.ok(!rows.some((row) => row.idempotencyKey === importKey('m07')));
+		assert.ok(!rows.some((row) => row.id === memoryIdFor('m07')));
 	});
 
 	it('maps archived to withdrawn, and a withdrawn successor leaves its predecessor active', () => {
@@ -150,7 +154,7 @@ describe('mapFlairMemories', () => {
 		assert.equal(byKey.get('m08').status, 'withdrawn');
 		assert.equal(byKey.get('m08').withdrawnAt, '2026-02-01T00:00:00.000Z');
 		assert.equal(byKey.get('m08').withdrawnReason, 'archived in Flair');
-		assert.deepEqual(byKey.get('m08').supersedes, [idOf('ann', 'm09')]);
+		assert.deepEqual(byKey.get('m08').supersedes, [idOf('m09')]);
 		assert.equal(byKey.get('m09').status, 'active');
 		assert.equal(byKey.get('m09').supersededBy, undefined);
 	});
@@ -163,7 +167,7 @@ describe('mapFlairMemories', () => {
 		];
 		const outcome = (old, replacement) => {
 			const { rows, summary } = mapFlairMemories(pair(old, replacement), principalMap);
-			return [rows.find((row) => row.idempotencyKey === importKey('old')).status, summary.supersedes.unresolved];
+			return [rows.find((row) => row.id === memoryIdFor('old')).status, summary.supersedes.unresolved];
 		};
 		const ann = { agentId: 'agent-ann' };
 		const bob = { agentId: 'agent-bob' };
@@ -236,22 +240,20 @@ describe('mapFlairMemories', () => {
 			supersedes: index ? `c${index - 1}` : undefined,
 		}));
 		const { rows, summary } = mapFlairMemories(chain, principalMap);
-		assert.equal(rows[0].idempotencyKey, importKey('c19999'));
-		assert.equal(rows.at(-1).idempotencyKey, importKey('c0'));
+		assert.equal(rows[0].id, memoryIdFor('c19999'));
+		assert.equal(rows.at(-1).id, memoryIdFor('c0'));
 		assert.equal(summary.byStatus.active, 1);
 	});
 
-	it('sends only allowlisted fields, never embeddings or Flair bookkeeping', () => {
+	it('sends only allowlisted fields accepted by importMemories, never embeddings or Flair bookkeeping', async () => {
 		const allowed = new Set([
 			'id',
-			'idempotencyKey',
 			'ownerId',
 			'content',
 			'scopes',
 			'status',
 			'createdAt',
 			'tags',
-			'durability',
 			'supersedes',
 			'supersededBy',
 			'validUntil',
@@ -261,8 +263,22 @@ describe('mapFlairMemories', () => {
 		const { rows, byKey } = mapped();
 		for (const row of rows) for (const field of Object.keys(row)) assert.ok(allowed.has(field), field);
 		assert.deepEqual(byKey.get('m01').tags, ['deploy']);
-		assert.equal(byKey.get('m02').durability, 'persistent');
+		assert.equal(byKey.get('m02').durability, undefined);
 		assert.equal(byKey.get('m01').createdAt, '2026-01-01T00:00:00.000Z');
+
+		__test.reset();
+		applySettings(parseSettings({}));
+		const root = createPrincipal({ id: 'root', superUser: true });
+		const first = await importMemories({ rows }, root, {});
+		assert.deepEqual(
+			first.results,
+			rows.map((row) => ({ id: row.id, result: 'created' })),
+		);
+		const second = await importMemories({ rows }, root, {});
+		assert.deepEqual(
+			second.results,
+			rows.map((row) => ({ id: row.id, result: 'unchanged' })),
+		);
 	});
 
 	it('refuses malformed input before anything is mapped', () => {
@@ -311,7 +327,7 @@ describe('import-flair CLI', () => {
 
 	it('posts ordered batches with target credentials from the environment and tallies results', async () => {
 		const target = await stubServer(
-			importHandler((row) => (row.idempotencyKey === importKey('m04') ? 'conflict' : 'created')),
+			importHandler((row) => (row.id === memoryIdFor('m04') ? 'conflict' : 'created')),
 		);
 		try {
 			const result = await cli(
@@ -338,7 +354,7 @@ describe('import-flair CLI', () => {
 				created: 10,
 				unchanged: 0,
 				conflict: 1,
-				conflicts: [{ id: idOf('bob', 'm04'), idempotencyKey: importKey('m04') }],
+				conflicts: [{ id: idOf('m04') }],
 				dependsOnConflict: [],
 			});
 		} finally {
@@ -387,10 +403,10 @@ describe('import-flair CLI', () => {
 		}
 	});
 
-	it('stops on a failed batch and reports status, code and row key without the response message', async () => {
+	it('stops on a failed batch and reports status, code and row id without the response message', async () => {
 		const target = await stubServer((_request, count) =>
 			count === 2
-				? { status: 400, json: { error: 'SECRET-echo', code: 'import_id_mismatch', index: 1 } }
+				? { status: 400, json: { error: 'SECRET-echo', code: 'invalid_id', index: 1 } }
 				: importHandler()(_request),
 		);
 		try {
@@ -401,8 +417,8 @@ describe('import-flair CLI', () => {
 			assert.equal(result.code, 1);
 			assert.equal(target.requests.length, 2);
 			const secondBatch = JSON.parse(target.requests[1].body).rows;
-			assert.match(result.stderr, /batch 2\/3 failed: HTTP 400, code import_id_mismatch, row 1 \(import:flair:/);
-			assert.ok(result.stderr.includes(secondBatch[1].idempotencyKey));
+			assert.match(result.stderr, /batch 2\/3 failed: HTTP 400, code invalid_id, row 1 \([0-9a-f]{32}\)/);
+			assert.ok(result.stderr.includes(secondBatch[1].id));
 			assert.doesNotMatch(result.stderr, /SECRET/);
 		} finally {
 			target.close();
@@ -412,7 +428,7 @@ describe('import-flair CLI', () => {
 	it('lists created rows whose replacement came back as a conflict', async () => {
 		for (const batchSize of ['4', '100']) {
 			const target = await stubServer(
-				importHandler((row) => (row.idempotencyKey === importKey('m03') ? 'conflict' : 'created')),
+				importHandler((row) => (row.id === memoryIdFor('m03') ? 'conflict' : 'created')),
 			);
 			try {
 				const result = await cli(
@@ -430,7 +446,7 @@ describe('import-flair CLI', () => {
 				);
 				assert.equal(result.code, 0, result.stderr);
 				assert.deepEqual(JSON.parse(result.stdout).result.dependsOnConflict, [
-					{ id: idOf('ann', 'm02'), idempotencyKey: importKey('m02'), supersededBy: idOf('bob', 'm03') },
+					{ id: idOf('m02'), supersededBy: idOf('m03') },
 				]);
 			} finally {
 				target.close();
@@ -457,7 +473,7 @@ describe('import-flair CLI', () => {
 				TARGET_ENV,
 			);
 			assert.equal(result.code, 1);
-			assert.match(result.stderr, /HTTP 400, row 0 \(import:flair:/);
+			assert.match(result.stderr, /HTTP 400, row 0 \([0-9a-f]{32}\)/);
 			assert.doesNotMatch(result.stderr, /SECRET/);
 		} finally {
 			target.close();

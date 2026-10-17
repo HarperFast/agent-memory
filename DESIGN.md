@@ -310,8 +310,8 @@ The mapping is a pure function of the Flair rows and the principal map: a re-run
 sends identical rows.
 
 - **Owner**: Flair `agentId` → Harper username through `--principal-map`. An unmapped agent's memories
-  are skipped and reported, never guessed. The owner is part of the id, so remapping an agent after an
-  import adds rows under the new owner; it does not move the old ones.
+  are skipped and reported, never guessed. Because `id` is derived from the Flair id alone, remapping an
+  agent after an import reports those rows as `conflict` rather than overwriting or duplicating them.
 - **Scopes**: Flair treats only the literal `private` as owner-only, so `private` → `[user:<owner>]` and
   every other value (`shared`, absent, legacy) → `[global]`.
 - **Lifecycle**: `archived` → `withdrawn` with `withdrawnAt` = `archivedAt`. Flair's archive is a
@@ -325,11 +325,10 @@ sends identical rows.
   (`global` counts as readable by every imported principal, as the scope mapping already assumes). No
   sent row references a row outside the import set.
 - **Order**: successors before the rows they supersede, so after an interrupted run every committed
-  `superseded` row has its replacement committed. This holds only while nobody edits imported rows in
-  the target until the import finishes: a re-run cannot see a replacement that was withdrawn in
-  between, so it reports created rows whose replacement came back `conflict`.
+  `superseded` row has its replacement committed, and the CLI reports any created row whose replacement
+  came back `conflict` (`dependsOnConflict`).
 - **Not imported**: `ephemeral` rows (the only Flair tier with `expiresAt`; the target has no expiry),
-  embeddings (the target re-embeds through `@embed`), and Flair bookkeeping fields.
+  `durability`, embeddings (the target re-embeds through `@embed`), and Flair bookkeeping fields.
 
 ## Not in v0
 
