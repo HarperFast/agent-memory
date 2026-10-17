@@ -91,10 +91,9 @@ function drainIncomingMessages(incomingMessages: any, onClose: () => void): { is
 		void (async () => {
 			try {
 				for await (const _ of incomingMessages) {
-					void _;
+					// Drain incoming frames until the socket closes.
 				}
 			} catch {
-				void 0;
 			} finally {
 				markClosed();
 			}
@@ -118,9 +117,7 @@ function scheduleFlushHeaders(context: any): void {
 				} else if (remaining > 0) {
 					attempt(remaining - 1);
 				}
-			} catch {
-				void 0;
-			}
+			} catch {}
 		});
 	};
 	attempt(5);
@@ -133,6 +130,8 @@ function rejectUnsupportedVerb(target: any): never {
 	if (target?.action !== undefined && !MEMORY_ACTIONS.includes(target.action)) throw notFound();
 	throw memoryError('Method not allowed', 405, 'method_not_allowed');
 }
+
+type SubscriptionStream = AsyncIterable<{ id: string; kind: string; revision: number }> & { end?: () => void };
 
 // @ts-expect-error — Resource's static verb types carry transactional()'s reliesOnPrototype brand
 class MemoryEndpoint extends Resource {
@@ -159,11 +158,11 @@ class MemoryEndpoint extends Resource {
 		return handle('patch', context, async () => rejectUnsupportedVerb(target));
 	}
 
-	static async subscribe(target: any, context: object): Promise<any> {
+	static async subscribe(target: any, context: object): Promise<SubscriptionStream> {
 		return handleSubscribe(context, async () => rejectUnsupportedVerb(target));
 	}
 
-	static async connect(target: any, incomingMessages: any, context: object): Promise<any> {
+	static async connect(target: any, incomingMessages: any, context: object): Promise<SubscriptionStream | Response> {
 		// SSE calls connect(target, null, request) and accepts a Response on error; WebSocket passes incomingMessages
 		// and translates thrown statusCode errors into close frames.
 		if (incomingMessages == null) {
@@ -180,7 +179,7 @@ class MemoryEndpoint extends Resource {
 				return errorResponse(error, 'connect');
 			}
 		}
-		let activeStream: any;
+		let activeStream: SubscriptionStream | undefined;
 		const drain = drainIncomingMessages(incomingMessages, () => activeStream?.end?.());
 		try {
 			const stream = await this.subscribe(target, context);
@@ -212,6 +211,7 @@ export class MemoryResource extends MemoryEndpoint {
 	}
 }
 
+// Mounted only when `mcp: true`; `hidden = false` lets Harper's MCP server discover `mcpTools` and `mcpResources`.
 export class MemoryMcpResource extends Resource {
 	static path = '/MemoryMcp';
 	static hidden = false;

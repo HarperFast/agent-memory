@@ -62,7 +62,7 @@ beforeEach(async () => {
 });
 
 describe('Level 1: record-change subscriptions on Memory', () => {
-	it('delivers created, revised, superseded, withdrawn, restored, and flagged events without content, and sets non-enumerable value for MQTT', async () => {
+	it('delivers created, revised, superseded, withdrawn, restored, and flagged events without content', async () => {
 		const stream = await MemoryResource.subscribe(queryTarget('', { rest: '' }), { user: aliceUser });
 		const collector = collectEvents(stream);
 
@@ -70,19 +70,16 @@ describe('Level 1: record-change subscriptions on Memory', () => {
 		const id2 = 'mem-sub-level1-02';
 		const citerId = 'mem-sub-citer-001';
 
-		// 1. created (id1)
 		await MemoryItemResource.put(
 			queryTarget('', { id: id1 }),
 			{ title: 'first', content: 'first body', visibility: 'shared' },
 			{ user: aliceUser },
 		);
-		// 2. revised (id1 -> rev 2)
 		await MemoryItemResource.put(
 			queryTarget('', { id: id1 }),
 			{ content: 'first body revised' },
 			{ user: aliceUser, headers: { 'if-match': '"1"' } },
 		);
-		// 3. created (citer citing id1)
 		await MemoryItemResource.put(
 			queryTarget('', { id: citerId }),
 			{
@@ -93,7 +90,6 @@ describe('Level 1: record-change subscriptions on Memory', () => {
 			},
 			{ user: aliceUser },
 		);
-		// 4. supersede id1 with id2 -> emits created(id2), superseded(id1 rev 3), flagged(citerId rev 2)
 		await MemoryItemResource.put(
 			queryTarget('', { id: id2 }),
 			{
@@ -104,7 +100,6 @@ describe('Level 1: record-change subscriptions on Memory', () => {
 			},
 			{ user: aliceUser },
 		);
-		// 5. withdraw id2 -> emits restored(id1 rev 4) and withdrawn(id2 rev 2)
 		await MemoryItemResource.delete(queryTarget('reason=retract', { id: id2 }), {
 			user: aliceUser,
 			headers: { 'if-match': '"1"' },
@@ -125,7 +120,6 @@ describe('Level 1: record-change subscriptions on Memory', () => {
 		]);
 		for (const event of collector.received) {
 			assert.deepEqual(Object.keys(event), ['id', 'kind', 'revision']);
-			assert.equal(event.value, event);
 			assert.equal('content' in event, false);
 			assert.equal('title' in event, false);
 		}
@@ -138,7 +132,6 @@ describe('Level 1: record-change subscriptions on Memory', () => {
 		const daveSub = collectEvents(await MemoryResource.subscribe(queryTarget('', { rest: '' }), { user: daveUser }));
 
 		const teamId = 'mem-sub-team-0001';
-		// Created in team:eng -> alice and bob see it; dave does not.
 		await MemoryItemResource.put(
 			queryTarget('', { id: teamId }),
 			{ title: 'team note', content: 'eng only', scopes: ['team:eng'] },
@@ -332,7 +325,7 @@ describe('Level 1: record-change subscriptions on Memory', () => {
 		assert.equal(citRow.needsReview?.replacementId, impSupId);
 	});
 
-	it('isolates transient per-event read errors, deduplicates identical revisions, closes streams when upstream ends, and cleans up on client disconnect', async () => {
+	it('isolates transient per-event read errors with log throttling, deduplicates identical revisions, closes streams when upstream ends, and cleans up on client disconnect', async () => {
 		const sub = collectEvents(await MemoryResource.subscribe(queryTarget('', { rest: '' }), { user: bobUser }));
 		const ScopeGrant = databases.memory.ScopeGrant;
 		const origGet = ScopeGrant.get;
@@ -340,10 +333,13 @@ describe('Level 1: record-change subscriptions on Memory', () => {
 		const origError = logger.error;
 		logger.error = (...args) => errors.push(args);
 
-		let failNext = true;
+		// Evict bob's cached grant so delivery-time filtering hits ScopeGrant.get.
+		await grant('user:bob', ['global'], ['global']);
+
+		let failRemaining = 2;
 		ScopeGrant.get = async (id, ctx) => {
-			if (failNext && id === 'user:bob') {
-				failNext = false;
+			if (failRemaining > 0 && id === 'user:bob') {
+				failRemaining -= 1;
 				throw new Error('transient lmdb read error');
 			}
 			return origGet.call(ScopeGrant, id, ctx);
@@ -356,12 +352,17 @@ describe('Level 1: record-change subscriptions on Memory', () => {
 				{ user: aliceUser },
 			);
 			await MemoryItemResource.put(
-				queryTarget('', { id: 'mem-err-keep-0002' }),
-				{ title: 'second', content: 'delivered after recovery', visibility: 'shared' },
+				queryTarget('', { id: 'mem-err-skip-0002' }),
+				{ title: 'second', content: 'also skipped; error log throttled within window', visibility: 'shared' },
+				{ user: aliceUser },
+			);
+			await MemoryItemResource.put(
+				queryTarget('', { id: 'mem-err-keep-0003' }),
+				{ title: 'third', content: 'delivered after recovery', visibility: 'shared' },
 				{ user: aliceUser },
 			);
 			await sub.waitForCount(1);
-			assert.deepEqual(sub.received, [{ id: 'mem-err-keep-0002', kind: 'created', revision: 1 }]);
+			assert.deepEqual(sub.received, [{ id: 'mem-err-keep-0003', kind: 'created', revision: 1 }]);
 			assert.equal(errors.length, 1);
 		} finally {
 			ScopeGrant.get = origGet;
@@ -531,10 +532,16 @@ describe('Level 1: record-change subscriptions on Memory', () => {
 describe('Level 2: MemoryWatch, watch=true on search/bootstrap, and /MemoryEvents', () => {
 	it('POST /Memory/watch validates payload, rejects missing or unreadable ids with identical 404, records watches, and never shortens an existing watch TTL', async () => {
 		const pubId = 'mem-watch-pub-001';
+		const pubId2 = 'mem-watch-pub-002';
 		const privId = 'mem-watch-prv-001';
 		await MemoryItemResource.put(
 			queryTarget('', { id: pubId }),
 			{ title: 'pub', content: 'pub content', visibility: 'shared' },
+			{ user: aliceUser },
+		);
+		await MemoryItemResource.put(
+			queryTarget('', { id: pubId2 }),
+			{ title: 'pub2', content: 'pub2 content', visibility: 'shared' },
 			{ user: aliceUser },
 		);
 		await MemoryItemResource.put(
@@ -572,11 +579,13 @@ describe('Level 2: MemoryWatch, watch=true on search/bootstrap, and /MemoryEvent
 			assert.equal(res.status, 400, JSON.stringify(badBody));
 		}
 
+		__test.lockLog.length = 0;
 		const longWatch = await parse(
 			await MemoryWatchResource.post(queryTarget(''), { ids: [pubId, pubId], ttlSeconds: 7200 }, { user: bobUser }),
 		);
 		assert.equal(longWatch.status, 200);
 		assert.deepEqual(longWatch.body.watched, [pubId]);
+		assert.ok(__test.lockLog.some((entry) => entry.table === 'MemoryWatch' && entry.id === `bob:${pubId}`));
 		const longExpiry = Date.parse(longWatch.body.expiresAt);
 		assert.ok(Number.isFinite(longExpiry));
 		const storedLong = await databases.memory.MemoryWatch.get(`bob:${pubId}`);
@@ -584,12 +593,15 @@ describe('Level 2: MemoryWatch, watch=true on search/bootstrap, and /MemoryEvent
 		assert.equal(storedLong.memoryId, pubId);
 		assert.equal(storedLong.expiresAt.getTime(), longExpiry);
 
-		// A shorter explicit watch or watch=true search (default 3600s) must keep the longer 7200s expiry.
+		// A shorter explicit watch or watch=true search (default 3600s) must keep the longer 7200s expiry,
+		// while a multi-id watch reports the earliest effective expiresAt across the watched set.
 		const shortWatch = await parse(
-			await MemoryWatchResource.post(queryTarget(''), { ids: [pubId], ttlSeconds: 60 }, { user: bobUser }),
+			await MemoryWatchResource.post(queryTarget(''), { ids: [pubId, pubId2], ttlSeconds: 60 }, { user: bobUser }),
 		);
 		assert.equal(shortWatch.status, 200);
-		assert.equal(Date.parse(shortWatch.body.expiresAt), longExpiry);
+		const storedShort2 = await databases.memory.MemoryWatch.get(`bob:${pubId2}`);
+		assert.equal(Date.parse(shortWatch.body.expiresAt), storedShort2.expiresAt.getTime());
+		assert.ok(Date.parse(shortWatch.body.expiresAt) < longExpiry);
 		await MemoryResource.get(queryTarget('q=pub&watch=true', { rest: '' }), { user: bobUser });
 		const afterShort = await databases.memory.MemoryWatch.get(`bob:${pubId}`);
 		assert.equal(afterShort.expiresAt.getTime(), longExpiry);
@@ -630,7 +642,7 @@ describe('Level 2: MemoryWatch, watch=true on search/bootstrap, and /MemoryEvent
 		assert.equal(await databases.memory.MemoryWatch.get(`dave:${m2}`), null);
 	});
 
-	it('/MemoryEvents delivers events for watched memories and own flagged memories, honours expiry, and forbids principal in path', async () => {
+	it('/MemoryEvents delivers events for watched memories and own flagged memories (including folded needsReview), honours expiry, and forbids principal in path', async () => {
 		// Any principal or subpath on /MemoryEvents is 404.
 		const pathWithPrincipal = await parse(
 			await MemoryEventsResource.connect(queryTarget('', { pathname: 'bob' }), null, { user: bobUser }),
@@ -696,7 +708,37 @@ describe('Level 2: MemoryWatch, watch=true on search/bootstrap, and /MemoryEvent
 			headers: { 'if-match': '"1"' },
 		});
 
-		await bobEvents.waitForCount(2);
+		// Import batch where row A supersedes unwatchedId and row B (owned by Bob, unwatched) cites unwatchedId ->
+		// B has needsReview folded into its 'created' transition, so Bob receives B's 'created' event on /MemoryEvents.
+		const bobFoldedCiterId = 'mem-events-bobfld';
+		await MemoryImportResource.post(
+			queryTarget(''),
+			{
+				rows: [
+					{
+						id: 'mem-events-impsup',
+						ownerId: 'alice',
+						title: 'sup',
+						content: 'supersedes unwatchedId',
+						scopes: ['global'],
+						status: 'active',
+						supersedes: [unwatchedId],
+					},
+					{
+						id: bobFoldedCiterId,
+						ownerId: 'bob',
+						title: 'bob folded citer',
+						content: 'cites unwatchedId in import batch',
+						scopes: ['global'],
+						status: 'active',
+						evidence: [{ kind: 'memory', ref: unwatchedId }],
+					},
+				],
+			},
+			{ user: superUser },
+		);
+
+		await bobEvents.waitForCount(3);
 
 		// Expire Bob's watch on watchedId -> subsequent revision is not delivered.
 		await databases.memory.MemoryWatch.put({
@@ -716,6 +758,7 @@ describe('Level 2: MemoryWatch, watch=true on search/bootstrap, and /MemoryEvent
 		assert.deepEqual(bobEvents.received, [
 			{ id: watchedId, kind: 'revised', revision: 2 },
 			{ id: bobOwnCiterId, kind: 'flagged', revision: 2 },
+			{ id: bobFoldedCiterId, kind: 'created', revision: 1 },
 		]);
 	});
 });
@@ -734,7 +777,6 @@ describe('MCP tools and custom resource on MemoryMcpResource', () => {
 		const aliceCtx = { user: aliceUser };
 		const bobCtx = { user: bobUser };
 
-		// 1. remember (generated UUID and explicit id + idempotent retry)
 		const autoCreated = await resource.mcpRemember(
 			{ title: 'auto id memory', content: 'remembered via mcp', visibility: 'shared', tags: ['mcp'] },
 			aliceCtx,
@@ -764,7 +806,6 @@ describe('MCP tools and custom resource on MemoryMcpResource', () => {
 				err.statusCode === 428 && err.code === 'if_match_required' && err.errors?.[0]?.code === 'if_match_required',
 		);
 
-		// 2. revise
 		const revised = await resource.mcpRevise({ id: explicitId, revision: 1, content: 'revised via mcp' }, aliceCtx);
 		assert.deepEqual(revised, { id: explicitId, revision: 2, created: false, candidates: [] });
 
@@ -781,7 +822,6 @@ describe('MCP tools and custom resource on MemoryMcpResource', () => {
 			(err) => err.statusCode === 403 && err.code === 'not_memory_owner',
 		);
 
-		// 3. get and memory:///{id} custom resource read
 		const got = await resource.mcpGet({ id: explicitId }, bobCtx);
 		assert.equal(got.memory.id, explicitId);
 		assert.equal(got.memory.content, 'revised via mcp');
@@ -803,12 +843,10 @@ describe('MCP tools and custom resource on MemoryMcpResource', () => {
 		assert.equal(await resource.mcpReadMemory({ id: 'mem-mcp-missing-1' }, bobCtx), undefined);
 		assert.equal(await resource.mcpReadMemory({ id: explicitId }, {}), undefined);
 
-		// 4. recall (with watch: true)
 		const recalled = await resource.mcpRecall({ q: 'revised', tags: [], watch: true }, bobCtx);
 		assert.ok(recalled.memories.some((m) => m.id === explicitId));
 		assert.ok(await databases.memory.MemoryWatch.get(`bob:${explicitId}`));
 
-		// 5. pin, unpin, confirm, watch, withdraw
 		const pinned = await resource.mcpPin({ id: explicitId }, bobCtx);
 		assert.equal(pinned.pinned, true);
 		const unpinned = await resource.mcpUnpin({ id: explicitId }, bobCtx);

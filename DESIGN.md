@@ -69,10 +69,10 @@ authentication of its own and has no credential tables.
 
 - Interactive MCP clients (Claude Code, desktop, claude.ai connectors): intended to authenticate with
   OAuth 2.1 through `@harperfast/oauth` `mcp` mode (`withMCPAuth`), which does not yet populate a Harper
-  user object on `context.user` for Harper core's `/mcp` endpoint (Harper core mounts `/mcp` on a
-  `urlPath: "/mcp"` sub-route chain that bypasses unmounted `server.http` hooks, `withMCPAuth` leaves
-  `request.user` `undefined`, and the session-cookie hook sets `request.user` to a bare username string
-  rather than `{ username, role }`, so `resolvePrincipal` rejects with `401 principal_required`; see
+  user object on `context.user` for Harper core's `/mcp` endpoint (`withMCPAuth` only attaches its
+  middleware to `server.http` so `request.user` stays `undefined` on `/mcp`, and `@harperfast/oauth`'s
+  session-cookie hook sets `request.user` to a username string rather than `{ username, role }`, so
+  `resolvePrincipal` rejects with `401 principal_required`; see
   [HarperFast/oauth#279](https://github.com/HarperFast/oauth/issues/279)). Until that lands, MCP clients
   against `/mcp` authenticate with Harper credentials or a host-app middleware / principal resolver.
 - Headless agents use Harper credentials bound to a user (operation tokens, or a host-app API key that
@@ -280,8 +280,9 @@ one of its supports changing.
 ## HTTP surface
 
 Mounted at `urlPath` (default `Memory`, with the per-caller watch stream at `<urlPath>Events`, default
-`MemoryEvents`); every HTTP route class stays `hidden = true`, while `MemoryMcpResource` is mounted with
-`hidden = false` only when the plugin option `mcp` is `true` (default `false`).
+`MemoryEvents`); every HTTP route class stays `hidden = true`, while `MemoryMcpResource` (registered at
+`MemoryMcp` with `static path = '/MemoryMcp'` and no HTTP verb methods) is mounted with `hidden = false`
+only when the plugin option `mcp` is `true` (default `false`).
 
 | Route                                                                          | Purpose                                                                                                  |
 | ------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------- |
@@ -350,27 +351,30 @@ Three levels, built in order:
 
 1. **Record changes**: `Memory` (`/Memory` and `/Memory/<id>`) supports Harper real-time subscriptions
    over WebSocket and SSE (`Accept: text/event-stream`). Every event is checked against the subscriber's
-   read rule (`canRead`) at delivery time: `ScopeGrant` rows (and any custom principal resolver) are
-   re-evaluated on every event, so a scope narrowing or grant revocation revokes visibility
-   mid-subscription. For `withdrawn`, read access checks the memory's scope labels ignoring
-   `status = withdrawn` (matching Provenance), so label readers and watchers learn that a shared memory
-   they could read was withdrawn (`GET /Memory/<id>` still returns 404 to non-owners). Events carry
-   `{ id, kind, revision }` — never content — with `kind` one of `created`, `revised`, `superseded`,
-   `withdrawn`, `restored`, or `flagged` (`needsReview` set), so a reader re-reads through the guarded
-   `GET`. Subscriptions are live-only (`omitCurrent: true`) with at-most-once delivery and no replay
-   across disconnects; reconnecting clients re-read or re-bootstrap (`watch=true`) to catch up.
+   read rule (`canRead`) at delivery time: `ScopeGrant` rows are cached for up to 5 s and invalidated via
+   the worker hub's `ScopeGrant` subscription (and any custom principal resolver is called on each event),
+   so a scope narrowing or grant revocation revokes visibility mid-subscription; Harper user role
+   assignments on `context.user` are captured when the connection opens and take effect on reconnect. For
+   `withdrawn`, read access checks the memory's scope labels ignoring `status = withdrawn` (matching
+   Provenance), so label readers and watchers learn that a shared memory they could read was withdrawn
+   (`GET /Memory/<id>` still returns 404 to non-owners). Events carry `{ id, kind, revision }` — never
+   content — with `kind` one of `created`, `revised`, `superseded`, `withdrawn`, `restored`, or `flagged`
+   (`needsReview` set), so a reader re-reads through the guarded `GET`. Subscriptions are live-only
+   (`omitCurrent: true`) with at-most-once delivery and no replay across disconnects; reconnecting clients
+   re-read watched ids (comparing `revision`) or re-bootstrap (`watch=true`) to catch up.
 2. **Watches**: `POST /Memory/watch { ids, ttlSeconds? }` (1–100 ids; `ttlSeconds` integer in
    `1..86400`, default 3600) and `watch=true` on search and bootstrap record `MemoryWatch` rows
    (`<principalId>:<memoryId>`, `expiresAt @expiresAt`), keeping whichever `expiresAt` is later when a
-   watch already exists. `POST /Memory/watch` requires read access on every requested id and rejects
-   unreadable ids with the same 404 (`memory_not_found`) as missing ones before writing any watch. A
-   per-caller event stream at `/MemoryEvents` (`<urlPath>Events` when `urlPath` is customized; identity
-   comes from `context`, with no principal in the path — `/MemoryEvents/<principal>` returns 404) delivers
-   `{ id, kind, revision }` over SSE or WebSocket whenever:
+   watch already exists and returning the earliest effective `expiresAt` across the watched ids.
+   `POST /Memory/watch` requires read access on every requested id and rejects unreadable ids with the
+   same 404 (`memory_not_found`) as missing ones before writing any watch. A per-caller event stream at
+   `/MemoryEvents` (`<urlPath>Events` when `urlPath` is customized; identity comes from `context`, with no
+   principal in the path — `/MemoryEvents/<principal>` returns 404) delivers `{ id, kind, revision }` over
+   SSE or WebSocket whenever:
    - a memory with an unexpired `MemoryWatch` for the caller changes and passes the caller's delivery-time
      read check, or
-   - one of the caller's own memories (`ownerId === principal.id`) is flagged `needsReview`
-     (`kind: 'flagged'`).
+   - one of the caller's own memories (`ownerId === principal.id`) is flagged `needsReview` (`kind:
+'flagged'`, or `restored` / `created` with a newly folded `needsReview` flag visible to the caller).
      The notification fires when "a memory you relied on changed, or your own memory needs review", not on
      every write.
    - **MCP resource subscriptions (`resources/subscribe`)**: Harper core's `resources/subscribe` handler
@@ -386,9 +390,9 @@ Three levels, built in order:
 ## MCP surface
 
 Behind the plugin option `mcp` (`boolean`, default `false`), `handleApplication` mounts `MemoryMcpResource`
-(`static hidden = false`, with no HTTP verb methods) to expose MCP tools and a resource template on
-Harper's native `/mcp` endpoint (`src/mcp.ts`), each delegating to the same lifecycle, search, and watch
-functions and enforcing the same permission checks as REST:
+(`static path = '/MemoryMcp'`, `static hidden = false`, with no HTTP verb methods) to expose MCP tools and
+a resource template on Harper's native `/mcp` endpoint (`src/mcp.ts`), each delegating to the same
+lifecycle, search, and watch functions and enforcing the same permission checks as REST:
 
 - **`static mcpTools`**:
   - `remember` — create a memory (`PUT`; generates a UUID when `id` is omitted, or idempotently retries an
