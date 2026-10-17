@@ -1,6 +1,6 @@
-// Memory ids are 16-64 characters, so the 9-char `bootstrap` and 6-char `import` path segments cannot collide with one.
-import { logger, Resource } from 'harper';
-import { badRequest, isCallerSafe, memoryError, notFound, type MemoryError } from './errors.ts';
+// Memory ids are 16-64 characters, so the 9-char `bootstrap`, 6-char `import`, and 5-char `watch` path segments cannot collide with one.
+import { Resource } from 'harper';
+import { badRequest, memoryError, normalizeError, notFound } from './errors.ts';
 import { subscribeMemory, subscribeMemoryEvents, watchMemories } from './events.ts';
 import { importMemories } from './import.ts';
 import { confirmMemory, getMemory, pinMemory, putMemory, unpinMemory, withdrawMemory } from './lifecycle.ts';
@@ -8,7 +8,6 @@ import { MEMORY_MCP_METHODS, MEMORY_MCP_RESOURCES, MEMORY_MCP_TOOLS } from './mc
 import { resolvePrincipal } from './principal.ts';
 import type { Principal } from './scopes.ts';
 import { bootstrapMemories, parseBootstrapParams, parseSearchParams, searchMemories } from './search.ts';
-import { getSettings } from './settings.ts';
 
 function json(data: unknown, status = 200, extraHeaders?: Record<string, string>): Response {
 	return new Response(JSON.stringify(data), {
@@ -23,43 +22,6 @@ async function readBody(data: unknown): Promise<unknown> {
 	} catch {
 		throw badRequest('Request body must be valid JSON', 'invalid_body');
 	}
-}
-
-// Harper's retryable failures: 503 (an index rebuilding or lagging, a database closing), 423 (a record lock not
-// granted in time), the 409 a lock lease that lapsed before commit raises, and transient embedding backend
-// failures (429, 5xx, timeout, connection failure), whether wrapped by Harper's embedHook or raised by the
-// plugin's own embedding before a write. Any other 409 (a sink inserting a row that exists) is a defect, not a
-// reason to retry.
-function isRetryable(error: any): boolean {
-	const status = error?.statusCode;
-	const message = String(error?.message ?? '');
-	if (status === 503 || status === 423 || (status === 409 && message.startsWith('Record lock'))) return true;
-	const upstream = error?.upstreamStatus ?? error?.cause?.upstreamStatus ?? error?.cause?.status;
-	if (upstream === 429 || (typeof upstream === 'number' && upstream >= 500 && upstream <= 599)) return true;
-	if (error?.name === 'AbortError' || error?.name === 'TimeoutError') return true;
-	if (error?.name === 'TypeError' && message === 'fetch failed') return true;
-	return /^Failed to compute embedding for attribute "embedding"(?: \[(?:AbortError|TimeoutError|TypeError)\]|.*\(backend HTTP (?:429|5\d\d)\))/.test(
-		message,
-	);
-}
-
-const RETRYABLE_WARN_INTERVAL_MS = 60_000;
-let lastRetryableWarning = 0;
-
-export function normalizeError(error: unknown, route: string): MemoryError {
-	if (isCallerSafe(error)) return error;
-	// The fixed message keeps Harper's text, which is not vetted for callers, out of the response; the log keeps
-	// a persistent condition diagnosable without logging every request.
-	if (isRetryable(error)) {
-		const now = Date.now();
-		if (now - lastRetryableWarning >= RETRYABLE_WARN_INTERVAL_MS) {
-			lastRetryableWarning = now;
-			logger.warn?.(`[agent-memory] ${route} answered 503 for a retryable failure`, error);
-		}
-		return memoryError('Temporarily unavailable; retry shortly', 503, 'unavailable');
-	}
-	logger.error?.(`[agent-memory] ${route} failed`, error);
-	return memoryError('Internal error', 500, 'internal_error');
 }
 
 function errorResponse(error: unknown, route: string): Response {
@@ -105,24 +67,40 @@ async function handleSubscribe<T>(
 	}
 }
 
-function drainIncomingMessages(incomingMessages: any): void {
-	if (!incomingMessages) return;
+function isResponseClosed(context: any): boolean {
+	const nodeRes = context?._nodeResponse;
+	return Boolean(nodeRes?.writableEnded || nodeRes?.destroyed);
+}
+
+function drainIncomingMessages(incomingMessages: any, onClose: () => void): { isClosed(): boolean } {
+	let closed = false;
+	const markClosed = () => {
+		if (closed) return;
+		closed = true;
+		onClose();
+	};
+	if (!incomingMessages) return { isClosed: () => closed };
 	if (typeof incomingMessages.on === 'function') {
 		incomingMessages.on('data', () => {});
 		incomingMessages.on('error', () => {});
-		return;
+		incomingMessages.on('close', markClosed);
+		incomingMessages.on('end', markClosed);
+		return { isClosed: () => closed };
 	}
 	if (typeof incomingMessages[Symbol.asyncIterator] === 'function') {
 		void (async () => {
 			try {
 				for await (const _ of incomingMessages) {
-					// Subscription streams are server-to-client only; ignore client frames.
+					void _;
 				}
 			} catch {
-				// Ignore disconnect errors on the incoming side.
+				void 0;
+			} finally {
+				markClosed();
 			}
 		})();
 	}
+	return { isClosed: () => closed };
 }
 
 // Node's http.ServerResponse defers transmitting headers after writeHead() until the first body byte or
@@ -141,7 +119,7 @@ function scheduleFlushHeaders(context: any): void {
 					attempt(remaining - 1);
 				}
 			} catch {
-				// Ignore if the client disconnected before headers flushed.
+				void 0;
 			}
 		});
 	};
@@ -158,7 +136,7 @@ function rejectUnsupportedVerb(target: any): never {
 
 // @ts-expect-error — Resource's static verb types carry transactional()'s reliesOnPrototype brand
 class MemoryEndpoint extends Resource {
-	// Kept out of MCP and OpenAPI auto-export unless explicitly enabled on MemoryResource.
+	// Kept out of MCP and OpenAPI auto-export.
 	static hidden = true;
 
 	static async get(target: any, context: object) {
@@ -191,15 +169,28 @@ class MemoryEndpoint extends Resource {
 		if (incomingMessages == null) {
 			try {
 				const stream = await this.subscribe(target, context);
+				if (isResponseClosed(context)) {
+					stream.end?.();
+					return stream;
+				}
+				(context as any)?._nodeResponse?.once?.('close', () => stream.end?.());
 				scheduleFlushHeaders(context);
 				return stream;
 			} catch (error) {
 				return errorResponse(error, 'connect');
 			}
 		}
-		drainIncomingMessages(incomingMessages);
+		let activeStream: any;
+		const drain = drainIncomingMessages(incomingMessages, () => activeStream?.end?.());
 		try {
-			return await this.subscribe(target, context);
+			const stream = await this.subscribe(target, context);
+			activeStream = stream;
+			if (drain.isClosed() || isResponseClosed(context)) {
+				stream.end?.();
+				return stream;
+			}
+			(context as any)?._nodeResponse?.once?.('close', () => stream.end?.());
+			return stream;
 		} catch (error) {
 			throw normalizeError(error, 'connect');
 		}
@@ -208,18 +199,6 @@ class MemoryEndpoint extends Resource {
 
 export class MemoryResource extends MemoryEndpoint {
 	static path = '/Memory/*rest';
-
-	static override get hidden(): boolean {
-		return !getSettings().mcp;
-	}
-
-	static get mcpTools() {
-		return getSettings().mcp ? MEMORY_MCP_TOOLS : [];
-	}
-
-	static get mcpResources() {
-		return getSettings().mcp ? MEMORY_MCP_RESOURCES : [];
-	}
 
 	static async get(target: any, context: object) {
 		return handle('get', context, async (principal, ctx) => {
@@ -233,7 +212,14 @@ export class MemoryResource extends MemoryEndpoint {
 	}
 }
 
-Object.assign(MemoryResource.prototype, MEMORY_MCP_METHODS);
+export class MemoryMcpResource extends Resource {
+	static path = '/MemoryMcp';
+	static hidden = false;
+	static mcpTools = MEMORY_MCP_TOOLS;
+	static mcpResources = MEMORY_MCP_RESOURCES;
+}
+
+Object.assign(MemoryMcpResource.prototype, MEMORY_MCP_METHODS);
 
 export class MemoryBootstrapResource extends MemoryEndpoint {
 	static path = '/Memory/bootstrap';

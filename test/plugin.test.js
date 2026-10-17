@@ -2,7 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { handleApplication } from '../dist/index.js';
-import { MemoryResource } from '../dist/resource.js';
+import { MemoryMcpResource, MemoryResource } from '../dist/resource.js';
 import { getSettings, parseSettings } from '../dist/settings.js';
 
 function fakeScope(options) {
@@ -30,7 +30,7 @@ function fakeScope(options) {
 }
 
 describe('handleApplication', () => {
-	it('mounts all route resources at urlPath and moves them when the option changes', async () => {
+	it('mounts all route resources at urlPath, toggles MemoryMcpResource with mcp, and moves them when options change', async () => {
 		const harness = fakeScope({ urlPath: '/agent-memory/' });
 		await handleApplication(harness.scope);
 		assert.deepEqual(
@@ -47,7 +47,14 @@ describe('handleApplication', () => {
 		);
 		assert.equal(harness.entries.get('agent-memory/*rest').Resource, MemoryResource);
 
-		harness.setOptions({ urlPath: 'mem' });
+		harness.setOptions({ urlPath: 'mem', mcp: true });
+		assert.deepEqual(
+			[...harness.entries.keys()],
+			['mem/*rest', 'mem/bootstrap', 'mem/import', 'mem/watch', 'mem/:id', 'mem/:id/:action', 'memEvents', 'memMcp'],
+		);
+		assert.equal(harness.entries.get('memMcp').Resource, MemoryMcpResource);
+
+		harness.setOptions({ urlPath: 'mem', mcp: false });
 		assert.deepEqual(
 			[...harness.entries.keys()],
 			['mem/*rest', 'mem/bootstrap', 'mem/import', 'mem/watch', 'mem/:id', 'mem/:id/:action', 'memEvents'],

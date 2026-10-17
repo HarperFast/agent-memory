@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
-import { badRequest, isCallerSafe, memoryError, notFound } from './errors.ts';
-import { watchMemories } from './events.ts';
+import { badRequest, isCallerSafe, memoryError, normalizeError, notFound } from './errors.ts';
+import { WATCH_MAX_IDS, WATCH_MAX_TTL_SECONDS, watchMemories } from './events.ts';
 import {
 	confirmMemory,
 	EVIDENCE_KINDS,
@@ -13,7 +13,6 @@ import {
 	withdrawMemory,
 } from './lifecycle.ts';
 import { resolvePrincipal } from './principal.ts';
-import { normalizeError } from './resource.ts';
 import { isScopeLabel, type Principal } from './scopes.ts';
 import { searchMemories, type SearchParams } from './search.ts';
 
@@ -216,8 +215,8 @@ export const MEMORY_MCP_TOOLS = [
 			additionalProperties: false,
 			required: ['ids'],
 			properties: {
-				ids: { type: 'array', items: { type: 'string' }, minItems: 1 },
-				ttlSeconds: { type: 'integer', minimum: 1 },
+				ids: { type: 'array', items: { type: 'string' }, minItems: 1, maxItems: WATCH_MAX_IDS },
+				ttlSeconds: { type: 'integer', minimum: 1, maximum: WATCH_MAX_TTL_SECONDS },
 			},
 		},
 	},
@@ -230,7 +229,6 @@ export const MEMORY_MCP_RESOURCES = [
 		description: 'Guarded view of a readable memory by id.',
 		mimeType: 'application/json',
 		method: 'mcpReadMemory',
-		read: 'mcpReadMemory',
 	},
 ] as const;
 

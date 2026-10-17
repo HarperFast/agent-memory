@@ -106,8 +106,10 @@ server.http(
 		} else if (mode === 'oauth-resource-string-user') {
 			request._oauthAuth = { valid: true, userId: 'alice', scopes: ['mcp:read', 'mcp:write'] };
 			request.user = 'alice';
+		} else if (mode === 'oauth-hydrated-user') {
+			request.user = { username: 'alice' };
 		}
 		return nextHandler(request);
 	},
-	{ runFirst: true },
+	{ urlPath: '/mcp', runFirst: true },
 );

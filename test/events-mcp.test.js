@@ -1,12 +1,14 @@
 import { beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { __test, databases } from 'harper';
+import { EventEmitter } from 'node:events';
+import { __test, databases, logger } from 'harper';
 import {
 	MemoryActionResource,
 	MemoryBootstrapResource,
 	MemoryEventsResource,
 	MemoryImportResource,
 	MemoryItemResource,
+	MemoryMcpResource,
 	MemoryResource,
 	MemoryWatchResource,
 } from '../dist/resource.js';
@@ -37,6 +39,7 @@ function collectEvents(stream) {
 	})();
 	return {
 		received,
+		done,
 		async waitForCount(count, timeoutMs = 1000) {
 			const deadline = Date.now() + timeoutMs;
 			while (received.length < count && Date.now() < deadline) {
@@ -170,7 +173,7 @@ describe('Level 1: record-change subscriptions on Memory', () => {
 		);
 		await aliceSub.waitForCount(4);
 
-		// Create another global memory and withdraw it -> owner (alice) receives withdrawn; non-owners (bob, dave) do not.
+		// Create another global memory and withdraw it -> label readers (bob, dave) as well as owner (alice) receive withdrawn.
 		const withdrawId = 'mem-sub-withdr-01';
 		await MemoryItemResource.put(
 			queryTarget('', { id: withdrawId }),
@@ -185,9 +188,12 @@ describe('Level 1: record-change subscriptions on Memory', () => {
 			headers: { 'if-match': '"1"' },
 		});
 		await aliceSub.waitForCount(6);
+		await bobSub.waitForCount(4);
+		await daveSub.waitForCount(3);
 
-		// Redacted review flag: alice creates a global citer that cites her private memory sharedId, then withdraws sharedId.
-		// dave can read the global citer, but cannot read the private source sharedId, so dave must NOT receive 'flagged'.
+		// Redacted review flag and private withdrawal: alice creates a global citer that cites her private memory sharedId,
+		// then withdraws sharedId. dave and bob can read the global citer, but cannot read the private source sharedId,
+		// so they must receive neither 'withdrawn' for sharedId nor 'flagged' for publicCiterId.
 		const publicCiterId = 'mem-sub-pubcite-1';
 		await MemoryItemResource.put(
 			queryTarget('', { id: publicCiterId }),
@@ -199,13 +205,24 @@ describe('Level 1: record-change subscriptions on Memory', () => {
 			},
 			{ user: aliceUser },
 		);
-		await daveSub.waitForCount(3);
+		await bobSub.waitForCount(5);
+		await daveSub.waitForCount(4);
 
 		await MemoryItemResource.delete(queryTarget('', { id: sharedId }), {
 			user: aliceUser,
 			headers: { 'if-match': '"2"' },
 		});
 		await aliceSub.waitForCount(9);
+
+		// Emit a final shared marker so bob and dave have processed the preceding private withdrawal and redacted flag.
+		const markerId = 'mem-sub-marker-01';
+		await MemoryItemResource.put(
+			queryTarget('', { id: markerId }),
+			{ title: 'marker', content: 'end marker', visibility: 'shared' },
+			{ user: aliceUser },
+		);
+		await bobSub.waitForCount(6);
+		await daveSub.waitForCount(5);
 
 		await aliceSub.close();
 		await bobSub.close();
@@ -217,7 +234,9 @@ describe('Level 1: record-change subscriptions on Memory', () => {
 				[teamId, 'created', 1],
 				[sharedId, 'created', 1],
 				[withdrawId, 'created', 1],
+				[withdrawId, 'withdrawn', 2],
 				[publicCiterId, 'created', 1],
+				[markerId, 'created', 1],
 			],
 		);
 		assert.deepEqual(
@@ -225,10 +244,220 @@ describe('Level 1: record-change subscriptions on Memory', () => {
 			[
 				[sharedId, 'created', 1],
 				[withdrawId, 'created', 1],
+				[withdrawId, 'withdrawn', 2],
 				[publicCiterId, 'created', 1],
+				[markerId, 'created', 1],
 			],
 		);
 		assert.ok(aliceSub.received.some((e) => e.id === publicCiterId && e.kind === 'flagged'));
+	});
+
+	it('preserves restored event kind when a restored memory also cited the withdrawn superseder, and preserves created kind on import batch citers', async () => {
+		const oldId = 'mem-rest-cite-old';
+		const supId = 'mem-rest-cite-sup';
+		await MemoryItemResource.put(
+			queryTarget('', { id: oldId }),
+			{ title: 'old', content: 'old content', visibility: 'shared' },
+			{ user: aliceUser },
+		);
+		await MemoryItemResource.put(
+			queryTarget('', { id: supId }),
+			{ title: 'sup', content: 'supersedes old', visibility: 'shared', supersedes: [oldId] },
+			{ user: aliceUser },
+		);
+		// Seed oldId with a citation to supId while superseded so withdrawing supId both restores and flags oldId in one transaction.
+		const oldRow = await databases.memory.Memory.get(oldId);
+		await databases.memory.Memory.put({
+			...oldRow,
+			evidence: [{ kind: 'memory', ref: supId }],
+			evidenceMemoryIds: [supId],
+		});
+
+		const sub = collectEvents(await MemoryResource.subscribe(queryTarget('', { rest: '' }), { user: aliceUser }));
+		await MemoryItemResource.delete(queryTarget('reason=undo', { id: supId }), {
+			user: aliceUser,
+			headers: { 'if-match': '"1"' },
+		});
+		await sub.waitForCount(2);
+
+		const restoredEvent = sub.received.find((e) => e.id === oldId);
+		assert.deepEqual(restoredEvent, { id: oldId, kind: 'restored', revision: 3 });
+		const restoredRow = await databases.memory.Memory.get(oldId);
+		assert.equal(restoredRow.status, 'active');
+		assert.equal(restoredRow.lastEventKind, 'restored');
+		assert.equal(restoredRow.needsReview?.sourceId, supId);
+		assert.equal(restoredRow.needsReview?.cause, 'withdrawn');
+
+		// Import batch where row B supersedes stored oldId and row C cites oldId: C must emit 'created' at revision 1 with needsReview set.
+		const impSupId = 'mem-imp-sup-00001';
+		const impCitId = 'mem-imp-cit-00001';
+		const impRes = await parse(
+			await MemoryImportResource.post(
+				queryTarget(''),
+				{
+					rows: [
+						{
+							id: impSupId,
+							ownerId: 'alice',
+							title: 'import sup',
+							content: 'supersedes oldId',
+							scopes: ['global'],
+							status: 'active',
+							supersedes: [oldId],
+						},
+						{
+							id: impCitId,
+							ownerId: 'alice',
+							title: 'import citer',
+							content: 'cites oldId in same batch',
+							scopes: ['global'],
+							status: 'active',
+							evidence: [{ kind: 'memory', ref: oldId }],
+						},
+					],
+				},
+				{ user: superUser },
+			),
+		);
+		assert.equal(impRes.status, 200);
+		await sub.waitForCount(5);
+		await sub.close();
+
+		const citCreated = sub.received.filter((e) => e.id === impCitId);
+		assert.deepEqual(citCreated, [{ id: impCitId, kind: 'created', revision: 1 }]);
+		const citRow = await databases.memory.Memory.get(impCitId);
+		assert.equal(citRow.revision, 1);
+		assert.equal(citRow.lastEventKind, 'created');
+		assert.equal(citRow.needsReview?.sourceId, oldId);
+		assert.equal(citRow.needsReview?.replacementId, impSupId);
+	});
+
+	it('isolates transient per-event read errors, deduplicates identical revisions, closes streams when upstream ends, and cleans up on client disconnect', async () => {
+		const sub = collectEvents(await MemoryResource.subscribe(queryTarget('', { rest: '' }), { user: bobUser }));
+		const ScopeGrant = databases.memory.ScopeGrant;
+		const origGet = ScopeGrant.get;
+		const errors = [];
+		const origError = logger.error;
+		logger.error = (...args) => errors.push(args);
+
+		let failNext = true;
+		ScopeGrant.get = async (id, ctx) => {
+			if (failNext && id === 'user:bob') {
+				failNext = false;
+				throw new Error('transient lmdb read error');
+			}
+			return origGet.call(ScopeGrant, id, ctx);
+		};
+
+		try {
+			await MemoryItemResource.put(
+				queryTarget('', { id: 'mem-err-skip-0001' }),
+				{ title: 'first', content: 'skipped due to transient grant error', visibility: 'shared' },
+				{ user: aliceUser },
+			);
+			await MemoryItemResource.put(
+				queryTarget('', { id: 'mem-err-keep-0002' }),
+				{ title: 'second', content: 'delivered after recovery', visibility: 'shared' },
+				{ user: aliceUser },
+			);
+			await sub.waitForCount(1);
+			assert.deepEqual(sub.received, [{ id: 'mem-err-keep-0002', kind: 'created', revision: 1 }]);
+			assert.equal(errors.length, 1);
+		} finally {
+			ScopeGrant.get = origGet;
+			logger.error = origError;
+			await sub.close();
+		}
+
+		// Deduplication of repeated (id, revision) and upstream iterator completion closing client streams.
+		const Memory = databases.memory.Memory;
+		const origSubscribe = Memory.subscribe;
+		let pushUpstream;
+		let finishUpstream;
+		let upstreamEndCalls = 0;
+		Memory.subscribe = async () => {
+			const items = [];
+			let resolveNext;
+			let ended = false;
+			pushUpstream = (ev) => {
+				if (resolveNext) {
+					const r = resolveNext;
+					resolveNext = null;
+					r({ value: ev, done: false });
+				} else {
+					items.push(ev);
+				}
+			};
+			finishUpstream = () => {
+				ended = true;
+				if (resolveNext) {
+					const r = resolveNext;
+					resolveNext = null;
+					r({ value: undefined, done: true });
+				}
+			};
+			return {
+				end() {
+					upstreamEndCalls += 1;
+					finishUpstream();
+				},
+				[Symbol.asyncIterator]() {
+					return {
+						next() {
+							if (items.length > 0) return Promise.resolve({ value: items.shift(), done: false });
+							if (ended) return Promise.resolve({ value: undefined, done: true });
+							return new Promise((resolve) => {
+								resolveNext = resolve;
+							});
+						},
+						return() {
+							upstreamEndCalls += 1;
+							return Promise.resolve({ value: undefined, done: true });
+						},
+					};
+				},
+			};
+		};
+
+		try {
+			const nodeRes = new EventEmitter();
+			const sseStream = await MemoryResource.connect(queryTarget('', { rest: '' }), null, {
+				user: bobUser,
+				_nodeResponse: nodeRes,
+			});
+			const collected = collectEvents(sseStream);
+			const dupEvent = {
+				id: 'mem-dup-event-001',
+				type: 'put',
+				value: {
+					id: 'mem-dup-event-001',
+					ownerId: 'alice',
+					scopes: ['global'],
+					status: 'active',
+					revision: 1,
+					lastEventKind: 'created',
+				},
+			};
+			pushUpstream(dupEvent);
+			pushUpstream(dupEvent);
+			await collected.waitForCount(1);
+			finishUpstream();
+			await collected.done;
+			assert.deepEqual(collected.received, [{ id: 'mem-dup-event-001', kind: 'created', revision: 1 }]);
+
+			// Disconnect via _nodeResponse 'close' event releases the hub subscription.
+			const nodeRes2 = new EventEmitter();
+			const sseStream2 = await MemoryResource.connect(queryTarget('', { rest: '' }), null, {
+				user: bobUser,
+				_nodeResponse: nodeRes2,
+			});
+			const collected2 = collectEvents(sseStream2);
+			nodeRes2.emit('close');
+			await collected2.done;
+			assert.ok(upstreamEndCalls >= 1);
+		} finally {
+			Memory.subscribe = origSubscribe;
+		}
 	});
 
 	it('supports single-item subscriptions on /Memory/:id and rejects missing or unreadable ids with identical 404', async () => {
@@ -300,7 +529,7 @@ describe('Level 1: record-change subscriptions on Memory', () => {
 });
 
 describe('Level 2: MemoryWatch, watch=true on search/bootstrap, and /MemoryEvents', () => {
-	it('POST /Memory/watch validates payload, rejects missing or unreadable ids with identical 404, and records watches', async () => {
+	it('POST /Memory/watch validates payload, rejects missing or unreadable ids with identical 404, records watches, and never shortens an existing watch TTL', async () => {
 		const pubId = 'mem-watch-pub-001';
 		const privId = 'mem-watch-prv-001';
 		await MemoryItemResource.put(
@@ -343,15 +572,27 @@ describe('Level 2: MemoryWatch, watch=true on search/bootstrap, and /MemoryEvent
 			assert.equal(res.status, 400, JSON.stringify(badBody));
 		}
 
-		const ok = await parse(
-			await MemoryWatchResource.post(queryTarget(''), { ids: [pubId, pubId], ttlSeconds: 120 }, { user: bobUser }),
+		const longWatch = await parse(
+			await MemoryWatchResource.post(queryTarget(''), { ids: [pubId, pubId], ttlSeconds: 7200 }, { user: bobUser }),
 		);
-		assert.equal(ok.status, 200);
-		assert.deepEqual(ok.body.watched, [pubId]);
-		assert.ok(typeof ok.body.expiresAt === 'string');
-		const stored = await databases.memory.MemoryWatch.get(`bob:${pubId}`);
-		assert.equal(stored.principalId, 'bob');
-		assert.equal(stored.memoryId, pubId);
+		assert.equal(longWatch.status, 200);
+		assert.deepEqual(longWatch.body.watched, [pubId]);
+		const longExpiry = Date.parse(longWatch.body.expiresAt);
+		assert.ok(Number.isFinite(longExpiry));
+		const storedLong = await databases.memory.MemoryWatch.get(`bob:${pubId}`);
+		assert.equal(storedLong.principalId, 'bob');
+		assert.equal(storedLong.memoryId, pubId);
+		assert.equal(storedLong.expiresAt.getTime(), longExpiry);
+
+		// A shorter explicit watch or watch=true search (default 3600s) must keep the longer 7200s expiry.
+		const shortWatch = await parse(
+			await MemoryWatchResource.post(queryTarget(''), { ids: [pubId], ttlSeconds: 60 }, { user: bobUser }),
+		);
+		assert.equal(shortWatch.status, 200);
+		assert.equal(Date.parse(shortWatch.body.expiresAt), longExpiry);
+		await MemoryResource.get(queryTarget('q=pub&watch=true', { rest: '' }), { user: bobUser });
+		const afterShort = await databases.memory.MemoryWatch.get(`bob:${pubId}`);
+		assert.equal(afterShort.expiresAt.getTime(), longExpiry);
 	});
 
 	it('watch=true on search and bootstrap watches every returned memory id', async () => {
@@ -479,13 +720,17 @@ describe('Level 2: MemoryWatch, watch=true on search/bootstrap, and /MemoryEvent
 	});
 });
 
-describe('MCP tools and custom resource on MemoryResource', () => {
+describe('MCP tools and custom resource on MemoryMcpResource', () => {
 	beforeEach(() => {
 		applySettings(parseSettings({ mcp: true }));
 	});
 
 	it('executes remember, revise, recall (with watch), get, pin, unpin, confirm, watch, withdraw, and memory:///{id} with the same rules as REST', async () => {
-		const resource = new MemoryResource();
+		const watchTool = MemoryMcpResource.mcpTools.find((t) => t.name === 'watch');
+		assert.equal(watchTool.inputSchema.properties.ids.maxItems, 100);
+		assert.equal(watchTool.inputSchema.properties.ttlSeconds.maximum, 86400);
+
+		const resource = new MemoryMcpResource();
 		const aliceCtx = { user: aliceUser };
 		const bobCtx = { user: bobUser };
 

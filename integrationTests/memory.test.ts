@@ -1001,8 +1001,6 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 					kind: 'revised',
 					revision: 3,
 				});
-				ok(!bobAll.events.some((e) => e.id === shared.id && e.revision === 3));
-				ok(!singleSub.events.some((e) => e.id === shared.id && e.revision === 3));
 
 				// Widen back to shared, cite from bob, supersede, and withdraw superseder to exercise
 				// flagged, superseded, restored, and withdrawn events.
@@ -1019,6 +1017,9 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 					200,
 				);
 				await bobAll.waitFor((e) => e.id === shared.id && e.revision === 4);
+				await singleSub.waitFor((e) => e.id === shared.id && e.revision === 4);
+				ok(!bobAll.events.some((e) => e.id === shared.id && e.revision === 3));
+				ok(!singleSub.events.some((e) => e.id === shared.id && e.revision === 3));
 
 				const citer = await create('bob', 'sse-citer', {
 					title: 'tern plan',
@@ -1043,10 +1044,21 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 					revision: 2,
 				});
 
-				// Withdraw replacement -> alice (owner) gets withdrawn; bob does NOT get withdrawn for alice's memory,
-				// but DOES get restored on shared.id.
+				// Withdraw shared replacement -> both alice (owner) and bob (label reader) receive withdrawn for replacement,
+				// and restored on shared.id; withdrawing alicePrivate delivers withdrawn to alice only, not bob.
 				strictEqual((await call('alice', 'DELETE', replacement.id, undefined, { 'If-Match': '"1"' })).status, 200);
+				strictEqual((await call('alice', 'DELETE', alicePrivate.id, undefined, { 'If-Match': '"1"' })).status, 200);
 				deepStrictEqual(await aliceAll.waitFor((e) => e.id === replacement.id && e.kind === 'withdrawn'), {
+					id: replacement.id,
+					kind: 'withdrawn',
+					revision: 2,
+				});
+				deepStrictEqual(await aliceAll.waitFor((e) => e.id === alicePrivate.id && e.kind === 'withdrawn'), {
+					id: alicePrivate.id,
+					kind: 'withdrawn',
+					revision: 2,
+				});
+				deepStrictEqual(await bobAll.waitFor((e) => e.id === replacement.id && e.kind === 'withdrawn'), {
 					id: replacement.id,
 					kind: 'withdrawn',
 					revision: 2,
@@ -1056,7 +1068,6 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 					kind: 'restored',
 					revision: 6,
 				});
-				ok(!bobAll.events.some((e) => e.id === replacement.id && e.kind === 'withdrawn'));
 
 				// ScopeGrant revocation mid-subscription: dave loses customer:* and no longer receives customer:x events.
 				const cxMem = await create('carol', 'sse-cx', {
@@ -1085,7 +1096,9 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 						visibility: 'shared',
 					});
 					await daveAll.waitFor((e) => e.id === marker.id && e.kind === 'created');
+					await bobAll.waitFor((e) => e.id === marker.id && e.kind === 'created');
 					ok(!daveAll.events.some((e) => e.id === cxMem.id && e.revision === 2));
+					ok(!bobAll.events.some((e) => e.id === alicePrivate.id));
 				} finally {
 					await operation({
 						operation: 'upsert',
@@ -1135,10 +1148,16 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 			visibility: 'shared',
 		});
 
-		const explicitWatch = await call('bob', 'POST', 'watch', { ids: [watchedMem.id], ttlSeconds: 300 });
+		const explicitWatch = await call('bob', 'POST', 'watch', { ids: [watchedMem.id], ttlSeconds: 7200 });
 		strictEqual(explicitWatch.status, 200, JSON.stringify(explicitWatch.body));
 		deepStrictEqual(explicitWatch.body.watched, [watchedMem.id]);
-		ok(!Number.isNaN(Date.parse(explicitWatch.body.expiresAt)));
+		const initialExpiry = Date.parse(explicitWatch.body.expiresAt);
+		ok(!Number.isNaN(initialExpiry));
+
+		// A shorter TTL request must not shorten the existing 7200 s watch.
+		const shorterWatch = await call('bob', 'POST', 'watch', { ids: [watchedMem.id], ttlSeconds: 60 });
+		strictEqual(shorterWatch.status, 200);
+		strictEqual(Date.parse(shorterWatch.body.expiresAt), initialExpiry);
 
 		const searchRes = await call('bob', 'GET', '?q=frigatebird&watch=true');
 		strictEqual(searchRes.status, 200);
@@ -1220,6 +1239,14 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 			await bobEvents.waitFor((e) => e.id === bootWatched.id && e.kind === 'revised');
 			ok(!bobEvents.events.some((e) => e.id === unwatchedMem.id));
 
+			// Withdraw watchedMem -> bob receives 'withdrawn' for the watched shared memory
+			strictEqual((await call('alice', 'DELETE', watchedMem.id, undefined, { 'If-Match': '"2"' })).status, 200);
+			deepStrictEqual(await bobEvents.waitFor((e) => e.id === watchedMem.id && e.kind === 'withdrawn'), {
+				id: watchedMem.id,
+				kind: 'withdrawn',
+				revision: 3,
+			});
+
 			// Withdraw unwatchedMem -> flags bobCiter (owned by bob), so bob receives flagged on /MemoryEvents
 			strictEqual((await call('alice', 'DELETE', unwatchedMem.id, undefined, { 'If-Match': '"2"' })).status, 200);
 			deepStrictEqual(await bobEvents.waitFor((e) => e.id === bobCiter.id && e.kind === 'flagged'), {
@@ -1296,8 +1323,8 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 		strictEqual(toolsRes.status, 200, JSON.stringify(toolsRes.body));
 		const allToolNames: string[] = toolsRes.body.result.tools.map((t: any) => t.name).sort();
 		ok(
-			!allToolNames.some((n) => n.endsWith('_Memory') || n.endsWith('_MemoryEvents')),
-			`no generic table/resource tools should be auto-generated for Memory or MemoryEvents: ${JSON.stringify(allToolNames)}`,
+			!allToolNames.some((n) => n.endsWith('_Memory') || n.endsWith('_MemoryEvents') || n.endsWith('_MemoryMcp')),
+			`no generic table/resource tools should be auto-generated for Memory, MemoryEvents, or MemoryMcp: ${JSON.stringify(allToolNames)}`,
 		);
 		const toolNames = allToolNames.filter((n) => n !== 'get_MismatchProbe');
 		deepStrictEqual(
@@ -1452,9 +1479,23 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 	});
 
 	test('verifies @harperfast/oauth MCP composition against Harper core /mcp (HarperFast/oauth#279)', async () => {
-		// 1. `withMCPAuth` sets `request._oauthAuth = { user: 'alice', ... }` and leaves `request.user` undefined.
+		// Positive control: prove the `server.http` hook runs on `/mcp` and succeeds when it populates a
+		// Harper user object (`{ username: 'alice' }`) on `request.user`.
+		const hydratedHeaders = { 'x-simulate-oauth-mcp': 'oauth-hydrated-user' };
+		const session0 = await initMcpSession(null, hydratedHeaders);
+		const call0 = await mcpCall(
+			null,
+			'tools/call',
+			{ name: 'recall', arguments: { q: 'osprey' } },
+			session0,
+			hydratedHeaders,
+		);
+		strictEqual(call0.body.result.isError, undefined, JSON.stringify(call0.body));
+		ok(Array.isArray(JSON.parse(call0.body.result.content[0].text).memories));
+
+		// 1. `withMCPAuth` sets `request._oauthAuth = { valid: true, userId: 'alice', ... }` and leaves `request.user` undefined.
 		// Harper core's /mcp adapter reads `request.user`, so `context.user` is undefined and tool calls fail auth.
-		const withMcpAuthHeaders = { 'x-simulate-oauth-mcp': 'withMCPAuth' };
+		const withMcpAuthHeaders = { 'x-simulate-oauth-mcp': 'with-mcp-auth' };
 		const session1 = await initMcpSession(null, withMcpAuthHeaders);
 		const call1 = await mcpCall(
 			null,
@@ -1469,7 +1510,7 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 		// 2. `@harperfast/oauth`'s global HTTP hook sets `request.user = payload.username` (a bare string).
 		// Harper core's /mcp passes `userObject: 'alice'` into `context.user`, which fails `resolvePrincipal`
 		// because `resolveHarperUser` requires a user object with `typeof user.username === 'string'`.
-		const oauthHookHeaders = { 'x-simulate-oauth-mcp': 'oauth-hook' };
+		const oauthHookHeaders = { 'x-simulate-oauth-mcp': 'oauth-resource-string-user' };
 		const session2 = await initMcpSession(null, oauthHookHeaders);
 		const noteId = memId('oauth-hook-note');
 		const call2 = await mcpCall(

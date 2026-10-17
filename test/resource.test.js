@@ -7,6 +7,7 @@ import {
 	MemoryBootstrapResource,
 	MemoryImportResource,
 	MemoryItemResource,
+	MemoryMcpResource,
 	MemoryResource,
 } from '../dist/resource.js';
 import { applySettings, parseSettings } from '../dist/settings.js';
@@ -25,7 +26,7 @@ beforeEach(() => {
 });
 
 describe('MEMORY_RESOURCES static surface', () => {
-	it('declares static path, static hidden = true (unless mcp is enabled on MemoryResource), and static REST verbs without loadAsInstance or instance verbs', () => {
+	it('declares static path, static hidden = true on all HTTP resources, and isolates MCP declarations on verb-less MemoryMcpResource', () => {
 		assert.deepEqual(
 			MEMORY_RESOURCES.map((ResourceClass) => ResourceClass.path),
 			[
@@ -47,21 +48,19 @@ describe('MEMORY_RESOURCES static surface', () => {
 			assert.equal(Object.hasOwn(ResourceClass.prototype, 'delete'), false);
 			assert.equal(Object.hasOwn(ResourceClass.prototype, 'segments'), false);
 		}
-		assert.deepEqual(MemoryResource.mcpTools, []);
-		assert.deepEqual(MemoryResource.mcpResources, []);
-
-		applySettings(parseSettings({ mcp: true }));
-		assert.equal(MemoryResource.hidden, false);
+		assert.equal(MemoryMcpResource.path, '/MemoryMcp');
+		assert.equal(MemoryMcpResource.hidden, false);
 		assert.deepEqual(
-			MemoryResource.mcpTools.map((t) => t.name),
+			MemoryMcpResource.mcpTools.map((t) => t.name),
 			['remember', 'revise', 'recall', 'get', 'withdraw', 'pin', 'unpin', 'confirm', 'watch'],
 		);
 		assert.deepEqual(
-			MemoryResource.mcpResources.map((r) => [r.name, r.uriTemplate, r.method, r.read]),
-			[['memory', 'memory:///{id}', 'mcpReadMemory', 'mcpReadMemory']],
+			MemoryMcpResource.mcpResources.map((r) => [r.name, r.uriTemplate, r.method, 'read' in r]),
+			[['memory', 'memory:///{id}', 'mcpReadMemory', false]],
 		);
-		for (const ResourceClass of MEMORY_RESOURCES.filter((R) => R !== MemoryResource)) {
-			assert.equal(ResourceClass.hidden, true);
+		for (const verb of ['get', 'post', 'put', 'delete', 'patch', 'subscribe', 'connect']) {
+			assert.equal(Object.hasOwn(MemoryMcpResource, verb), false);
+			assert.equal(Object.hasOwn(MemoryMcpResource.prototype, verb), false);
 		}
 	});
 

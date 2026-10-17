@@ -68,20 +68,13 @@ The principal is the Harper user on the request context (`context.user.username`
 authentication of its own and has no credential tables.
 
 - Interactive MCP clients (Claude Code, desktop, claude.ai connectors): intended to authenticate with
-  OAuth 2.1 through `@harperfast/oauth` `mcp` mode (`withMCPAuth`), but verification showed that
-  `@harperfast/oauth` and Harper core's native `/mcp` endpoint do not yet compose out of the box:
-  1. `withMCPAuth` (`mcp: true` mode) is a per-resource wrapper that stores validated token metadata on
-     `request._oauthAuth` and passes `(request, user)` to its wrapped resource while leaving `request.user`
-     `undefined`, whereas Harper core's `/mcp` adapter (`harperHttp.ts`) reads `request.user` and therefore
-     passes `context.user === undefined`.
-  2. `@harperfast/oauth`'s global `server.http` session-cookie hook sets `request.user = payload.username`
-     (a bare string rather than a `{ username, role }` Harper user object); Harper's `security/auth.ts`
-     treats truthy `request.user` as already authenticated without hydrating the user record, so `/mcp`
-     receives `context.user` as a bare string lacking `.username` and `.role`.
-     In both cases `resolvePrincipal` rejects with `401 Authenticated principal required` (`principal_required`).
-     The gap is filed at [HarperFast/oauth#279](https://github.com/HarperFast/oauth/issues/279); until that
-     lands, MCP clients against `/mcp` must authenticate with Harper credentials or a host-app middleware /
-     principal resolver.
+  OAuth 2.1 through `@harperfast/oauth` `mcp` mode (`withMCPAuth`), which does not yet populate a Harper
+  user object on `context.user` for Harper core's `/mcp` endpoint (Harper core mounts `/mcp` on a
+  `urlPath: "/mcp"` sub-route chain that bypasses unmounted `server.http` hooks, `withMCPAuth` leaves
+  `request.user` `undefined`, and the session-cookie hook sets `request.user` to a bare username string
+  rather than `{ username, role }`, so `resolvePrincipal` rejects with `401 principal_required`; see
+  [HarperFast/oauth#279](https://github.com/HarperFast/oauth/issues/279)). Until that lands, MCP clients
+  against `/mcp` authenticate with Harper credentials or a host-app middleware / principal resolver.
 - Headless agents use Harper credentials bound to a user (operation tokens, or a host-app API key that
   resolves to a user).
 - An app with its own principal registry (harper-eye's `AgentPrincipal`) can install a resolver with
@@ -287,8 +280,8 @@ one of its supports changing.
 ## HTTP surface
 
 Mounted at `urlPath` (default `Memory`, with the per-caller watch stream at `<urlPath>Events`, default
-`MemoryEvents`); sub-resources stay `hidden = true`, while `MemoryResource` sets `hidden = false` only
-when the plugin option `mcp` is `true` (default `false`).
+`MemoryEvents`); every HTTP route class stays `hidden = true`, while `MemoryMcpResource` is mounted with
+`hidden = false` only when the plugin option `mcp` is `true` (default `false`).
 
 | Route                                                                          | Purpose                                                                                                  |
 | ------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------- |
@@ -300,7 +293,7 @@ when the plugin option `mcp` is `true` (default `false`).
 | `POST /Memory/<id>/pin` · `/unpin`                                             | per-reader pin / unpin (empty or `{}` body)                                                              |
 | `POST /Memory/<id>/confirm`                                                    | owner's review: clears `needsReview`, records `confirmed` (returns `{ memory }`)                         |
 | `POST /Memory/watch`                                                           | watch readable memories (`{ ids, ttlSeconds? }` → `{ watched, expiresAt }`)                              |
-| `GET /Memory` · `/Memory/<id>` (SSE / WebSocket / MQTT)                        | Level 1 record-change subscription (`{ id, kind, revision }`)                                            |
+| `GET /Memory` · `/Memory/<id>` (SSE / WebSocket)                               | Level 1 record-change subscription (`{ id, kind, revision }`)                                            |
 | `GET /MemoryEvents` (SSE / WebSocket)                                          | Level 2 per-caller watch and `needsReview` event stream (`{ id, kind, revision }`)                       |
 | `POST /Memory/import`                                                          | bulk import (`super_user`)                                                                               |
 
@@ -323,7 +316,7 @@ lease, since a batch writes up to 100 rows and flags their citers inside one tra
   readable set; it never widens it. Results include `supersededBy` when `includeSuperseded` is set,
   and `needsReview` under the Provenance visibility rule; withdrawn memories never appear. The vector lane has no distance cutoff, so it contributes the
   nearest readable memories whatever their distance. Passing `watch=true` records a `MemoryWatch` (with
-  the default 24 h TTL) for every memory id returned in the result.
+  the default 1 h TTL) for every memory id returned in the result.
 - **Searchable at commit**: both indexes are Harper derived indexes maintained after commit (`audit:
 true` puts `@embed`'s HNSW index on the native plane). Each lane passes `waitForIndexMilliseconds`,
   so a search covers every write committed before it began; an index that is already current does not
@@ -356,22 +349,24 @@ true` puts `@embed`'s HNSW index on the native plane). Each lane passes `waitFor
 Three levels, built in order:
 
 1. **Record changes**: `Memory` (`/Memory` and `/Memory/<id>`) supports Harper real-time subscriptions
-   over WebSocket, SSE (`Accept: text/event-stream`), and MQTT (`<urlPath>/<id>`). Every event is checked
-   against the subscriber's read rule (`canRead`) at delivery time: the subscriber's principal and
-   `ScopeGrant` rows are re-resolved on every event, so a scope narrowing, grant revocation, or withdrawal
-   revokes visibility mid-subscription (withdrawn tombstones stay readable to their owner and `super_user`,
-   so they receive `withdrawn`; for non-owners, withdrawing a superseder delivers `restored` on the
-   restored memory and `flagged` on any citing memory). Events carry `{ id, kind, revision }` — never
-   content — with `kind` one of `created`, `revised`, `superseded`, `withdrawn`, `restored`, or `flagged`
-   (`needsReview` set), so a reader re-reads through the guarded `GET`.
+   over WebSocket and SSE (`Accept: text/event-stream`). Every event is checked against the subscriber's
+   read rule (`canRead`) at delivery time: `ScopeGrant` rows (and any custom principal resolver) are
+   re-evaluated on every event, so a scope narrowing or grant revocation revokes visibility
+   mid-subscription. For `withdrawn`, read access checks the memory's scope labels ignoring
+   `status = withdrawn` (matching Provenance), so label readers and watchers learn that a shared memory
+   they could read was withdrawn (`GET /Memory/<id>` still returns 404 to non-owners). Events carry
+   `{ id, kind, revision }` — never content — with `kind` one of `created`, `revised`, `superseded`,
+   `withdrawn`, `restored`, or `flagged` (`needsReview` set), so a reader re-reads through the guarded
+   `GET`. Subscriptions are live-only (`omitCurrent: true`) with at-most-once delivery and no replay
+   across disconnects; reconnecting clients re-read or re-bootstrap (`watch=true`) to catch up.
 2. **Watches**: `POST /Memory/watch { ids, ttlSeconds? }` (1–100 ids; `ttlSeconds` integer in
    `1..86400`, default 3600) and `watch=true` on search and bootstrap record `MemoryWatch` rows
-   (`<principalId>:<memoryId>`, `expiresAt @expiresAt`). `POST /Memory/watch` requires read access on
-   every requested id and rejects unreadable ids with the same 404 (`memory_not_found`) as missing ones
-   before writing any watch. A per-caller event stream at `/MemoryEvents` (`<urlPath>Events` when
-   `urlPath` is customized; identity comes from `context`, with no principal in the path —
-   `/MemoryEvents/<principal>` returns 404) delivers `{ id, kind, revision }` over SSE, WebSocket, or MQTT
-   whenever:
+   (`<principalId>:<memoryId>`, `expiresAt @expiresAt`), keeping whichever `expiresAt` is later when a
+   watch already exists. `POST /Memory/watch` requires read access on every requested id and rejects
+   unreadable ids with the same 404 (`memory_not_found`) as missing ones before writing any watch. A
+   per-caller event stream at `/MemoryEvents` (`<urlPath>Events` when `urlPath` is customized; identity
+   comes from `context`, with no principal in the path — `/MemoryEvents/<principal>` returns 404) delivers
+   `{ id, kind, revision }` over SSE or WebSocket whenever:
    - a memory with an unexpired `MemoryWatch` for the caller changes and passes the caller's delivery-time
      read check, or
    - one of the caller's own memories (`ownerId === principal.id`) is flagged `needsReview`
@@ -390,10 +385,10 @@ Three levels, built in order:
 
 ## MCP surface
 
-Behind the plugin option `mcp` (`boolean`, default `false`), `MemoryResource` sets `static hidden = false`
-and exposes MCP tools and a resource template on Harper's native `/mcp` endpoint (`src/mcp.ts`), each
-delegating to the same lifecycle, search, and watch functions and enforcing the same permission checks as
-REST:
+Behind the plugin option `mcp` (`boolean`, default `false`), `handleApplication` mounts `MemoryMcpResource`
+(`static hidden = false`, with no HTTP verb methods) to expose MCP tools and a resource template on
+Harper's native `/mcp` endpoint (`src/mcp.ts`), each delegating to the same lifecycle, search, and watch
+functions and enforcing the same permission checks as REST:
 
 - **`static mcpTools`**:
   - `remember` — create a memory (`PUT`; generates a UUID when `id` is omitted, or idempotently retries an
@@ -410,10 +405,10 @@ REST:
 - **`static mcpResources`**: `uriTemplate: 'memory:///{id}'` (`mimeType: 'application/json'`,
   `method: 'mcpReadMemory'`), whose read calls `getMemory` and returns the guarded memory view (or
   `undefined` when missing/unreadable, which Harper's MCP layer surfaces as a JSON-RPC read error).
-- Tool and resource handlers are bound on `MemoryResource.prototype` under `mcp*` method names
+- Tool and resource handlers are bound on `MemoryMcpResource.prototype` under `mcp*` method names
   (`mcpRemember`, `mcpRevise`, `mcpRecall`, `mcpGet`, `mcpWithdraw`, `mcpPin`, `mcpUnpin`, `mcpConfirm`,
-  `mcpWatch`, `mcpReadMemory`) rather than HTTP verb names, so Harper's MCP discovery does not
-  auto-generate generic REST verb tools (`get_Memory`, `put_Memory`, etc.) or unguarded `harper+rest://`
+  `mcpWatch`, `mcpReadMemory`), while every HTTP route class stays `hidden = true`, so neither Harper's
+  MCP discovery nor OpenAPI export auto-generates generic REST verb tools or unguarded `harper+rest://`
   templates alongside the explicit surface.
 
 ## Extension points

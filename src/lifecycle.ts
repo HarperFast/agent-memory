@@ -1,6 +1,6 @@
 import { databases, models, transaction } from 'harper';
 import { badRequest, isCallerSafe, memoryError, notFound, type MemoryError } from './errors.ts';
-import { activeDependentIds, CLEARED_REVIEW, flagDependents, forReader } from './provenance.ts';
+import { activeDependentIds, CLEARED_REVIEW, flagDependents, forReader, reviewFlagFor } from './provenance.ts';
 import { assertWritable, canRead, isSuperset, normalizeScopes, type Principal } from './scopes.ts';
 import { DEFAULT_EMBEDDING_MODEL, getSettings } from './settings.ts';
 import { hasSinks, notifySinks } from './sinks.ts';
@@ -888,7 +888,7 @@ export function compareNewest(a: { id: string; createdAt: unknown }, b: { id: st
  * returns to active otherwise. Runs before W is patched, with the targets already locked by the caller; every
  * create that supersedes them takes the same locks. Returns the ids it changed.
  */
-async function reconcileSuperseded(Memory: any, withdrawn: any, context: object): Promise<string[]> {
+async function reconcileSuperseded(Memory: any, withdrawn: any, context: object, now: Date): Promise<string[]> {
 	const changed: string[] = [];
 	for (const targetId of withdrawn.supersedes ?? []) {
 		const target = await Memory.get(targetId, context);
@@ -898,7 +898,18 @@ async function reconcileSuperseded(Memory: any, withdrawn: any, context: object)
 			? { status: STATUS_SUPERSEDED, supersededBy: newest.id, lastEventKind: 'superseded' }
 			: { status: STATUS_ACTIVE, supersededBy: null, lastEventKind: 'restored' };
 		if (next.status === target.status && next.supersededBy === target.supersededBy) continue;
-		await Memory.patch(targetId, { ...next, revision: target.revision + 1 }, context);
+		// A memory restored to active that also cited the withdrawn memory gets its review flag in the same patch
+		// so its single transition event remains `restored`.
+		const flagPatch =
+			next.status === STATUS_ACTIVE
+				? reviewFlagFor(
+						{ ...target, status: STATUS_ACTIVE },
+						{ id: withdrawn.id, replacementId: withdrawn.supersededBy ?? undefined },
+						'withdrawn',
+						now,
+					)
+				: undefined;
+		await Memory.patch(targetId, { ...next, ...flagPatch, revision: target.revision + 1 }, context);
 		changed.push(targetId);
 	}
 	return changed;
@@ -953,7 +964,7 @@ export async function withdrawMemory(
 			locks.require([...(existing.supersedes ?? []), ...citers]);
 
 			const now = new Date();
-			const restored = await reconcileSuperseded(Memory, existing, txn);
+			const restored = await reconcileSuperseded(Memory, existing, txn, now);
 			// Withdrawal is exempt from assertWritable — locking an owner out of retracting would be worse.
 			// patch, not put: a put would echo @updatedTime back as a caller-supplied value.
 			await Memory.patch(
@@ -967,12 +978,12 @@ export async function withdrawMemory(
 				},
 				txn,
 			);
-			// A memory this withdrawal restored can cite it too; the index does not show the restore yet.
+			const restoredSet = new Set(restored);
 			const flagged = await flagDependents(
 				Memory,
 				{ id: existing.id, replacementId: existing.supersededBy ?? undefined },
 				'withdrawn',
-				[...citers, ...restored],
+				citers.filter((citerId) => !restoredSet.has(citerId)),
 				txn,
 				now,
 			);
