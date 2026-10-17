@@ -1,0 +1,13 @@
+# In the plugin's database: a sink's writes are atomic with the memory only there.
+type SinkLog @table(database: "memory") {
+	id: ID @primaryKey
+	kind: String
+	memoryId: String
+	status: String
+	revision: Int
+}
+
+type Memory @table {
+	id: ID @primaryKey
+	note: String
+}

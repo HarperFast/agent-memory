@@ -2,21 +2,30 @@
 	"name": "@harperfast/agent-memory",
 	"version": "0.0.0",
 	"private": true,
-	"description": "Shared, permissioned, live memory for agents and people — a Harper plugin",
+	"description": "Shared, permissioned, live memory for agents and people \u2014 a Harper plugin",
 	"type": "module",
 	"main": "dist/index.js",
 	"exports": {
 		".": "./dist/index.js",
 		"./config": "./config.yaml"
 	},
-	"files": ["dist/", "schema/", "config.yaml", "README.md", "DESIGN.md"],
+	"files": [
+		"dist/",
+		"schema/",
+		"config.yaml",
+		"README.md",
+		"DESIGN.md"
+	],
 	"scripts": {
 		"build": "tsc",
-		"test": "npm run build && node --test \"test/**/*.test.js\"",
+		"test": "npm run build && node --import ./test/helpers/harper-mock.mjs --test \"test/**/*.test.js\"",
+		"install:fixtures": "node scripts/install-fixtures.js",
+		"test:integration": "harper-integration-test-run \"integrationTests/**/*.test.ts\"",
 		"format:check": "prettier --check .",
 		"format:write": "prettier --write ."
 	},
 	"devDependencies": {
+		"@harperfast/integration-testing": "1.0.5",
 		"@types/node": "^22.0.0",
 		"harper": "^5.3.1",
 		"prettier": "^3.6.2",

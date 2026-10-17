@@ -5,7 +5,5 @@ pluginModule: 'dist/index.js'
 graphqlSchema:
   files: 'schema/*.graphql'
 
-embeddingModel: 'embedder'
-supersession:
-  mode: 'suggest' # suggest | auto
-  similarity: 0.82
+urlPath: 'Memory'
+embeddingModel: 'default'

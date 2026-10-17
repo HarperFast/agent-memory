@@ -1,3 +1,5 @@
 node_modules/
 dist/
 .env*
+integrationTests/fixtures/*/node_modules/
+integrationTests/fixtures/*/package-lock.json
