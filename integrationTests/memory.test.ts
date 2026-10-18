@@ -1,7 +1,10 @@
 // Needs `npm run install:fixtures` first: the fixture app loads the packed plugin from its own node_modules.
 import { suite, test, before, after } from 'node:test';
 import { deepStrictEqual, ok, strictEqual } from 'node:assert/strict';
-import { join, dirname } from 'node:path';
+import { spawn } from 'node:child_process';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, dirname, resolve } from 'node:path';
 import { createRequire } from 'node:module';
 import { createHash } from 'node:crypto';
 import { setupHarperWithFixture, teardownHarper, type ContextWithHarper } from '@harperfast/integration-testing';
@@ -1520,7 +1523,258 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 			session2,
 			oauthHookHeaders,
 		);
+		strictEqual(call2.status, 200);
 		strictEqual(call2.body.result.isError, true);
 		ok(String(call2.body.result.content[0].text).includes('Authenticated principal required'));
+	});
+
+	function execNodeScript(scriptPath: string, args: string[], stdinText: string, env: Record<string, string>) {
+		return new Promise<{ code: number | null; stdout: string; stderr: string }>((resolvePromise, rejectPromise) => {
+			const child = spawn(process.execPath, [scriptPath, ...args], {
+				env: { ...process.env, ...env },
+				stdio: ['pipe', 'pipe', 'pipe'],
+			});
+			let stdout = '';
+			let stderr = '';
+			child.stdout.on('data', (chunk) => {
+				stdout += chunk.toString('utf8');
+			});
+			child.stderr.on('data', (chunk) => {
+				stderr += chunk.toString('utf8');
+			});
+			child.on('error', rejectPromise);
+			child.on('close', (code) => {
+				resolvePromise({ code, stdout, stderr });
+			});
+			if (stdinText) {
+				child.stdin.write(stdinText);
+			}
+			child.stdin.end();
+		});
+	}
+
+	test('claude-plugin hooks, /MemoryEvents follower, import-claude-memory.mjs, and eval-recall.mjs end-to-end', async () => {
+		const repoRoot = resolve(import.meta.dirname, '..');
+		const hookScript = join(repoRoot, 'claude-plugin', 'hooks', 'hook.mjs');
+		const headersScript = join(repoRoot, 'claude-plugin', 'bin', 'headers.mjs');
+		const importScript = join(repoRoot, 'scripts', 'import-claude-memory.mjs');
+		const evalScript = join(repoRoot, 'scripts', 'eval-recall.mjs');
+
+		const tmpDir = mkdtempSync(join(tmpdir(), 'agent-memory-claude-e2e-'));
+		const cacheDir = join(tmpDir, 'cache');
+		const sessionId = 'e2e-claude-session-1';
+		const bobEnv: Record<string, string> = {
+			AGENT_MEMORY_URL: ctx.harper.httpURL,
+			AGENT_MEMORY_TOKEN: basic('bob', PASSWORD),
+			AGENT_MEMORY_USER: 'bob',
+			AGENT_MEMORY_CACHE_DIR: cacheDir,
+			AGENT_MEMORY_HEARTBEAT_MS: '100',
+		};
+
+		try {
+			// 1. Verify bin/headers.mjs produces working MCP Authorization headers
+			const headersRes = await execNodeScript(headersScript, [], '', bobEnv);
+			strictEqual(headersRes.code, 0, headersRes.stderr);
+			const mcpHeaders = JSON.parse(headersRes.stdout);
+			strictEqual(mcpHeaders.Authorization, basic('bob', PASSWORD));
+
+			// 2. Seed a pinned memory for bob, a shared memory from alice, and a bob memory citing alice's memory
+			const bobPinned = await create('bob', 'e2e-bob-pinned', {
+				title: 'Pinned curlew invariant',
+				content: 'curlew telemetry must include ring number',
+			});
+			strictEqual((await call('bob', 'POST', `${bobPinned.id}/pin`, {})).status, 200);
+
+			const aliceShared = await create('alice', 'e2e-alice-shared', {
+				title: 'turnstone tide table',
+				content: 'turnstone foraging peaks two hours before low tide',
+				visibility: 'shared',
+			});
+			const bobCiter = await create('bob', 'e2e-bob-citer', {
+				title: 'turnstone camera setup',
+				content: 'deploy camera two hours before low tide per turnstone table',
+				visibility: 'shared',
+				evidence: [{ kind: 'memory', ref: aliceShared.id }],
+			});
+			await settleIndex('bob', 'turnstone');
+
+			// 3. SessionStart(startup) injects bootstrap memories, caches them, and starts the /MemoryEvents follower
+			const bootHook = await execNodeScript(
+				hookScript,
+				[],
+				JSON.stringify({ hook_event_name: 'SessionStart', session_id: sessionId, source: 'startup' }),
+				bobEnv,
+			);
+			strictEqual(bootHook.code, 0, bootHook.stderr);
+			const bootOut = JSON.parse(bootHook.stdout);
+			const bootContext: string = bootOut.hookSpecificOutput.additionalContext;
+			ok(bootContext.includes(bobPinned.id), `expected pinned memory in bootstrap context: ${bootContext}`);
+			ok(bootContext.includes('author="bob"'));
+			ok(bootContext.includes('scopes="user:bob"'));
+			ok(bootContext.includes('needsReview="false"'));
+
+			// Wait briefly for the detached follower to connect to /MemoryEvents
+			const endpointHash = createHash('sha256')
+				.update(`${ctx.harper.httpURL}\0${basic('bob', PASSWORD)}`)
+				.digest('hex')
+				.slice(0, 16);
+			const lockFile = join(cacheDir, endpointHash, 'sessions', `${sessionId}.follower.lock`);
+			const lockDeadline = Date.now() + 3000;
+			while (Date.now() < lockDeadline) {
+				if (existsSync(lockFile)) {
+					try {
+						const lockData = JSON.parse(await import('node:fs').then((fs) => fs.readFileSync(lockFile, 'utf8')));
+						if (lockData.connected) break;
+					} catch {
+						// retry
+					}
+				}
+				await new Promise((r) => setTimeout(r, 40));
+			}
+
+			// 4. UserPromptSubmit recalls turnstone memory, skips already-injected bobPinned/bobCiter, and watches aliceShared
+			const recallHook1 = await execNodeScript(
+				hookScript,
+				[],
+				JSON.stringify({
+					hook_event_name: 'UserPromptSubmit',
+					session_id: sessionId,
+					prompt: 'turnstone foraging low tide',
+				}),
+				bobEnv,
+			);
+			strictEqual(recallHook1.code, 0, recallHook1.stderr);
+			const recallOut1 = JSON.parse(recallHook1.stdout);
+			const recallContext1: string = recallOut1.hookSpecificOutput?.additionalContext ?? '';
+			// aliceShared should either have been in bootstrap or recalled now; after this prompt it is definitely injected & watched
+			if (!bootContext.includes(aliceShared.id)) {
+				ok(recallContext1.includes(aliceShared.id), `expected ${aliceShared.id} in recall output`);
+			}
+
+			// Re-running the same prompt immediately should skip already-injected memories
+			const recallHookDup = await execNodeScript(
+				hookScript,
+				[],
+				JSON.stringify({
+					hook_event_name: 'UserPromptSubmit',
+					session_id: sessionId,
+					prompt: 'turnstone foraging low tide',
+				}),
+				bobEnv,
+			);
+			strictEqual(recallHookDup.code, 0);
+			strictEqual(recallHookDup.stdout.trim(), '{}', 'already-injected memories must not be re-injected');
+
+			// 5. Alice withdraws aliceShared -> triggers withdrawn on watched aliceShared AND flags bobCiter (bob's own memory)
+			strictEqual((await call('alice', 'DELETE', aliceShared.id, undefined, { 'If-Match': '"1"' })).status, 200);
+
+			// Wait for follower to append events to events.jsonl
+			const eventsFile = join(cacheDir, endpointHash, 'sessions', `${sessionId}.events.jsonl`);
+			const eventDeadline = Date.now() + 3000;
+			while (Date.now() < eventDeadline) {
+				if (existsSync(eventsFile)) {
+					const content = await import('node:fs').then((fs) => fs.readFileSync(eventsFile, 'utf8'));
+					if (content.includes(aliceShared.id) && content.includes(bobCiter.id)) break;
+				}
+				await new Promise((r) => setTimeout(r, 40));
+			}
+
+			// Next UserPromptSubmit surfaces the live change notices for both withdrawn aliceShared and flagged bobCiter
+			const noticeHook = await execNodeScript(
+				hookScript,
+				[],
+				JSON.stringify({
+					hook_event_name: 'UserPromptSubmit',
+					session_id: sessionId,
+					prompt: 'unrelated query xyz123',
+				}),
+				bobEnv,
+			);
+			strictEqual(noticeHook.code, 0, noticeHook.stderr);
+			const noticeContext: string = JSON.parse(noticeHook.stdout).hookSpecificOutput?.additionalContext ?? '';
+			ok(
+				noticeContext.includes(`id="${aliceShared.id}" change="withdrawn"`),
+				`expected withdrawn notice for ${aliceShared.id}: ${noticeContext}`,
+			);
+			ok(
+				noticeContext.includes(`id="${bobCiter.id}" change="flagged"`),
+				`expected flagged notice for ${bobCiter.id}: ${noticeContext}`,
+			);
+
+			// 6. Import a directory of Claude auto-memory files via scripts/import-claude-memory.mjs
+			const memDir = join(tmpDir, 'claude-memory');
+			await import('node:fs').then((fs) => fs.mkdirSync(memDir, { recursive: true }));
+			writeFileSync(join(memDir, 'MEMORY.md'), '# Index\n- [Redshank](redshank.md)\n- [Greenshank](greenshank.md)\n');
+			writeFileSync(
+				join(memDir, 'redshank.md'),
+				[
+					'---',
+					'name: Redshank protocol',
+					'description: Redshank banding rule referencing [[Greenshank reference]]',
+					'type: feedback',
+					'---',
+					'Always band redshanks on the right tibia.',
+					'',
+					'**Why:** Left tibia bands interfere with salt-gland sensor tags.',
+					'**How to apply:** Check sensor placement before banding.',
+				].join('\n'),
+			);
+			writeFileSync(
+				join(memDir, 'greenshank.md'),
+				[
+					'---',
+					'name: Greenshank reference',
+					'description: Greenshank estuary coordinates',
+					'type: reference',
+					'---',
+					'Greenshank roost is at sector 7G.',
+				].join('\n'),
+			);
+
+			const importRes = await execNodeScript(importScript, ['--json', memDir], '', bobEnv);
+			strictEqual(importRes.code, 0, importRes.stderr);
+			const imported = JSON.parse(importRes.stdout);
+			strictEqual(imported.count, 2, 'MEMORY.md index must be skipped');
+
+			const redshankRec = imported.records.find((r: any) => r.name === 'Redshank protocol');
+			const greenshankRec = imported.records.find((r: any) => r.name === 'Greenshank reference');
+			ok(redshankRec && greenshankRec);
+
+			const storedRedshank = (await call('bob', 'GET', redshankRec.id)).body.memory;
+			strictEqual(storedRedshank.ownerId, 'bob');
+			deepStrictEqual(storedRedshank.scopes, ['user:bob']);
+			deepStrictEqual(storedRedshank.tags, ['type:feedback']);
+			ok(storedRedshank.content.includes('**Why:** Left tibia bands interfere'));
+			ok(storedRedshank.content.includes('**How to apply:** Check sensor placement'));
+			deepStrictEqual(storedRedshank.evidenceMemoryIds, [greenshankRec.id]);
+
+			await settleIndex('bob', 'redshank');
+
+			// 7. Run scripts/eval-recall.mjs against the imported memories
+			const datasetFile = join(tmpDir, 'eval.jsonl');
+			writeFileSync(
+				datasetFile,
+				[
+					JSON.stringify({ prompt: 'redshank banding right tibia sensor', expectedIds: [redshankRec.id] }),
+					JSON.stringify({ prompt: 'greenshank estuary roost sector 7G', expectedIds: [greenshankRec.id] }),
+				].join('\n'),
+			);
+			const evalRes = await execNodeScript(evalScript, ['--dataset', datasetFile, '--k', '5', '--json'], '', bobEnv);
+			strictEqual(evalRes.code, 0, evalRes.stderr);
+			const evalSummary = JSON.parse(evalRes.stdout);
+			strictEqual(evalSummary.count, 2);
+			strictEqual(evalSummary.recallAtK, 1);
+			strictEqual(evalSummary.timeouts, 0);
+			ok(typeof evalSummary.latencyMs.p50 === 'number');
+		} finally {
+			await execNodeScript(
+				hookScript,
+				[],
+				JSON.stringify({ hook_event_name: 'SessionEnd', session_id: sessionId }),
+				bobEnv,
+			).catch(() => {});
+			await new Promise((r) => setTimeout(r, 150));
+			rmSync(tmpDir, { recursive: true, force: true });
+		}
 	});
 });

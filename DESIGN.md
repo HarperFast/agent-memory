@@ -474,6 +474,86 @@ conflict }] }`; an invalid row fails the batch with 400 and its `index`.
 The first source is the team's Flair instance: agent id → Harper username via a mapping file; Flair
 `private` → `user:<owner>`, shared → `global`; `supersedes` and `validTo` carried over.
 
+## Claude Code plugin
+
+`claude-plugin/` (published at the repository root via `.claude-plugin/marketplace.json`) integrates
+`agent-memory` into Claude Code without adding harness-specific routes to the Harper server:
+
+- **Remote HTTP MCP (`claude-plugin/.mcp.json`, `claude-plugin/bin/headers.mjs`)**: `.mcp.json` declares
+  Harper's native Streamable HTTP endpoint directly (`"type": "http"`, `"url": "${AGENT_MEMORY_URL}/mcp"`,
+  `"headersHelper": "node \"${CLAUDE_PLUGIN_ROOT}/bin/headers.mjs\""`) rather than wrapping REST calls in a
+  local `stdio` proxy.
+  - _Trade-off_: pointing directly at `/mcp` keeps a single tool schema source of truth on the server
+    (`remember`, `revise`, `recall`, `get`, `withdraw`, `pin`, `unpin`, `confirm`, `watch`) and authenticates
+    each request with the caller's Harper-user-bound credential (`Bearer` or `Basic`) read by `headersHelper`
+    from `process.env` or `~/.config/agent-memory/env`, so `AGENT_MEMORY_TOKEN` is never exported to
+    `CLAUDE_ENV_FILE` where model `Bash` commands could read it. In exchange, the host Harper app must enable
+    `mcp: true`, and `AGENT_MEMORY_URL` must be present in the process environment (or Claude Code's
+    `settings.json` `env` block) at startup because Claude Code expands `${AGENT_MEMORY_URL}` in `.mcp.json`
+    before `SessionStart` hooks run. When `AGENT_MEMORY_URL` is found only in `~/.config/agent-memory/env`,
+    `SessionStart` injects a configuration notice reminding the user to export it in their shell or settings.
+- **Bootstrap hook (`SessionStart`: `startup`, `resume`, `compact`)**: calls
+  `GET /Memory/bootstrap?budget=<chars>&watch=true` (default budget `4000` characters via
+  `AGENT_MEMORY_BOOTSTRAP_BUDGET`, timeout `3000` ms via `AGENT_MEMORY_BOOTSTRAP_TIMEOUT_MS`), formats
+  returned memories within the character budget (counting wrapper overhead and skipping oversized records to
+  continue checking smaller ones), records `injectedIds`, `watchedIds`, and per-id `{ revision, status,
+needsReview, author, scopes }` in atomic per-session state (`state.json` written via temp-file + `rename`),
+  and updates the local read-through cache (`bootstrap-cache.json`). `startup` and `compact` reset
+  `injectedIds` so bootstrap context is re-established; `resume` preserves `injectedIds`.
+- **Recall hook (`UserPromptSubmit`)**: truncates the submitted prompt to `QUERY_MAX_CHARS` (`1000`
+  characters) and calls `GET /Memory/?q=<prompt>&limit=<k>&watch=true` (`k` defaults to `5` via
+  `AGENT_MEMORY_RECALL_LIMIT`) under a single shared `AbortSignal` deadline (default `1500` ms via
+  `AGENT_MEMORY_RECALL_TIMEOUT_MS`, backed by a `3` s command timeout in `hooks.json`). Memory ids already in
+  `state.injectedIds` are skipped, and newly injected memories are formatted within
+  `AGENT_MEMORY_RECALL_BUDGET` (default `2000` characters). On timeout, network error, or server error, or
+  when `state.json` is corrupt, the hook injects nothing and always exits `0` (`hook.mjs` installs top-level
+  `uncaughtException`, `unhandledRejection`, and `EPIPE` guards and calls `process.exit(0)` immediately after
+  flushing stdout). Setting `AGENT_MEMORY_RECALL=off` disables per-prompt recall when users do not want
+  prompts sent in query strings or to the server's embedding provider.
+- **Live changes (`/MemoryEvents` follower + in-band revision diffing)**:
+  - `SessionStart` unlinks any prior `.stop` sentinel, garbage-collects session files older than
+    `AGENT_MEMORY_FOLLOWER_TTL_MS` (default `4` hours), and spawns a detached per-session follower
+    (`claude-plugin/lib/follower.mjs`, `stdio: 'ignore'`, `unref()`). The follower acquires
+    `<session>.follower.lock` with `O_EXCL` (taking over locks whose heartbeat `mtime` is older than
+    `3 * AGENT_MEMORY_HEARTBEAT_MS`), connects to `GET /MemoryEvents` (`Accept: text/event-stream`) with
+    jittered reconnect, appends incoming `{ id, kind, revision, ts }` frames to `<session>.events.jsonl`
+    (`O_APPEND`), and periodically renews `POST /Memory/watch` in batches of `<= 100` before the 3600 s
+    watch TTL expires. `SessionEnd` writes `<session>.stop` so the follower exits cleanly without
+    `kill(pid)` PID-reuse hazards.
+  - On `UserPromptSubmit`, the hook drains `<session>.events.jsonl` from `state.eventsOffset` and also
+    compares `revision`, `status`, and `needsReview` on memories returned by recall against
+    `state.revisions`. When an injected memory (`injectedIds`) is `superseded`, `revised`, `withdrawn`, or
+    `flagged` (`needsReview`), or when one of the caller's own memories is `flagged` (which `/MemoryEvents`
+    delivers to the owner), the hook emits an attributed `[memory-change-<nonce> ...]` notice built directly
+    from `state.revisions` and the event payload, requiring zero extra per-notice `GET /Memory/<id>` calls.
+- **Untrusted-data injection format (`claude-plugin/lib/format.mjs`)**: every injected memory and change
+  notice carries `id`, `author` (`author.principalId`, plus `lastEditor` when different), `scopes`,
+  `revision`, and `needsReview` (`"true"` or `"false"`) inside a per-call random nonced wrapper
+  (`<agent-memory-data-<nonce> role="stored-data" notice="...">...</agent-memory-data-<nonce>>` and
+  `[memory-<nonce> ...]...[/memory-<nonce>]`). Attribute values escape quotes, brackets, angle brackets, and
+  newlines, and any occurrence of the nonce or tag names in memory bodies is scrubbed so stored content
+  cannot break out of the data block or masquerade as instructions.
+- **Read-through offline cache (`bootstrap-cache.json`)**: stores the last successful bootstrap response and
+  pinned memories (`section === 'pinned'`) under `AGENT_MEMORY_CACHE_DIR` (`0700` dir, `0600` file, bounded by
+  `AGENT_MEMORY_CACHE_MAX_AGE_MS`, default `24` hours). Used only when `/Memory/bootstrap` fails due to
+  network unreachability, timeout, or `5xx`, prepending a `[STALE CACHE ...]` notice. A `401` or `403`
+  response immediately purges `bootstrap-cache.json` and emits an authentication-failure notice so revoked
+  credentials or scopes do not serve stale cached data.
+- **Routing skill & CLI utilities**:
+  - `claude-plugin/skills/memory-routing/SKILL.md`: routes team-relevant findings, decisions, and shared
+    lessons to `agent-memory` while keeping machine-specific paths, worktree state, and personal workflow
+    preferences in Claude's native file memory (`~/.claude/projects/.../memory/`), enforcing a strict
+    single-home rule.
+  - `scripts/import-claude-memory.mjs`: migrates selected native Claude memory Markdown files into
+    `agent-memory` with `--dry-run`, deriving per-principal deterministic ids (`cm_<sha256(scope:name)[:32]>`,
+    matching `^[A-Za-z0-9_-]{16,64}$`), mapping frontmatter `type` to `type:<type>` tags, preserving
+    `Why`/`How to apply` lines in `content`, defaulting scope to `user:<self>`, and converting `[[name]]`
+    wikilinks to `{ kind: 'memory', ref }` evidence via a two-pass `PUT /Memory/<id>` write (`If-Match` on
+    pass 2 when forward/cyclic links exist).
+  - `scripts/eval-recall.mjs`: evaluates a JSONL dataset of `{ prompt, expectedIds }` against the recall
+    hook's query (`GET /Memory/?q=<prompt>&limit=<k>&watch=true`), reporting `recall@k`, hit rate, timeout
+    rate, and latency percentiles (`min`, `p50`, `p95`, `max`, `mean` ms).
+
 ## Not in v0
 
 Standing queries (level 3), summary-tree consolidation of long memories, Reflex lane registration

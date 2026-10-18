@@ -118,6 +118,64 @@ registerMemorySink({
 setPrincipalResolver(async (context, next) => (await lookUpAgentKey(context)) ?? next());
 ```
 
+## Claude Code plugin
+
+The repository ships a Claude Code plugin in [`claude-plugin/`](claude-plugin/) (registered in
+[`.claude-plugin/marketplace.json`](.claude-plugin/marketplace.json)) that wires `agent-memory`'s remote
+HTTP `/mcp` endpoint, automatic `SessionStart` bootstrap, budgeted `UserPromptSubmit` recall, and live
+`/MemoryEvents` change notices into Claude Code.
+
+### Install & configure
+
+1. Enable `mcp: true` under `@harperfast/agent-memory` in your Harper app's `config.yaml`.
+2. Add the marketplace and install the plugin in Claude Code:
+
+   ```text
+   /plugin marketplace add HarperFast/agent-memory
+   /plugin install agent-memory --marketplace HarperFast/agent-memory
+   ```
+
+3. Set `AGENT_MEMORY_URL` in your shell or Claude Code `settings.json` `env` block (so `.mcp.json` can
+   expand `${AGENT_MEMORY_URL}/mcp`) and store `AGENT_MEMORY_TOKEN` in `~/.config/agent-memory/env`
+   (`chmod 600 ~/.config/agent-memory/env`):
+
+   ```sh
+   export AGENT_MEMORY_URL="https://memory.example.com:9926"
+   mkdir -p ~/.config/agent-memory
+   cat <<'EOF' > ~/.config/agent-memory/env
+   AGENT_MEMORY_URL="https://memory.example.com:9926"
+   AGENT_MEMORY_TOKEN="your-harper-token-or-Basic-credential"
+   EOF
+   chmod 600 ~/.config/agent-memory/env
+   ```
+
+   Optional settings: `AGENT_MEMORY_BOOTSTRAP_BUDGET` (default `4000`), `AGENT_MEMORY_RECALL_BUDGET`
+   (default `2000`), `AGENT_MEMORY_RECALL_TIMEOUT_MS` (default `1500`), `AGENT_MEMORY_RECALL_LIMIT`
+   (default `5`), `AGENT_MEMORY_RECALL=off` (disable per-prompt query recall), and
+   `AGENT_MEMORY_DISABLE_FOLLOWER=1` (disable the background `/MemoryEvents` follower).
+
+### Memory routing
+
+The bundled `memory-routing` skill enforces a single-home rule:
+
+- **Route to `agent-memory` (MCP tools)**: team-relevant findings, architectural decisions, domain
+  invariants, and cross-session lessons (`remember`, `revise`, `recall`, `get`, `withdraw`, `pin`,
+  `unpin`, `confirm`, `watch`).
+- **Keep in Claude's native file memory (`~/.claude/projects/.../memory/`)**: machine-specific paths,
+  local worktree/harness state, and personal workflow preferences.
+- **Never duplicate**: never write the same fact to both stores.
+
+### Migration & recall evaluation scripts
+
+```sh
+# Preview or migrate native Claude memory files into agent-memory (default scope: user:<self>)
+node scripts/import-claude-memory.mjs --dry-run ~/.claude/projects/<project>/memory/
+node scripts/import-claude-memory.mjs --delete-migrated ~/.claude/projects/<project>/memory/feedback_testing.md
+
+# Evaluate recall@k and latency for the recall hook's query against a JSONL dataset of { prompt, expectedIds }
+node scripts/eval-recall.mjs --dataset eval.jsonl --k 5
+```
+
 ## Development
 
 ```sh
