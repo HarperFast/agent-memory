@@ -501,31 +501,44 @@ needsReview, author, scopes }` in atomic per-session state (`state.json` written
   and updates the local read-through cache (`bootstrap-cache.json`). `startup` and `compact` reset
   `injectedIds` so bootstrap context is re-established; `resume` preserves `injectedIds`.
 - **Recall hook (`UserPromptSubmit`)**: truncates the submitted prompt to `QUERY_MAX_CHARS` (`1000`
-  characters) and calls `GET /Memory/?q=<prompt>&limit=<k>&watch=true` (`k` defaults to `5` via
-  `AGENT_MEMORY_RECALL_LIMIT`) under a single shared `AbortSignal` deadline (default `1500` ms via
-  `AGENT_MEMORY_RECALL_TIMEOUT_MS`, backed by a `3` s command timeout in `hooks.json`). Memory ids already in
-  `state.injectedIds` are skipped, and newly injected memories are formatted within
-  `AGENT_MEMORY_RECALL_BUDGET` (default `2000` characters). On timeout, network error, or server error, or
-  when `state.json` is corrupt, the hook injects nothing and always exits `0` (`hook.mjs` installs top-level
-  `uncaughtException`, `unhandledRejection`, and `EPIPE` guards and calls `process.exit(0)` immediately after
-  flushing stdout). Setting `AGENT_MEMORY_RECALL=off` disables per-prompt recall when users do not want
-  prompts sent in query strings or to the server's embedding provider.
+  characters) and calls `GET /Memory/?q=<prompt>&limit=<k>&includeSuperseded=true&watch=true` (`k` defaults to
+  `5` via `AGENT_MEMORY_RECALL_LIMIT`) under a single shared `AbortSignal` deadline (default `1500` ms via
+  `AGENT_MEMORY_RECALL_TIMEOUT_MS`, clamped to `<= 2000` ms and backed by a `3` s command timeout in
+  `hooks.json`). `includeSuperseded=true` lets in-band diffing observe `superseded` transitions on previously
+  injected memories while only active (`status === 'active'`) memories not yet in `state.injectedIds` are
+  injected as recalled records within `AGENT_MEMORY_RECALL_BUDGET` (default `2000` characters). On timeout,
+  network error, or server error, or when `state.json` is corrupt, the hook skips recall and always exits `0`
+  (`hook.mjs` installs top-level `uncaughtException`, `unhandledRejection`, and `EPIPE` guards and calls
+  `process.exit(0)` after flushing stdout). Setting `AGENT_MEMORY_RECALL=off` skips the per-prompt network
+  search when users do not want prompts sent in query strings or to the server's embedding provider, while
+  still draining `<session>.events.jsonl` to surface pending live change notices.
 - **Live changes (`/MemoryEvents` follower + in-band revision diffing)**:
-  - `SessionStart` unlinks any prior `.stop` sentinel, garbage-collects session files older than
+  - _Trade-off vs. `GET /Memory/changes?since=<ts>`_: combining a per-session `/MemoryEvents` SSE follower
+    with in-band revision diffing (`includeSuperseded=true`) consumes PR #9's existing server surface with
+    zero new server routes or timestamp change-log indexes, delivering `withdrawn`, `superseded`, `revised`,
+    and `flagged` events in real time without adding a second per-prompt HTTP round-trip on the
+    `UserPromptSubmit` latency path.
+  - `SessionStart` unlinks any prior `.stop` sentinel, garbage-collects inactive sessions as a unit only when
+    all of their session files (`state.json`, `events.jsonl`, `follower.lock`, `.stop`) are older than
     `AGENT_MEMORY_FOLLOWER_TTL_MS` (default `4` hours), and spawns a detached per-session follower
     (`claude-plugin/lib/follower.mjs`, `stdio: 'ignore'`, `unref()`). The follower acquires
     `<session>.follower.lock` with `O_EXCL` (taking over locks whose heartbeat `mtime` is older than
     `3 * AGENT_MEMORY_HEARTBEAT_MS`), connects to `GET /MemoryEvents` (`Accept: text/event-stream`) with
     jittered reconnect, appends incoming `{ id, kind, revision, ts }` frames to `<session>.events.jsonl`
-    (`O_APPEND`), and periodically renews `POST /Memory/watch` in batches of `<= 100` before the 3600 s
-    watch TTL expires. `SessionEnd` writes `<session>.stop` so the follower exits cleanly without
-    `kill(pid)` PID-reuse hazards.
-  - On `UserPromptSubmit`, the hook drains `<session>.events.jsonl` from `state.eventsOffset` and also
-    compares `revision`, `status`, and `needsReview` on memories returned by recall against
+    (`O_APPEND`), and periodically renews `POST /Memory/watch` for active watched IDs in batches of `<= 100`
+    before the 3600 s watch TTL expires (falling back to per-ID watch requests and pruning stale `404` IDs if
+    a batch contains a withdrawn or inaccessible memory). `SessionEnd` writes `<session>.stop` so the follower
+    aborts any active stream or backoff timer and exits cleanly after verifying lock ownership (`pid` and
+    `startedAt`).
+  - On `UserPromptSubmit`, the hook drains `<session>.events.jsonl` from `state.eventsOffset` using bounded
+    byte-offset reads (`openSync`/`readSync`, resetting to offset `0` if the file was truncated or recreated)
+    and compares `revision`, `status`, and `needsReview` on memories returned by recall against
     `state.revisions`. When an injected memory (`injectedIds`) is `superseded`, `revised`, `withdrawn`, or
     `flagged` (`needsReview`), or when one of the caller's own memories is `flagged` (which `/MemoryEvents`
     delivers to the owner), the hook emits an attributed `[memory-change-<nonce> ...]` notice built directly
     from `state.revisions` and the event payload, requiring zero extra per-notice `GET /Memory/<id>` calls.
+    Notices are marked notified in `state.notifiedRevisions` only after they fit within the turn's character
+    budget; any overflow notices are persisted in `state.pendingNotices` for subsequent turns.
 - **Untrusted-data injection format (`claude-plugin/lib/format.mjs`)**: every injected memory and change
   notice carries `id`, `author` (`author.principalId`, plus `lastEditor` when different), `scopes`,
   `revision`, and `needsReview` (`"true"` or `"false"`) inside a per-call random nonced wrapper
@@ -533,26 +546,28 @@ needsReview, author, scopes }` in atomic per-session state (`state.json` written
   `[memory-<nonce> ...]...[/memory-<nonce>]`). Attribute values escape quotes, brackets, angle brackets, and
   newlines, and any occurrence of the nonce or tag names in memory bodies is scrubbed so stored content
   cannot break out of the data block or masquerade as instructions.
-- **Read-through offline cache (`bootstrap-cache.json`)**: stores the last successful bootstrap response and
-  pinned memories (`section === 'pinned'`) under `AGENT_MEMORY_CACHE_DIR` (`0700` dir, `0600` file, bounded by
-  `AGENT_MEMORY_CACHE_MAX_AGE_MS`, default `24` hours). Used only when `/Memory/bootstrap` fails due to
-  network unreachability, timeout, or `5xx`, prepending a `[STALE CACHE ...]` notice. A `401` or `403`
-  response immediately purges `bootstrap-cache.json` and emits an authentication-failure notice so revoked
-  credentials or scopes do not serve stale cached data.
+- **Read-through offline cache (`bootstrap-cache.json`)**: stores the last successful `/Memory/bootstrap`
+  snapshot authoritatively under `AGENT_MEMORY_CACHE_DIR` (`0700` dir, `0600` file, bounded by
+  `AGENT_MEMORY_CACHE_MAX_AGE_MS`, default `24` hours), and evicts any memory IDs that later transition to
+  `withdrawn` or `superseded`. Used only when `/Memory/bootstrap` fails due to network unreachability,
+  timeout, or `5xx`, prepending a `[STALE CACHE ...]` notice. A `401` or `403` response immediately purges
+  `bootstrap-cache.json` and emits an authentication-failure notice so revoked credentials or scopes do not
+  serve stale cached data.
 - **Routing skill & CLI utilities**:
   - `claude-plugin/skills/memory-routing/SKILL.md`: routes team-relevant findings, decisions, and shared
     lessons to `agent-memory` while keeping machine-specific paths, worktree state, and personal workflow
     preferences in Claude's native file memory (`~/.claude/projects/.../memory/`), enforcing a strict
     single-home rule.
   - `scripts/import-claude-memory.mjs`: migrates selected native Claude memory Markdown files into
-    `agent-memory` with `--dry-run`, deriving per-principal deterministic ids (`cm_<sha256(scope:name)[:32]>`,
-    matching `^[A-Za-z0-9_-]{16,64}$`), mapping frontmatter `type` to `type:<type>` tags, preserving
+    `agent-memory` with `--dry-run`, skipping `user`-type personal profile files by default (`--include-user`
+    to opt in), deriving per-principal deterministic ids (`cm_<sha256(principalKey:name)[:32]>`, matching
+    `^[A-Za-z0-9_-]{16,64}$`), mapping frontmatter `type` to `type:<type>` tags, preserving
     `Why`/`How to apply` lines in `content`, defaulting scope to `user:<self>`, and converting `[[name]]`
     wikilinks to `{ kind: 'memory', ref }` evidence via a two-pass `PUT /Memory/<id>` write (`If-Match` on
     pass 2 when forward/cyclic links exist).
   - `scripts/eval-recall.mjs`: evaluates a JSONL dataset of `{ prompt, expectedIds }` against the recall
-    hook's query (`GET /Memory/?q=<prompt>&limit=<k>&watch=true`), reporting `recall@k`, hit rate, timeout
-    rate, and latency percentiles (`min`, `p50`, `p95`, `max`, `mean` ms).
+    search endpoint (`GET /Memory/?q=<prompt>&limit=<k>`, with `--watch` opt-in), reporting `recall@k`, hit
+    rate, timeout rate, and full-response latency percentiles (`min`, `p50`, `p95`, `max`, `mean` ms).
 
 ## Not in v0
 

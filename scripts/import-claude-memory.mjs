@@ -1,14 +1,19 @@
 #!/usr/bin/env node
 import { createHash } from 'node:crypto';
-import { readdirSync, readFileSync, renameSync, mkdirSync, statSync, unlinkSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync } from 'node:fs';
 import { basename, extname, join, resolve } from 'node:path';
-import { formatAuthorizationHeader, resolveConfig, validateBaseUrl } from '../claude-plugin/lib/config.mjs';
+import {
+	formatAuthorizationHeader,
+	isMainModule,
+	resolveConfig,
+	validateBaseUrl,
+} from '../claude-plugin/lib/config.mjs';
 
 const DEFAULT_SCOPE = 'user:<self>';
 const TITLE_MAX_CHARS = 200;
 const CONTENT_MAX_CHARS = 50_000;
 
-export function extractBasicUsername(authorization) {
+function extractBasicUsername(authorization) {
 	if (!authorization || !/^Basic\s+/i.test(authorization)) return undefined;
 	try {
 		const b64 = authorization.replace(/^Basic\s+/i, '').trim();
@@ -27,7 +32,7 @@ export function deriveMemoryId(name, principalNamespace = DEFAULT_SCOPE) {
 	return `cm_${digest}`;
 }
 
-export function sanitizeTag(rawType) {
+function sanitizeTag(rawType) {
 	const cleaned = String(rawType ?? '')
 		.trim()
 		.toLowerCase()
@@ -92,7 +97,7 @@ export function extractWikiLinks(text) {
 	return links;
 }
 
-export function collectMarkdownFiles(paths) {
+function collectMarkdownFiles(paths) {
 	const files = [];
 	const seen = new Set();
 	for (const rawPath of paths) {
@@ -127,7 +132,7 @@ export function collectMarkdownFiles(paths) {
 export function buildImportPlan(fileEntries, options = {}) {
 	const scope = options.scope || DEFAULT_SCOPE;
 	const principalKey = options.principalKey || scope;
-	const excludeTypes = new Set((options.excludeTypes ?? []).map((t) => String(t).trim().toLowerCase()));
+	const excludeTypes = new Set((options.excludeTypes ?? ['user']).map((t) => String(t).trim().toLowerCase()));
 
 	const parsedDocs = [];
 	for (const entry of fileEntries) {
@@ -255,22 +260,31 @@ async function putRecord(baseUrl, authorization, record, includeEvidence, fetchI
 		redirect: 'error',
 	});
 
-	if (response.status === 409 || response.status === 412) {
-		const getRes = await fetchImpl(url, {
-			method: 'GET',
-			headers: { Accept: 'application/json', Authorization: authorization },
-			redirect: 'error',
-		});
-		if (getRes.ok) {
-			const existing = await getRes.json();
-			const rev = existing?.memory?.revision ?? existing?.revision;
-			if (typeof rev === 'number') {
-				response = await fetchImpl(url, {
-					method: 'PUT',
-					headers: { ...headers, 'If-Match': `"${rev}"` },
-					body: JSON.stringify(payload),
-					redirect: 'error',
-				});
+	if (response.status === 409 || response.status === 412 || response.status === 428) {
+		let errBody;
+		try {
+			errBody = await response.clone().json();
+		} catch {
+			errBody = undefined;
+		}
+		const errCode = errBody?.code;
+		if (errCode !== 'id_unavailable' && errCode !== 'memory_withdrawn') {
+			const getRes = await fetchImpl(url, {
+				method: 'GET',
+				headers: { Accept: 'application/json', Authorization: authorization },
+				redirect: 'error',
+			});
+			if (getRes.ok) {
+				const existing = await getRes.json();
+				const rev = existing?.memory?.revision ?? existing?.revision;
+				if (typeof rev === 'number') {
+					response = await fetchImpl(url, {
+						method: 'PUT',
+						headers: { ...headers, 'If-Match': `"${rev}"` },
+						body: JSON.stringify(payload),
+						redirect: 'error',
+					});
+				}
 			}
 		}
 	}
@@ -317,7 +331,7 @@ async function reviseRecordEvidence(baseUrl, authorization, record, revision, fe
 	return body?.revision ?? body?.memory?.revision ?? revision + 1;
 }
 
-export function parseArgs(argv) {
+function parseArgs(argv) {
 	const options = {
 		paths: [],
 		dryRun: false,
@@ -327,7 +341,7 @@ export function parseArgs(argv) {
 		user: undefined,
 		deleteMigrated: false,
 		archiveDir: undefined,
-		excludeTypes: [],
+		excludeTypes: ['user'],
 		json: false,
 		help: false,
 	};
@@ -340,6 +354,8 @@ export function parseArgs(argv) {
 			options.json = true;
 		} else if (arg === '--delete-migrated') {
 			options.deleteMigrated = true;
+		} else if (arg === '--include-user') {
+			options.excludeTypes = options.excludeTypes.filter((t) => t !== 'user');
 		} else if (arg === '--help' || arg === '-h') {
 			options.help = true;
 		} else if (arg === '--dir' || arg === '-d') {
@@ -374,7 +390,7 @@ export async function runImport(argv = [], env = process.env, io = {}) {
 	const args = parseArgs(argv);
 	if (args.help) {
 		stdout(
-			'Usage: import-claude-memory.mjs [--dry-run] [--scope <scope>] [--url <url>] [--token <token>] [--delete-migrated | --archive-dir <dir>] <file-or-dir...>',
+			'Usage: import-claude-memory.mjs [--dry-run] [--scope <scope>] [--url <url>] [--token <token>] [--user <id>] [--include-user] [--delete-migrated | --archive-dir <dir>] <file-or-dir...>',
 		);
 		return { exitCode: 0, records: [] };
 	}
@@ -394,7 +410,13 @@ export async function runImport(argv = [], env = process.env, io = {}) {
 		(authorization ? createHash('sha256').update(authorization).digest('hex').slice(0, 12) : undefined);
 
 	const principalKey =
-		args.scope !== DEFAULT_SCOPE ? args.scope : inferredUser ? `user:${inferredUser}` : DEFAULT_SCOPE;
+		args.scope === DEFAULT_SCOPE
+			? inferredUser
+				? `user:${inferredUser}`
+				: DEFAULT_SCOPE
+			: inferredUser
+				? `user:${inferredUser}:${args.scope}`
+				: args.scope;
 
 	const files = collectMarkdownFiles(args.paths);
 	const fileEntries = files.map((filePath) => ({
@@ -451,7 +473,13 @@ export async function runImport(argv = [], env = process.env, io = {}) {
 		const archiveAbs = resolve(args.archiveDir);
 		mkdirSync(archiveAbs, { recursive: true });
 		for (const record of plan) {
-			renameSync(record.filePath, join(archiveAbs, basename(record.filePath)));
+			const base = basename(record.filePath);
+			let destPath = join(archiveAbs, base);
+			if (existsSync(destPath)) {
+				const shortHash = createHash('sha256').update(record.filePath).digest('hex').slice(0, 8);
+				destPath = join(archiveAbs, `${shortHash}-${base}`);
+			}
+			renameSync(record.filePath, destPath);
 		}
 	} else if (args.deleteMigrated) {
 		for (const record of plan) {
@@ -473,7 +501,7 @@ export async function runImport(argv = [], env = process.env, io = {}) {
 	return { exitCode: 0, records: plan };
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (isMainModule(import.meta.url)) {
 	runImport(process.argv.slice(2), process.env).then(
 		({ exitCode }) => process.exit(exitCode),
 		(error) => {

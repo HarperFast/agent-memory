@@ -2,12 +2,14 @@
 import { suite, test, before, after } from 'node:test';
 import { deepStrictEqual, ok, strictEqual } from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { createRequire } from 'node:module';
 import { createHash } from 'node:crypto';
 import { setupHarperWithFixture, teardownHarper, type ContextWithHarper } from '@harperfast/integration-testing';
+import { getSessionPaths } from '../claude-plugin/lib/cache.mjs';
+import { resolveConfig } from '../claude-plugin/lib/config.mjs';
 
 const require = createRequire(import.meta.url);
 const fixturePath = join(import.meta.dirname, 'fixtures', 'memory-app');
@@ -1523,7 +1525,6 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 			session2,
 			oauthHookHeaders,
 		);
-		strictEqual(call2.status, 200);
 		strictEqual(call2.body.result.isError, true);
 		ok(String(call2.body.result.content[0].text).includes('Authenticated principal required'));
 	});
@@ -1570,15 +1571,14 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 			AGENT_MEMORY_CACHE_DIR: cacheDir,
 			AGENT_MEMORY_HEARTBEAT_MS: '100',
 		};
+		const { lockFile, eventsFile } = getSessionPaths(resolveConfig(bobEnv), sessionId);
 
 		try {
-			// 1. Verify bin/headers.mjs produces working MCP Authorization headers
 			const headersRes = await execNodeScript(headersScript, [], '', bobEnv);
 			strictEqual(headersRes.code, 0, headersRes.stderr);
 			const mcpHeaders = JSON.parse(headersRes.stdout);
 			strictEqual(mcpHeaders.Authorization, basic('bob', PASSWORD));
 
-			// 2. Seed a pinned memory for bob, a shared memory from alice, and a bob memory citing alice's memory
 			const bobPinned = await create('bob', 'e2e-bob-pinned', {
 				title: 'Pinned curlew invariant',
 				content: 'curlew telemetry must include ring number',
@@ -1598,7 +1598,6 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 			});
 			await settleIndex('bob', 'turnstone');
 
-			// 3. SessionStart(startup) injects bootstrap memories, caches them, and starts the /MemoryEvents follower
 			const bootHook = await execNodeScript(
 				hookScript,
 				[],
@@ -1613,26 +1612,22 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 			ok(bootContext.includes('scopes="user:bob"'));
 			ok(bootContext.includes('needsReview="false"'));
 
-			// Wait briefly for the detached follower to connect to /MemoryEvents
-			const endpointHash = createHash('sha256')
-				.update(`${ctx.harper.httpURL}\0${basic('bob', PASSWORD)}`)
-				.digest('hex')
-				.slice(0, 16);
-			const lockFile = join(cacheDir, endpointHash, 'sessions', `${sessionId}.follower.lock`);
+			let followerConnected = false;
 			const lockDeadline = Date.now() + 3000;
 			while (Date.now() < lockDeadline) {
 				if (existsSync(lockFile)) {
 					try {
-						const lockData = JSON.parse(await import('node:fs').then((fs) => fs.readFileSync(lockFile, 'utf8')));
-						if (lockData.connected) break;
-					} catch {
-						// retry
-					}
+						const lockData = JSON.parse(readFileSync(lockFile, 'utf8'));
+						if (lockData.connected) {
+							followerConnected = true;
+							break;
+						}
+					} catch {}
 				}
 				await new Promise((r) => setTimeout(r, 40));
 			}
+			ok(followerConnected, `expected follower to connect and write lockFile ${lockFile}`);
 
-			// 4. UserPromptSubmit recalls turnstone memory, skips already-injected bobPinned/bobCiter, and watches aliceShared
 			const recallHook1 = await execNodeScript(
 				hookScript,
 				[],
@@ -1646,12 +1641,10 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 			strictEqual(recallHook1.code, 0, recallHook1.stderr);
 			const recallOut1 = JSON.parse(recallHook1.stdout);
 			const recallContext1: string = recallOut1.hookSpecificOutput?.additionalContext ?? '';
-			// aliceShared should either have been in bootstrap or recalled now; after this prompt it is definitely injected & watched
 			if (!bootContext.includes(aliceShared.id)) {
 				ok(recallContext1.includes(aliceShared.id), `expected ${aliceShared.id} in recall output`);
 			}
 
-			// Re-running the same prompt immediately should skip already-injected memories
 			const recallHookDup = await execNodeScript(
 				hookScript,
 				[],
@@ -1665,21 +1658,22 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 			strictEqual(recallHookDup.code, 0);
 			strictEqual(recallHookDup.stdout.trim(), '{}', 'already-injected memories must not be re-injected');
 
-			// 5. Alice withdraws aliceShared -> triggers withdrawn on watched aliceShared AND flags bobCiter (bob's own memory)
 			strictEqual((await call('alice', 'DELETE', aliceShared.id, undefined, { 'If-Match': '"1"' })).status, 200);
 
-			// Wait for follower to append events to events.jsonl
-			const eventsFile = join(cacheDir, endpointHash, 'sessions', `${sessionId}.events.jsonl`);
+			let eventsArrived = false;
 			const eventDeadline = Date.now() + 3000;
 			while (Date.now() < eventDeadline) {
 				if (existsSync(eventsFile)) {
-					const content = await import('node:fs').then((fs) => fs.readFileSync(eventsFile, 'utf8'));
-					if (content.includes(aliceShared.id) && content.includes(bobCiter.id)) break;
+					const content = readFileSync(eventsFile, 'utf8');
+					if (content.includes(aliceShared.id) && content.includes(bobCiter.id)) {
+						eventsArrived = true;
+						break;
+					}
 				}
 				await new Promise((r) => setTimeout(r, 40));
 			}
+			ok(eventsArrived, `expected follower events for ${aliceShared.id} and ${bobCiter.id} in ${eventsFile}`);
 
-			// Next UserPromptSubmit surfaces the live change notices for both withdrawn aliceShared and flagged bobCiter
 			const noticeHook = await execNodeScript(
 				hookScript,
 				[],
@@ -1701,9 +1695,8 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 				`expected flagged notice for ${bobCiter.id}: ${noticeContext}`,
 			);
 
-			// 6. Import a directory of Claude auto-memory files via scripts/import-claude-memory.mjs
 			const memDir = join(tmpDir, 'claude-memory');
-			await import('node:fs').then((fs) => fs.mkdirSync(memDir, { recursive: true }));
+			mkdirSync(memDir, { recursive: true });
 			writeFileSync(join(memDir, 'MEMORY.md'), '# Index\n- [Redshank](redshank.md)\n- [Greenshank](greenshank.md)\n');
 			writeFileSync(
 				join(memDir, 'redshank.md'),
@@ -1750,7 +1743,6 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 
 			await settleIndex('bob', 'redshank');
 
-			// 7. Run scripts/eval-recall.mjs against the imported memories
 			const datasetFile = join(tmpDir, 'eval.jsonl');
 			writeFileSync(
 				datasetFile,

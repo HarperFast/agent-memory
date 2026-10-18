@@ -1,6 +1,7 @@
 import {
 	clearStopFile,
 	drainFollowerEvents,
+	evictFromBootstrapCache,
 	gcStaleSessions,
 	loadBootstrapCache,
 	loadSessionState,
@@ -28,9 +29,20 @@ export function buildChangeNotices(state, drainedEvents, recalledMemories = []) 
 	const injectedSet = new Set(state.injectedIds);
 	const watchedSet = new Set(state.watchedIds);
 	const seenInBatch = new Set();
-	let dirty = false;
 
-	const emitNotice = ({ id, kind, revision, author, scopes, needsReview, supersededBy, ownFlagged, title }) => {
+	for (const pending of Array.isArray(state.pendingNotices) ? state.pendingNotices : []) {
+		if (!pending || typeof pending.id !== 'string' || typeof pending.kind !== 'string') continue;
+		const revNum = typeof pending.revision === 'number' ? pending.revision : 1;
+		const dedupKey = `${pending.id}:${pending.kind}:${revNum}`;
+		const lastNotified = state.notifiedRevisions[pending.id];
+		if (lastNotified && lastNotified.revision >= revNum && lastNotified.kind === pending.kind) {
+			continue;
+		}
+		seenInBatch.add(dedupKey);
+		notices.push(pending);
+	}
+
+	const queueNotice = ({ id, kind, revision, author, scopes, needsReview, supersededBy, ownFlagged, title }) => {
 		const revNum = typeof revision === 'number' ? revision : 1;
 		const dedupKey = `${id}:${kind}:${revNum}`;
 		if (seenInBatch.has(dedupKey)) return;
@@ -39,8 +51,6 @@ export function buildChangeNotices(state, drainedEvents, recalledMemories = []) 
 			return;
 		}
 		seenInBatch.add(dedupKey);
-		state.notifiedRevisions[id] = { revision: revNum, kind };
-		dirty = true;
 
 		const label = title ? `"${title}" (${id})` : id;
 		const targetPrefix = ownFlagged ? `Your memory ${label}` : `Watched memory ${label}`;
@@ -73,23 +83,25 @@ export function buildChangeNotices(state, drainedEvents, recalledMemories = []) 
 	for (const event of drainedEvents) {
 		if (!event || typeof event.id !== 'string' || !NOTICE_EVENT_KINDS.has(event.kind)) continue;
 		const prev = state.revisions[event.id];
-		const isInjectedOrWatched = injectedSet.has(event.id) || watchedSet.has(event.id);
+		const isInjected = injectedSet.has(event.id);
+		const isWatchedOnly = !isInjected && watchedSet.has(event.id);
 		const isOwnFlagged =
-			event.kind === 'flagged' && (!isInjectedOrWatched || (state.ownerId && prev?.author === state.ownerId));
-		if (!injectedSet.has(event.id) && event.kind !== 'flagged') {
+			event.kind === 'flagged' &&
+			((!isInjected && !isWatchedOnly) || Boolean(state.ownerId && prev?.author === state.ownerId));
+		if (!isInjected && !isOwnFlagged) {
 			continue;
 		}
 		const revNum = typeof event.revision === 'number' ? event.revision : (prev?.revision ?? 1);
-		const author = prev?.author ?? state.ownerId ?? 'self';
+		const author = prev?.author ?? (isOwnFlagged && state.ownerId ? state.ownerId : 'unknown');
 		const scopes =
 			Array.isArray(prev?.scopes) && prev.scopes.length > 0
 				? prev.scopes
-				: state.ownerId
+				: isOwnFlagged && state.ownerId
 					? [`user:${state.ownerId}`]
-					: ['user:self'];
+					: [];
 		const needsReview = event.kind === 'flagged' ? true : Boolean(prev?.needsReview);
 
-		emitNotice({
+		queueNotice({
 			id: event.id,
 			kind: event.kind,
 			revision: revNum,
@@ -99,17 +111,6 @@ export function buildChangeNotices(state, drainedEvents, recalledMemories = []) 
 			ownFlagged: isOwnFlagged,
 			title: prev?.title,
 		});
-
-		if (prev) {
-			prev.revision = Math.max(prev.revision ?? 1, revNum);
-			if (event.kind === 'withdrawn' || event.kind === 'superseded') {
-				prev.status = event.kind;
-			}
-			if (event.kind === 'flagged') {
-				prev.needsReview = true;
-			}
-			dirty = true;
-		}
 	}
 
 	for (const memory of recalledMemories) {
@@ -133,7 +134,7 @@ export function buildChangeNotices(state, drainedEvents, recalledMemories = []) 
 				kind = 'revised';
 			}
 			if (kind) {
-				emitNotice({
+				queueNotice({
 					id: memory.id,
 					kind,
 					revision: revNum,
@@ -144,13 +145,9 @@ export function buildChangeNotices(state, drainedEvents, recalledMemories = []) 
 					ownFlagged: kind === 'flagged' && isOwn,
 					title: memory.title ?? prev.title,
 				});
-				prev.revision = revNum;
-				prev.status = memory.status ?? prev.status;
-				prev.needsReview = flagged;
-				dirty = true;
 			}
 		} else if (isOwn && flagged) {
-			emitNotice({
+			queueNotice({
 				id: memory.id,
 				kind: 'flagged',
 				revision: revNum,
@@ -163,7 +160,49 @@ export function buildChangeNotices(state, drainedEvents, recalledMemories = []) 
 		}
 	}
 
-	return { notices, dirty };
+	return notices;
+}
+
+function commitChangeNotices(state, candidateNotices, includedNotices, config) {
+	let dirty = false;
+	const includedSet = new Set(includedNotices);
+	const evictedIds = [];
+
+	for (const notice of includedNotices) {
+		state.notifiedRevisions[notice.id] = { revision: notice.revision, kind: notice.kind };
+		dirty = true;
+		const prev = state.revisions[notice.id];
+		if (prev) {
+			prev.revision = Math.max(prev.revision ?? 1, notice.revision);
+			if (notice.kind === 'withdrawn' || notice.kind === 'superseded') {
+				prev.status = notice.kind;
+			}
+			if (notice.kind === 'flagged' || notice.needsReview) {
+				prev.needsReview = true;
+			}
+		}
+		if (notice.kind === 'withdrawn' || notice.kind === 'superseded') {
+			evictedIds.push(notice.id);
+		}
+	}
+
+	if (evictedIds.length > 0) {
+		const evictSet = new Set(evictedIds);
+		state.watchedIds = state.watchedIds.filter((id) => !evictSet.has(id));
+		if (config) {
+			evictFromBootstrapCache(config, evictedIds);
+		}
+		dirty = true;
+	}
+
+	const remainingPending = candidateNotices.filter((n) => !includedSet.has(n));
+	const prevPendingLen = Array.isArray(state.pendingNotices) ? state.pendingNotices.length : 0;
+	if (remainingPending.length !== prevPendingLen || remainingPending.length > 0) {
+		state.pendingNotices = remainingPending;
+		dirty = true;
+	}
+
+	return dirty;
 }
 
 export async function handleSessionStart(input = {}, options = {}) {
@@ -176,6 +215,7 @@ export async function handleSessionStart(input = {}, options = {}) {
 
 	const sessionId = String(input.session_id || 'default');
 	const fetchImpl = options.fetchImpl ?? globalThis.fetch;
+	const shouldSpawnFollower = options.spawnFollower ?? !options.fetchImpl;
 
 	gcStaleSessions(config);
 	clearStopFile(config, sessionId);
@@ -186,6 +226,7 @@ export async function handleSessionStart(input = {}, options = {}) {
 		state.watchedIds = [];
 		state.revisions = {};
 		state.notifiedRevisions = {};
+		state.pendingNotices = [];
 		state.corrupt = false;
 	} else if (source === 'compact') {
 		state.injectedIds = [];
@@ -252,7 +293,7 @@ export async function handleSessionStart(input = {}, options = {}) {
 			recordMemoriesInState(state, memories, formatted.includedMemories);
 			saveSessionState(config, sessionId, state);
 			saveBootstrapCache(config, memories);
-			if (options.spawnFollower !== false) {
+			if (shouldSpawnFollower) {
 				ensureFollowerRunning(config, sessionId, env);
 			}
 			if (!formatted.text) return {};
@@ -263,6 +304,14 @@ export async function handleSessionStart(input = {}, options = {}) {
 				},
 			};
 		}
+	}
+
+	if (response && response.status < 500) {
+		return {};
+	}
+
+	if (shouldSpawnFollower) {
+		ensureFollowerRunning(config, sessionId, env);
 	}
 
 	const cached = loadBootstrapCache(config);
@@ -290,7 +339,7 @@ export async function handleSessionStart(input = {}, options = {}) {
 export async function handleUserPromptSubmit(input = {}, options = {}) {
 	const env = options.env ?? process.env;
 	const config = options.config ?? resolveConfig(env);
-	if (!config.configured || !config.recallEnabled) return {};
+	if (!config.configured) return {};
 
 	const sessionId = String(input.session_id || 'default');
 	const rawPrompt = input.prompt ?? input.user_prompt ?? '';
@@ -301,12 +350,17 @@ export async function handleUserPromptSubmit(input = {}, options = {}) {
 		return {};
 	}
 
+	const shouldSpawnFollower = options.spawnFollower ?? !options.fetchImpl;
+	if (shouldSpawnFollower && state.watchedIds.length > 0) {
+		ensureFollowerRunning(config, sessionId, env);
+	}
+
 	const { events: drainedEvents, nextOffset } = drainFollowerEvents(config, sessionId, state.eventsOffset);
 	let recalledMemories = [];
 
-	if (query.length > 0) {
+	if (config.recallEnabled && query.length > 0) {
 		const fetchImpl = options.fetchImpl ?? globalThis.fetch;
-		const url = `${config.baseUrl}/Memory/?q=${encodeURIComponent(query)}&limit=${encodeURIComponent(config.recallLimit)}&watch=true`;
+		const url = `${config.baseUrl}/Memory/?q=${encodeURIComponent(query)}&limit=${encodeURIComponent(config.recallLimit)}&includeSuperseded=true&watch=true`;
 		try {
 			const response = await fetchImpl(url, {
 				method: 'GET',
@@ -321,15 +375,14 @@ export async function handleUserPromptSubmit(input = {}, options = {}) {
 				purgeBootstrapCache(config);
 				return {};
 			}
-			if (!response.ok) {
-				return {};
-			}
-			const body = await response.json();
-			if (Array.isArray(body?.memories)) {
-				recalledMemories = body.memories;
+			if (response.ok) {
+				const body = await response.json();
+				if (Array.isArray(body?.memories)) {
+					recalledMemories = body.memories;
+				}
 			}
 		} catch {
-			return {};
+			recalledMemories = [];
 		}
 	}
 
@@ -339,22 +392,26 @@ export async function handleUserPromptSubmit(input = {}, options = {}) {
 		dirty = true;
 	}
 
-	const { notices, dirty: noticesDirty } = buildChangeNotices(state, drainedEvents, recalledMemories);
-	if (noticesDirty) dirty = true;
+	const candidateNotices = buildChangeNotices(state, drainedEvents, recalledMemories);
 
 	const injectedSet = new Set(state.injectedIds);
-	const uninjectedMemories = recalledMemories.filter(
-		(memory) => memory && typeof memory.id === 'string' && !injectedSet.has(memory.id),
+	const activeRecalledMemories = recalledMemories.filter(
+		(memory) => memory && typeof memory.id === 'string' && (!memory.status || memory.status === 'active'),
 	);
+	const uninjectedMemories = activeRecalledMemories.filter((memory) => !injectedSet.has(memory.id));
 
 	const formatted = formatInjectionBlock({
 		memories: uninjectedMemories,
-		notices,
+		notices: candidateNotices,
 		budget: config.recallBudget,
 		nonce: options.nonce,
 	});
 
-	if (recordMemoriesInState(state, recalledMemories, formatted.includedMemories)) {
+	if (commitChangeNotices(state, candidateNotices, formatted.includedNotices, config)) {
+		dirty = true;
+	}
+
+	if (recordMemoriesInState(state, activeRecalledMemories, formatted.includedMemories)) {
 		dirty = true;
 	}
 

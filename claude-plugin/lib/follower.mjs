@@ -17,8 +17,9 @@ import {
 	getEndpointCacheDir,
 	getSessionPaths,
 	loadSessionState,
+	saveSessionState,
 } from './cache.mjs';
-import { resolveConfig } from './config.mjs';
+import { isMainModule, resolveConfig } from './config.mjs';
 
 const MAX_ERROR_LOG_BYTES = 64 * 1024;
 
@@ -51,10 +52,21 @@ export function tryAcquireFollowerLock(lockFile, heartbeatMs, now = Date.now()) 
 	}
 }
 
-export function markFollowerConnected(lockFile, startedAt) {
+function markFollowerConnected(lockFile, startedAt) {
 	try {
 		const payload = JSON.stringify({ pid: process.pid, startedAt, connected: true });
 		writeFileSync(lockFile, payload, { encoding: 'utf8', mode: 0o600 });
+	} catch {
+		return;
+	}
+}
+
+function releaseOwnedLock(lockFile, startedAt) {
+	try {
+		const parsed = JSON.parse(readFileSync(lockFile, 'utf8'));
+		if (parsed && parsed.pid === process.pid && parsed.startedAt === startedAt) {
+			unlinkSync(lockFile);
+		}
 	} catch {
 		return;
 	}
@@ -76,43 +88,91 @@ function logFollowerError(config, message) {
 		const dir = getEndpointCacheDir(config);
 		mkdirSync(dir, { recursive: true, mode: 0o700 });
 		const logPath = join(dir, 'follower-errors.log');
+		let existingSize = 0;
 		try {
-			const stat = statSync(logPath);
-			if (stat.size > MAX_ERROR_LOG_BYTES) return;
+			existingSize = statSync(logPath).size;
 		} catch {
-			// File does not exist yet.
+			existingSize = 0;
 		}
+		if (existingSize > MAX_ERROR_LOG_BYTES) return;
 		appendFileSync(logPath, `${new Date().toISOString()} ${message}\n`, { encoding: 'utf8', mode: 0o600 });
 	} catch {
 		return;
 	}
 }
 
-export async function renewSessionWatches(config, sessionId, fetchImpl = globalThis.fetch, signal) {
-	const state = loadSessionState(config, sessionId);
-	const ids = state.watchedIds;
-	if (!Array.isArray(ids) || ids.length === 0) return;
-	for (let i = 0; i < ids.length; i += 100) {
-		const batch = ids.slice(i, i + 100);
-		try {
-			await fetchImpl(`${config.baseUrl}/Memory/watch`, {
-				method: 'POST',
-				headers: {
-					'Content-Type': 'application/json',
-					Accept: 'application/json',
-					Authorization: config.authorization,
-				},
-				body: JSON.stringify({ ids: batch, ttlSeconds: 3600 }),
-				redirect: 'error',
-				signal,
-			});
-		} catch {
-			return;
-		}
-	}
+async function postWatchBatch(config, ids, fetchImpl, signal) {
+	return fetchImpl(`${config.baseUrl}/Memory/watch`, {
+		method: 'POST',
+		headers: {
+			'Content-Type': 'application/json',
+			Accept: 'application/json',
+			Authorization: config.authorization,
+		},
+		body: JSON.stringify({ ids, ttlSeconds: 3600 }),
+		redirect: 'error',
+		signal,
+	});
 }
 
-export async function consumeSseStream(body, onEvent) {
+export async function renewSessionWatches(config, sessionId, fetchImpl = globalThis.fetch, signal) {
+	const state = loadSessionState(config, sessionId);
+	const rawIds = Array.isArray(state.watchedIds) ? state.watchedIds : [];
+	if (rawIds.length === 0) return true;
+
+	const staleIds = new Set();
+	const activeIds = [];
+	for (const id of rawIds) {
+		const revStatus = state.revisions?.[id]?.status;
+		if (revStatus === 'withdrawn' || revStatus === 'superseded') {
+			staleIds.add(id);
+		} else {
+			activeIds.push(id);
+		}
+	}
+
+	let allSucceeded = true;
+	for (let i = 0; i < activeIds.length; i += 100) {
+		const batch = activeIds.slice(i, i + 100);
+		try {
+			const response = await postWatchBatch(config, batch, fetchImpl, signal);
+			if (response.ok) continue;
+			if (response.status === 404) {
+				if (batch.length === 1) {
+					staleIds.add(batch[0]);
+					continue;
+				}
+				for (const singleId of batch) {
+					const singleRes = await postWatchBatch(config, [singleId], fetchImpl, signal);
+					if (singleRes.status === 404) {
+						staleIds.add(singleId);
+					} else if (!singleRes.ok) {
+						allSucceeded = false;
+					}
+				}
+			} else {
+				allSucceeded = false;
+			}
+		} catch {
+			return false;
+		}
+	}
+
+	if (staleIds.size > 0) {
+		const latest = loadSessionState(config, sessionId);
+		if (!latest.corrupt && Array.isArray(latest.watchedIds)) {
+			const filtered = latest.watchedIds.filter((id) => !staleIds.has(id));
+			if (filtered.length !== latest.watchedIds.length) {
+				latest.watchedIds = filtered;
+				saveSessionState(config, sessionId, latest);
+			}
+		}
+	}
+
+	return allSucceeded;
+}
+
+export async function consumeSseStream(body, onEvent, onActivity) {
 	const decoder = new TextDecoder();
 	let buffer = '';
 	let dataLines = [];
@@ -126,15 +186,19 @@ export async function consumeSseStream(body, onEvent) {
 				try {
 					const parsed = JSON.parse(joined);
 					if (parsed && typeof parsed.id === 'string' && typeof parsed.kind === 'string') {
+						onActivity?.();
 						onEvent(parsed);
 					}
 				} catch {
-					// Ignore non-JSON SSE frames.
+					return;
 				}
 			}
 			return;
 		}
-		if (line.startsWith(':')) return;
+		if (line.startsWith(':')) {
+			onActivity?.();
+			return;
+		}
 		if (line.startsWith('data:')) {
 			dataLines.push(line.slice(5).trimStart());
 		}
@@ -156,6 +220,25 @@ export async function consumeSseStream(body, onEvent) {
 	}
 }
 
+function waitAbortableDelay(delayMs, signal) {
+	return new Promise((resolve) => {
+		if (signal.aborted) {
+			resolve();
+			return;
+		}
+		const onAbort = () => {
+			clearTimeout(backoff);
+			resolve();
+		};
+		const backoff = setTimeout(() => {
+			signal.removeEventListener('abort', onAbort);
+			resolve();
+		}, delayMs);
+		backoff.unref?.();
+		signal.addEventListener('abort', onAbort, { once: true });
+	});
+}
+
 export async function runFollowerLoop(config, sessionId, options = {}) {
 	const fetchImpl = options.fetchImpl ?? globalThis.fetch;
 	const { sessionsDir, eventsFile, lockFile, stopFile } = getSessionPaths(config, sessionId);
@@ -169,6 +252,7 @@ export async function runFollowerLoop(config, sessionId, options = {}) {
 	const controller = new AbortController();
 	let lastHeartbeat = startedAt;
 	let lastWatchRenew = startedAt;
+	let renewingWatches = false;
 	const checkIntervalMs = Math.max(50, Math.min(config.heartbeatMs / 2, 1000));
 
 	const shouldStop = () => existsSync(stopFile) || Date.now() - startedAt >= config.followerTtlMs;
@@ -181,17 +265,23 @@ export async function runFollowerLoop(config, sessionId, options = {}) {
 			return;
 		}
 		if (now - lastHeartbeat >= config.heartbeatMs) {
-			lastHeartbeat = now;
 			const nowSec = now / 1000;
 			try {
 				utimesSync(lockFile, nowSec, nowSec);
+				lastHeartbeat = now;
 			} catch {
-				// Ignore lock touch failure.
+				return;
 			}
 		}
-		if (now - lastWatchRenew >= config.watchRenewMs) {
-			lastWatchRenew = now;
-			void renewSessionWatches(config, sessionId, fetchImpl, controller.signal);
+		if (!renewingWatches && now - lastWatchRenew >= config.watchRenewMs) {
+			renewingWatches = true;
+			void renewSessionWatches(config, sessionId, fetchImpl, controller.signal)
+				.then((ok) => {
+					if (ok) lastWatchRenew = Date.now();
+				})
+				.finally(() => {
+					renewingWatches = false;
+				});
 		}
 	}, checkIntervalMs);
 	timer.unref?.();
@@ -199,6 +289,8 @@ export async function runFollowerLoop(config, sessionId, options = {}) {
 	let attempt = 0;
 	try {
 		while (!shouldStop() && !controller.signal.aborted) {
+			const streamStart = Date.now();
+			let sawActivity = false;
 			try {
 				const response = await fetchImpl(`${config.baseUrl}/MemoryEvents`, {
 					method: 'GET',
@@ -216,35 +308,42 @@ export async function runFollowerLoop(config, sessionId, options = {}) {
 				if (!response.ok || !response.body) {
 					throw new Error(`unexpected status ${response.status}`);
 				}
-				attempt = 0;
 				markFollowerConnected(lockFile, startedAt);
-				await consumeSseStream(response.body, (event) => {
-					appendFollowerEvent(eventsFile, {
-						id: event.id,
-						kind: event.kind,
-						revision: typeof event.revision === 'number' ? event.revision : 1,
-						ts: Date.now(),
-					});
-				});
+				await consumeSseStream(
+					response.body,
+					(event) => {
+						appendFollowerEvent(eventsFile, {
+							id: event.id,
+							kind: event.kind,
+							revision: typeof event.revision === 'number' ? event.revision : 1,
+							ts: Date.now(),
+						});
+					},
+					() => {
+						sawActivity = true;
+						attempt = 0;
+					},
+				);
+				if (controller.signal.aborted || shouldStop()) break;
+				if (!sawActivity && Date.now() - streamStart < 1000) {
+					attempt += 1;
+				} else {
+					attempt = 0;
+				}
+				const delayMs =
+					attempt > 0 ? Math.min(5000, 100 * 2 ** Math.min(attempt, 6)) + Math.floor(Math.random() * 100) : 200;
+				await waitAbortableDelay(delayMs, controller.signal);
 			} catch (error) {
 				if (controller.signal.aborted || shouldStop()) break;
 				attempt += 1;
 				logFollowerError(config, `stream error (attempt ${attempt}): ${error?.message ?? error}`);
 				const delayMs = Math.min(5000, 100 * 2 ** Math.min(attempt, 6)) + Math.floor(Math.random() * 100);
-				await new Promise((resolve) => {
-					const backoff = setTimeout(resolve, delayMs);
-					backoff.unref?.();
-					controller.signal.addEventListener('abort', () => clearTimeout(backoff), { once: true });
-				});
+				await waitAbortableDelay(delayMs, controller.signal);
 			}
 		}
 	} finally {
 		clearInterval(timer);
-		try {
-			unlinkSync(lockFile);
-		} catch {
-			// Ignore missing lock.
-		}
+		releaseOwnedLock(lockFile, startedAt);
 	}
 }
 
@@ -270,7 +369,7 @@ export function ensureFollowerRunning(config, sessionId, env = process.env) {
 	}
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (isMainModule(import.meta.url)) {
 	process.on('uncaughtException', () => process.exit(0));
 	process.on('unhandledRejection', () => process.exit(0));
 	const sessionId = process.argv[2] || 'default';

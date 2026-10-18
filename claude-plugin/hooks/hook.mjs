@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { isMainModule } from '../lib/config.mjs';
 import { handleHookEvent } from '../lib/hooks.mjs';
 
 const MAX_STDIN_BYTES = 256 * 1024;
@@ -12,7 +13,7 @@ function safeExitZero(payload = {}) {
 		process.stdout.write(JSON.stringify(payload) + '\n', () => {
 			process.exit(0);
 		});
-		setTimeout(() => process.exit(0), 25).unref();
+		setTimeout(() => process.exit(0), 500).unref();
 	} catch {
 		process.exit(0);
 	}
@@ -22,7 +23,7 @@ process.on('uncaughtException', () => safeExitZero({}));
 process.on('unhandledRejection', () => safeExitZero({}));
 process.stdout.on('error', () => process.exit(0));
 
-export function readBoundedStdin(stream = process.stdin, maxBytes = MAX_STDIN_BYTES, timeoutMs = STDIN_TIMEOUT_MS) {
+function readBoundedStdin(stream = process.stdin, maxBytes = MAX_STDIN_BYTES, timeoutMs = STDIN_TIMEOUT_MS) {
 	return new Promise((resolve) => {
 		if (stream.isTTY) {
 			resolve('');
@@ -78,6 +79,6 @@ async function main() {
 	}
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (isMainModule(import.meta.url)) {
 	void main();
 }

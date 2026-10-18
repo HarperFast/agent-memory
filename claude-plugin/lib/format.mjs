@@ -27,7 +27,7 @@ export function resolveAuthorPrincipal(memory) {
 	return 'unknown';
 }
 
-export function resolveLastEditorPrincipal(memory) {
+function resolveLastEditorPrincipal(memory) {
 	if (typeof memory?.lastEditor === 'string' && memory.lastEditor) return memory.lastEditor;
 	if (typeof memory?.lastEditor?.principalId === 'string' && memory.lastEditor.principalId) {
 		return memory.lastEditor.principalId;
@@ -64,7 +64,7 @@ export function formatMemoryRecord(memory, nonce, maxBodyChars) {
 	return `${header}\n${body}\n${footer}`;
 }
 
-export function formatChangeNotice(notice, nonce) {
+export function formatChangeNotice(notice, nonce, maxSummaryChars) {
 	const id = escapeAttr(notice.id ?? 'unknown');
 	const kind = escapeAttr(notice.kind ?? 'revised');
 	const author = escapeAttr(notice.author ?? 'unknown');
@@ -73,10 +73,15 @@ export function formatChangeNotice(notice, nonce) {
 	const needsReview = notice.needsReview || notice.kind === 'flagged' ? 'true' : 'false';
 	const supersededByAttr = notice.supersededBy ? ` supersededBy="${escapeAttr(notice.supersededBy)}"` : '';
 	const targetLabel = notice.ownFlagged ? 'Your memory' : 'Watched memory';
-	const summary = sanitizeBody(
+	let summary = sanitizeBody(
 		notice.summary ?? `${targetLabel} ${notice.id} was ${notice.kind} (revision ${notice.revision ?? 1}).`,
 		nonce,
 	).replace(/[\r\n]+/g, ' ');
+	if (typeof maxSummaryChars === 'number' && summary.length > maxSummaryChars) {
+		const suffix = '… [truncated]';
+		const sliceLen = Math.max(0, maxSummaryChars - suffix.length);
+		summary = summary.slice(0, sliceLen) + suffix;
+	}
 	return `[memory-change-${nonce} id="${id}" change="${kind}" author="${author}" scopes="${scopes}" revision="${revision}" needsReview="${needsReview}"${supersededByAttr}]\n${summary}\n[/memory-change-${nonce}]`;
 }
 
@@ -118,6 +123,20 @@ export function formatInjectionBlock({
 			lines.push(rendered);
 			used += cost;
 			includedNotices.push(notice);
+		}
+	}
+
+	if (includedNotices.length === 0 && notices.length > 0) {
+		const firstNotice = notices[0];
+		const emptyNotice = formatChangeNotice({ ...firstNotice, summary: '' }, nonce);
+		const remainingForSummary = budget - used - emptyNotice.length - 1;
+		if (remainingForSummary >= 24) {
+			const truncatedNotice = formatChangeNotice(firstNotice, nonce, remainingForSummary);
+			if (used + truncatedNotice.length + 1 <= budget) {
+				lines.push(truncatedNotice);
+				used += truncatedNotice.length + 1;
+				includedNotices.push(firstNotice);
+			}
 		}
 	}
 

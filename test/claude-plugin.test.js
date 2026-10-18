@@ -18,6 +18,7 @@ import { isMemoryId } from '../dist/lifecycle.js';
 import {
 	appendFollowerEvent,
 	drainFollowerEvents,
+	evictFromBootstrapCache,
 	gcStaleSessions,
 	getBootstrapCachePath,
 	getSessionPaths,
@@ -37,6 +38,7 @@ import {
 	consumeSseStream,
 	isFollowerConnected,
 	isFollowerLockActive,
+	renewSessionWatches,
 	runFollowerLoop,
 	tryAcquireFollowerLock,
 } from '../claude-plugin/lib/follower.mjs';
@@ -399,7 +401,7 @@ describe('SessionStart bootstrap hook and read-through cache', () => {
 		}
 	});
 
-	it('preserves previously cached pinned memories across bootstrap refreshes and GCs old sessions', () => {
+	it('replaces cached bootstrap snapshot authoritatively, evicts withdrawn IDs, and GCs whole sessions only when all files are stale', () => {
 		const tmp = makeTempDir();
 		try {
 			const config = resolveConfig({
@@ -409,23 +411,37 @@ describe('SessionStart bootstrap hook and read-through cache', () => {
 				AGENT_MEMORY_FOLLOWER_TTL_MS: '1000',
 			});
 			saveBootstrapCache(config, [
-				{ id: 'mem_pinned_keep_0001', title: 'Pinned', content: 'keep me', section: 'pinned', revision: 1 },
+				{ id: 'mem_pinned_old_00001', title: 'Old Pinned', content: 'old pin', section: 'pinned', revision: 1 },
 			]);
 			saveBootstrapCache(config, [
-				{ id: 'mem_recent_new_00002', title: 'Recent', content: 'new', section: 'recent', revision: 1 },
+				{ id: 'mem_pinned_new_00002', title: 'New Pinned', content: 'new pin', section: 'pinned', revision: 1 },
+				{ id: 'mem_recent_new_00003', title: 'Recent', content: 'new', section: 'recent', revision: 1 },
 			]);
 			const cached = loadBootstrapCache(config);
 			assert.deepEqual(
 				cached.memories.map((m) => m.id),
-				['mem_pinned_keep_0001', 'mem_recent_new_00002'],
+				['mem_pinned_new_00002', 'mem_recent_new_00003'],
+			);
+
+			evictFromBootstrapCache(config, ['mem_pinned_new_00002']);
+			assert.deepEqual(
+				loadBootstrapCache(config).memories.map((m) => m.id),
+				['mem_recent_new_00003'],
 			);
 
 			const oldPaths = getSessionPaths(config, 'old-session');
 			saveSessionState(config, 'old-session', loadSessionState(config, 'old-session'));
+			appendFollowerEvent(oldPaths.eventsFile, { id: 'mem_1', kind: 'revised', revision: 2, ts: Date.now() });
 			const pastSec = (Date.now() - 10_000) / 1000;
 			utimesSync(oldPaths.stateFile, pastSec, pastSec);
+
+			gcStaleSessions(config, Date.now());
+			assert.equal(existsSync(oldPaths.stateFile), true, 'fresh events.jsonl keeps the session state alive');
+
+			utimesSync(oldPaths.eventsFile, pastSec, pastSec);
 			gcStaleSessions(config, Date.now());
 			assert.equal(existsSync(oldPaths.stateFile), false);
+			assert.equal(existsSync(oldPaths.eventsFile), false);
 		} finally {
 			rmSync(tmp, { recursive: true, force: true });
 		}
@@ -833,6 +849,155 @@ describe('live change notices: follower SSE stream + in-band revision diffing', 
 		await consumeSseStream(chunks, (ev) => collected.push(ev));
 		assert.deepEqual(collected, [{ id: 'mem_sse_000000000001', kind: 'flagged', revision: 4 }]);
 	});
+
+	it('persists overflow change notices across turns when budget is exceeded and delivers them even with AGENT_MEMORY_RECALL=off', async () => {
+		const tmp = makeTempDir();
+		try {
+			const env = {
+				AGENT_MEMORY_URL: 'https://memory.example.com',
+				AGENT_MEMORY_TOKEN: 'tok',
+				AGENT_MEMORY_USER: 'alice',
+				AGENT_MEMORY_CACHE_DIR: tmp,
+				AGENT_MEMORY_RECALL_BUDGET: '520',
+				AGENT_MEMORY_FOLLOWER: 'off',
+			};
+			const config = resolveConfig(env);
+			const sessionId = 'sess-overflow';
+			const { eventsFile } = getSessionPaths(config, sessionId);
+
+			const state = loadSessionState(config, sessionId);
+			state.ownerId = 'alice';
+			state.injectedIds = ['mem_overflow_0000001', 'mem_overflow_0000002'];
+			state.watchedIds = ['mem_overflow_0000001', 'mem_overflow_0000002'];
+			state.revisions = {
+				mem_overflow_0000001: {
+					revision: 1,
+					status: 'active',
+					needsReview: false,
+					author: 'bob',
+					scopes: ['global'],
+					title: 'First watched memory with a descriptive title',
+				},
+				mem_overflow_0000002: {
+					revision: 1,
+					status: 'active',
+					needsReview: false,
+					author: 'bob',
+					scopes: ['global'],
+					title: 'Second watched memory with a descriptive title',
+				},
+			};
+			saveSessionState(config, sessionId, state);
+
+			appendFollowerEvent(eventsFile, { id: 'mem_overflow_0000001', kind: 'withdrawn', revision: 2, ts: 1 });
+			appendFollowerEvent(eventsFile, { id: 'mem_overflow_0000002', kind: 'revised', revision: 2, ts: 2 });
+
+			const turn1 = await handleUserPromptSubmit(
+				{ session_id: sessionId, prompt: 'turn 1' },
+				{
+					config,
+					env,
+					nonce: '1111222233334444',
+					fetchImpl: async () => new Response(JSON.stringify({ memories: [] }), { status: 200 }),
+				},
+			);
+			const out1 = turn1.hookSpecificOutput?.additionalContext ?? '';
+			assert.ok(out1.includes('mem_overflow_0000001'), 'first notice fits in turn 1 budget');
+			assert.ok(!out1.includes('mem_overflow_0000002'), 'second notice exceeds turn 1 budget');
+
+			const stateAfterTurn1 = loadSessionState(config, sessionId);
+			assert.equal(stateAfterTurn1.pendingNotices.length, 1);
+			assert.equal(stateAfterTurn1.pendingNotices[0].id, 'mem_overflow_0000002');
+
+			const offEnv = { ...env, AGENT_MEMORY_RECALL: 'off' };
+			const turn2 = await handleUserPromptSubmit(
+				{ session_id: sessionId, prompt: 'turn 2 with recall off' },
+				{
+					config: resolveConfig(offEnv),
+					env: offEnv,
+					nonce: '1111222233334444',
+					fetchImpl: async () => {
+						throw new Error('should not fetch when recall is off');
+					},
+				},
+			);
+			const out2 = turn2.hookSpecificOutput?.additionalContext ?? '';
+			assert.ok(out2.includes('mem_overflow_0000002'), 'pending overflow notice is delivered on turn 2');
+			assert.equal(loadSessionState(config, sessionId).pendingNotices.length, 0);
+		} finally {
+			rmSync(tmp, { recursive: true, force: true });
+		}
+	});
+
+	it('falls back to per-ID watch renewal on batch 404 and recovers from follower crash and truncated events.jsonl', async () => {
+		const tmp = makeTempDir();
+		try {
+			const env = {
+				AGENT_MEMORY_URL: 'http://127.0.0.1:9926',
+				AGENT_MEMORY_TOKEN: 'tok',
+				AGENT_MEMORY_CACHE_DIR: tmp,
+				AGENT_MEMORY_HEARTBEAT_MS: '50',
+			};
+			const config = resolveConfig(env);
+			const sessionId = 'sess-watch-404';
+			const { lockFile, eventsFile } = getSessionPaths(config, sessionId);
+
+			const state = loadSessionState(config, sessionId);
+			state.watchedIds = ['mem_alive_0000000001', 'mem_deleted_00000002'];
+			saveSessionState(config, sessionId, state);
+
+			const watchCalls = [];
+			const ok = await renewSessionWatches(config, sessionId, async (_url, init) => {
+				const ids = JSON.parse(init.body).ids;
+				watchCalls.push(ids);
+				if (ids.length > 1 || ids[0] === 'mem_deleted_00000002') {
+					return new Response('Not Found', { status: 404 });
+				}
+				return new Response(JSON.stringify({ watched: ids }), { status: 200 });
+			});
+			assert.equal(ok, true);
+			assert.equal(watchCalls.length, 3, 'batch call + 2 per-ID fallback calls');
+			assert.deepEqual(
+				loadSessionState(config, sessionId).watchedIds,
+				['mem_alive_0000000001'],
+				'404 ID is pruned while surviving ID remains watched',
+			);
+
+			appendFollowerEvent(eventsFile, { id: 'mem_1', kind: 'revised', revision: 2, ts: 1 });
+			appendFollowerEvent(eventsFile, { id: 'mem_2', kind: 'revised', revision: 3, ts: 2 });
+			const firstDrain = drainFollowerEvents(config, sessionId, 0);
+			assert.equal(firstDrain.events.length, 2);
+			assert.ok(firstDrain.nextOffset > 0);
+
+			writeFileSync(
+				eventsFile,
+				`${JSON.stringify({ id: 'mem_after_recreate', kind: 'withdrawn', revision: 4, ts: 3 })}\n`,
+				'utf8',
+			);
+			const secondDrain = drainFollowerEvents(config, sessionId, firstDrain.nextOffset);
+			assert.equal(secondDrain.events.length, 1, 'truncation below fromOffset resets read offset to 0');
+			assert.equal(secondDrain.events[0].id, 'mem_after_recreate');
+
+			writeFileSync(lockFile, JSON.stringify({ pid: process.pid, startedAt: 123, connected: true }), 'utf8');
+			const staleSec = (Date.now() - 10_000) / 1000;
+			utimesSync(lockFile, staleSec, staleSec);
+			let reconnected = false;
+			const loopPromise = runFollowerLoop(config, sessionId, {
+				fetchImpl: async (url) => {
+					if (url.endsWith('/Memory/watch')) {
+						return new Response(JSON.stringify({ watched: ['mem_alive_0000000001'] }), { status: 200 });
+					}
+					reconnected = true;
+					await handleSessionEnd({ session_id: sessionId }, { config });
+					return new Response('', { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+				},
+			});
+			await loopPromise;
+			assert.equal(reconnected, true, 'new follower takes over stale lock after crashed follower');
+		} finally {
+			rmSync(tmp, { recursive: true, force: true });
+		}
+	});
 });
 
 describe('scripts/import-claude-memory.mjs', () => {
@@ -853,11 +1018,15 @@ describe('scripts/import-claude-memory.mjs', () => {
 		assert.notEqual(aliceId, bobId, 'default user:<self> imports for different users must not collide');
 	});
 
-	it('maps frontmatter type to type:<type> tag, preserves Why/How to apply, skips MEMORY.md, and converts [[wikilinks]]', () => {
+	it('maps frontmatter type to type:<type> tag, preserves Why/How to apply, skips MEMORY.md and user type by default, and converts [[wikilinks]]', () => {
 		const files = [
 			{
 				filePath: '/mem/MEMORY.md',
 				content: '# Index\n- [Alpha](alpha.md)\n- [Beta](beta.md)',
+			},
+			{
+				filePath: '/mem/user-profile.md',
+				content: '---\nname: Personal role\ndescription: Local profile\ntype: user\n---\nKeep local by default.\n',
 			},
 			{
 				filePath: '/mem/alpha.md',
@@ -892,14 +1061,20 @@ describe('scripts/import-claude-memory.mjs', () => {
 		]);
 
 		const plan = buildImportPlan(files, { scope: 'user:<self>', principalKey: 'user:alice' });
-		assert.equal(plan.length, 2, 'MEMORY.md index is skipped');
-		// Beta should be ordered before Alpha because Alpha cites Beta
+		assert.equal(plan.length, 2, 'MEMORY.md index and type:user are skipped by default');
 		assert.equal(plan[0].name, 'Beta rule');
 		assert.equal(plan[1].name, 'Alpha rule');
 		assert.deepEqual(plan[1].tags, ['type:feedback']);
 		assert.ok(plan[1].content.includes('**Why:** Mocked databases hide Harper indexing behavior.'));
 		assert.ok(plan[1].content.includes('**How to apply:** Run npm run test:integration'));
 		assert.deepEqual(plan[1].evidence, [{ kind: 'memory', ref: plan[0].id }]);
+
+		const planWithUser = buildImportPlan(files, {
+			scope: 'user:<self>',
+			principalKey: 'user:alice',
+			excludeTypes: [],
+		});
+		assert.equal(planWithUser.length, 3, 'excludeTypes: [] (--include-user) includes type:user');
 	});
 
 	it('supports --dry-run, resolves cyclic [[wikilinks]] via two-pass PUT, and supports --delete-migrated', async () => {

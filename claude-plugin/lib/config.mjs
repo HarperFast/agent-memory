@@ -1,6 +1,7 @@
-import { readFileSync, statSync } from 'node:fs';
+import { readFileSync, realpathSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 export const DEFAULT_BOOTSTRAP_BUDGET = 4000;
 export const DEFAULT_BOOTSTRAP_TIMEOUT_MS = 3000;
@@ -12,6 +13,19 @@ export const DEFAULT_HEARTBEAT_MS = 10_000;
 export const DEFAULT_WATCH_RENEW_MS = 45 * 60 * 1000;
 export const DEFAULT_CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 export const QUERY_MAX_CHARS = 1000;
+
+export function isMainModule(metaUrl, argv1 = process.argv[1]) {
+	if (!metaUrl || !argv1) return false;
+	try {
+		return pathToFileURL(realpathSync(argv1)).href === metaUrl;
+	} catch {
+		try {
+			return pathToFileURL(resolve(argv1)).href === metaUrl;
+		} catch {
+			return false;
+		}
+	}
+}
 
 export function parseEnvContent(content) {
 	const entries = {};
@@ -32,7 +46,7 @@ export function parseEnvContent(content) {
 	return entries;
 }
 
-export function loadEnvFile(envFilePath) {
+function loadEnvFile(envFilePath) {
 	try {
 		const stat = statSync(envFilePath);
 		const insecurePermissions = process.platform !== 'win32' && (stat.mode & 0o077) !== 0;
@@ -43,7 +57,7 @@ export function loadEnvFile(envFilePath) {
 	}
 }
 
-export function isLoopbackHostname(hostname) {
+function isLoopbackHostname(hostname) {
 	const lower = String(hostname).toLowerCase();
 	return (
 		lower === 'localhost' ||
@@ -129,14 +143,14 @@ export function resolveConfig(env = process.env) {
 			merged.AGENT_MEMORY_BOOTSTRAP_TIMEOUT_MS,
 			DEFAULT_BOOTSTRAP_TIMEOUT_MS,
 			50,
-			30_000,
+			4000,
 		),
 		recallBudget: parsePositiveInt(merged.AGENT_MEMORY_RECALL_BUDGET, DEFAULT_RECALL_BUDGET, 100, 100_000),
 		recallTimeoutMs: parsePositiveInt(
 			merged.AGENT_MEMORY_RECALL_TIMEOUT_MS ?? merged.AGENT_MEMORY_TIMEOUT_MS,
 			DEFAULT_RECALL_TIMEOUT_MS,
 			50,
-			30_000,
+			2000,
 		),
 		recallLimit: parsePositiveInt(merged.AGENT_MEMORY_RECALL_LIMIT, DEFAULT_RECALL_LIMIT, 1, 50),
 		recallEnabled,

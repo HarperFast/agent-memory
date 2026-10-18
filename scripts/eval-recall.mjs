@@ -5,6 +5,7 @@ import {
 	DEFAULT_RECALL_LIMIT,
 	DEFAULT_RECALL_TIMEOUT_MS,
 	formatAuthorizationHeader,
+	isMainModule,
 	resolveConfig,
 	validateBaseUrl,
 } from '../claude-plugin/lib/config.mjs';
@@ -58,14 +59,14 @@ export function computeLatencyStats(latenciesMs) {
 	};
 }
 
-export function parseEvalArgs(argv) {
+function parseEvalArgs(argv) {
 	const options = {
 		datasetPath: undefined,
 		k: undefined,
 		timeoutMs: undefined,
 		url: undefined,
 		token: undefined,
-		watch: true,
+		watch: false,
 		json: false,
 		help: false,
 	};
@@ -99,7 +100,7 @@ export function parseEvalArgs(argv) {
 	return options;
 }
 
-export async function evaluateRecallDataset(rows, { baseUrl, authorization, k, timeoutMs, watch = true, fetchImpl }) {
+export async function evaluateRecallDataset(rows, { baseUrl, authorization, k, timeoutMs, watch = false, fetchImpl }) {
 	const results = [];
 	const latencies = [];
 	let timeouts = 0;
@@ -124,10 +125,9 @@ export async function evaluateRecallDataset(rows, { baseUrl, authorization, k, t
 				redirect: 'error',
 				signal: AbortSignal.timeout(timeoutMs),
 			});
-			const elapsed = Number((performance.now() - start).toFixed(2));
-			latencies.push(elapsed);
 
 			if (!response.ok) {
+				await response.text();
 				errors += 1;
 				errorMsg = `HTTP ${response.status}`;
 			} else {
@@ -136,6 +136,9 @@ export async function evaluateRecallDataset(rows, { baseUrl, authorization, k, t
 					returnedIds = body.memories.map((m) => String(m?.id ?? '')).filter(Boolean);
 				}
 			}
+			const elapsed = Number((performance.now() - start).toFixed(2));
+			latencies.push(elapsed);
+
 			const recall = computeRecallAtK(returnedIds, row.expectedIds, k);
 			results.push({
 				prompt: row.prompt,
@@ -196,7 +199,7 @@ export async function runEval(argv = [], env = process.env, io = {}) {
 	const args = parseEvalArgs(argv);
 	if (args.help) {
 		stdout(
-			'Usage: eval-recall.mjs [--dataset <file.jsonl>] [--k <limit>] [--timeout-ms <ms>] [--url <url>] [--token <token>] [--no-watch] [--json]',
+			'Usage: eval-recall.mjs [--dataset <file.jsonl>] [--k <limit>] [--timeout-ms <ms>] [--url <url>] [--token <token>] [--watch | --no-watch] [--json]',
 		);
 		return { exitCode: 0 };
 	}
@@ -245,7 +248,7 @@ export async function runEval(argv = [], env = process.env, io = {}) {
 	return { exitCode: 0, summary };
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (isMainModule(import.meta.url)) {
 	runEval(process.argv.slice(2), process.env).then(
 		({ exitCode }) => process.exit(exitCode),
 		(error) => {

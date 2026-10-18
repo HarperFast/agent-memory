@@ -1,10 +1,14 @@
 import { createHash, randomBytes } from 'node:crypto';
 import {
 	appendFileSync,
+	closeSync,
 	existsSync,
+	fstatSync,
 	mkdirSync,
+	openSync,
 	readdirSync,
 	readFileSync,
+	readSync,
 	renameSync,
 	rmSync,
 	statSync,
@@ -53,6 +57,7 @@ export function createEmptySessionState(sessionId, ownerId) {
 		watchedIds: [],
 		revisions: {},
 		notifiedRevisions: {},
+		pendingNotices: [],
 		eventsOffset: 0,
 		corrupt: false,
 	};
@@ -82,6 +87,7 @@ export function loadSessionState(config, sessionId) {
 			revisions: parsed.revisions && typeof parsed.revisions === 'object' ? parsed.revisions : {},
 			notifiedRevisions:
 				parsed.notifiedRevisions && typeof parsed.notifiedRevisions === 'object' ? parsed.notifiedRevisions : {},
+			pendingNotices: Array.isArray(parsed.pendingNotices) ? parsed.pendingNotices : [],
 			eventsOffset: Number.isInteger(parsed.eventsOffset) && parsed.eventsOffset >= 0 ? parsed.eventsOffset : 0,
 			corrupt: Boolean(parsed.corrupt),
 		};
@@ -151,36 +157,51 @@ export function appendFollowerEvent(eventsFile, event) {
 
 export function drainFollowerEvents(config, sessionId, fromOffset = 0) {
 	const { eventsFile } = getSessionPaths(config, sessionId);
-	let buf;
+	let fd;
 	try {
-		buf = readFileSync(eventsFile);
+		fd = openSync(eventsFile, 'r');
 	} catch {
 		return { events: [], nextOffset: fromOffset };
 	}
-	if (buf.length <= fromOffset) {
-		return { events: [], nextOffset: fromOffset };
-	}
-	const slice = buf.subarray(fromOffset);
-	const lastNewline = slice.lastIndexOf(0x0a);
-	if (lastNewline < 0) {
-		return { events: [], nextOffset: fromOffset };
-	}
-	const completeChunk = slice.subarray(0, lastNewline + 1).toString('utf8');
-	const nextOffset = fromOffset + lastNewline + 1;
-	const events = [];
-	for (const line of completeChunk.split('\n')) {
-		const trimmed = line.trim();
-		if (!trimmed) continue;
-		try {
-			const parsed = JSON.parse(trimmed);
-			if (parsed && typeof parsed.id === 'string' && typeof parsed.kind === 'string') {
-				events.push(parsed);
+	try {
+		const stat = fstatSync(fd);
+		const startOffset = stat.size < fromOffset ? 0 : fromOffset;
+		const remaining = stat.size - startOffset;
+		if (remaining <= 0) {
+			return { events: [], nextOffset: startOffset };
+		}
+		const slice = Buffer.allocUnsafe(remaining);
+		const bytesRead = readSync(fd, slice, 0, remaining, startOffset);
+		const validSlice = slice.subarray(0, bytesRead);
+		const lastNewline = validSlice.lastIndexOf(0x0a);
+		if (lastNewline < 0) {
+			return { events: [], nextOffset: startOffset };
+		}
+		const completeChunk = validSlice.subarray(0, lastNewline + 1).toString('utf8');
+		const nextOffset = startOffset + lastNewline + 1;
+		const events = [];
+		for (const line of completeChunk.split('\n')) {
+			const trimmed = line.trim();
+			if (!trimmed) continue;
+			try {
+				const parsed = JSON.parse(trimmed);
+				if (parsed && typeof parsed.id === 'string' && typeof parsed.kind === 'string') {
+					events.push(parsed);
+				}
+			} catch {
+				continue;
 			}
+		}
+		return { events, nextOffset };
+	} catch {
+		return { events: [], nextOffset: fromOffset };
+	} finally {
+		try {
+			closeSync(fd);
 		} catch {
-			continue;
+			return;
 		}
 	}
-	return { events, nextOffset };
 }
 
 export function clearStopFile(config, sessionId) {
@@ -202,21 +223,73 @@ export function writeStopFile(config, sessionId) {
 	}
 }
 
-export function gcStaleSessions(config, now = Date.now()) {
-	const sessionsDir = join(getEndpointCacheDir(config), 'sessions');
+function gcSessionsInDir(sessionsDir, config, now) {
 	let entries;
 	try {
 		entries = readdirSync(sessionsDir);
 	} catch {
 		return;
 	}
+	const bySession = new Map();
 	for (const name of entries) {
+		const dotIdx = name.indexOf('.');
+		if (dotIdx <= 0) continue;
+		const prefix = name.slice(0, dotIdx);
 		const fullPath = join(sessionsDir, name);
 		try {
 			const stat = statSync(fullPath);
-			if (now - stat.mtimeMs > config.followerTtlMs) {
-				rmSync(fullPath, { force: true });
+			const group = bySession.get(prefix) ?? { files: [], maxMtimeMs: 0, lockActive: false };
+			group.files.push(fullPath);
+			if (stat.mtimeMs > group.maxMtimeMs) {
+				group.maxMtimeMs = stat.mtimeMs;
 			}
+			if (name.endsWith('.follower.lock') && now - stat.mtimeMs <= 3 * config.heartbeatMs) {
+				group.lockActive = true;
+			}
+			bySession.set(prefix, group);
+		} catch {
+			continue;
+		}
+	}
+	for (const group of bySession.values()) {
+		if (group.lockActive) continue;
+		if (now - group.maxMtimeMs > config.followerTtlMs) {
+			for (const filePath of group.files) {
+				try {
+					rmSync(filePath, { force: true });
+				} catch {
+					continue;
+				}
+			}
+		}
+	}
+}
+
+export function gcStaleSessions(config, now = Date.now()) {
+	const currentEndpointDir = getEndpointCacheDir(config);
+	gcSessionsInDir(join(currentEndpointDir, 'sessions'), config, now);
+
+	let endpointDirs;
+	try {
+		endpointDirs = readdirSync(config.cacheDir, { withFileTypes: true });
+	} catch {
+		return;
+	}
+	for (const dirent of endpointDirs) {
+		if (!dirent.isDirectory()) continue;
+		const endpointDir = join(config.cacheDir, dirent.name);
+		if (endpointDir === currentEndpointDir) continue;
+		const subSessionsDir = join(endpointDir, 'sessions');
+		gcSessionsInDir(subSessionsDir, config, now);
+		try {
+			const remainingSessions = existsSync(subSessionsDir) ? readdirSync(subSessionsDir) : [];
+			if (remainingSessions.length > 0) continue;
+			const cacheFile = join(endpointDir, 'bootstrap-cache.json');
+			if (existsSync(cacheFile)) {
+				const stat = statSync(cacheFile);
+				if (now - stat.mtimeMs <= config.cacheMaxAgeMs) continue;
+			}
+			rmSync(endpointDir, { recursive: true, force: true });
 		} catch {
 			continue;
 		}
@@ -231,27 +304,37 @@ export function saveBootstrapCache(config, memories, now = Date.now()) {
 	const dir = getEndpointCacheDir(config);
 	ensureDir(dir);
 	const cachePath = getBootstrapCachePath(config);
-	let existingPinned = [];
-	try {
-		const prev = JSON.parse(readFileSync(cachePath, 'utf8'));
-		if (Array.isArray(prev?.pinned)) existingPinned = prev.pinned;
-	} catch {
-		existingPinned = [];
-	}
-
-	const currentIds = new Set(memories.map((m) => m?.id).filter(Boolean));
-	const newPinned = memories.filter((m) => m && m.section === 'pinned');
-	const mergedPinned = [
-		...newPinned,
-		...existingPinned.filter((m) => m && m.id && !currentIds.has(m.id) && m.section === 'pinned'),
-	];
+	const validMemories = (Array.isArray(memories) ? memories : []).filter(
+		(m) => m && typeof m.id === 'string' && (!m.status || m.status === 'active'),
+	);
+	const pinned = validMemories.filter((m) => m.section === 'pinned' || m.pinned === true);
 
 	atomicWriteJson(cachePath, {
 		fetchedAt: new Date(now).toISOString(),
 		fetchedAtMs: now,
-		memories,
-		pinned: mergedPinned,
+		memories: validMemories,
+		pinned,
 	});
+}
+
+export function evictFromBootstrapCache(config, ids) {
+	if (!Array.isArray(ids) || ids.length === 0) return;
+	const cachePath = getBootstrapCachePath(config);
+	try {
+		if (!existsSync(cachePath)) return;
+		const parsed = JSON.parse(readFileSync(cachePath, 'utf8'));
+		if (!parsed || typeof parsed !== 'object') return;
+		const evictSet = new Set(ids);
+		const nextMemories = Array.isArray(parsed.memories) ? parsed.memories.filter((m) => m && !evictSet.has(m.id)) : [];
+		const nextPinned = Array.isArray(parsed.pinned) ? parsed.pinned.filter((m) => m && !evictSet.has(m.id)) : [];
+		atomicWriteJson(cachePath, {
+			...parsed,
+			memories: nextMemories,
+			pinned: nextPinned,
+		});
+	} catch {
+		return;
+	}
 }
 
 export function loadBootstrapCache(config, now = Date.now()) {
