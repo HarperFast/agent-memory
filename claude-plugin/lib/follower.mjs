@@ -248,7 +248,6 @@ function waitAbortableDelay(delayMs, signal) {
 			signal.removeEventListener('abort', onAbort);
 			resolve();
 		}, delayMs);
-		backoff.unref?.();
 		signal.addEventListener('abort', onAbort, { once: true });
 	});
 }
@@ -308,7 +307,6 @@ export async function runFollowerLoop(config, sessionId, options = {}) {
 				});
 		}
 	}, checkIntervalMs);
-	timer.unref?.();
 
 	let attempt = 0;
 	try {
