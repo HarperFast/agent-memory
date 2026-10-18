@@ -66,7 +66,7 @@ function parseEvalArgs(argv) {
 		timeoutMs: undefined,
 		url: undefined,
 		token: undefined,
-		watch: false,
+		watch: true,
 		json: false,
 		help: false,
 	};
@@ -100,7 +100,7 @@ function parseEvalArgs(argv) {
 	return options;
 }
 
-export async function evaluateRecallDataset(rows, { baseUrl, authorization, k, timeoutMs, watch = false, fetchImpl }) {
+export async function evaluateRecallDataset(rows, { baseUrl, authorization, k, timeoutMs, watch = true, fetchImpl }) {
 	const results = [];
 	const latencies = [];
 	let timeouts = 0;

@@ -17,7 +17,6 @@ import {
 	getEndpointCacheDir,
 	getSessionPaths,
 	loadSessionState,
-	saveSessionState,
 } from './cache.mjs';
 import { isMainModule, resolveConfig } from './config.mjs';
 
@@ -27,6 +26,15 @@ export function isFollowerLockActive(lockFile, heartbeatMs, now = Date.now()) {
 	try {
 		const stat = statSync(lockFile);
 		return now - stat.mtimeMs <= 3 * heartbeatMs;
+	} catch {
+		return false;
+	}
+}
+
+function isLockOwnedBySelf(lockFile, startedAt) {
+	try {
+		const parsed = JSON.parse(readFileSync(lockFile, 'utf8'));
+		return Boolean(parsed && parsed.pid === process.pid && parsed.startedAt === startedAt);
 	} catch {
 		return false;
 	}
@@ -46,27 +54,27 @@ export function tryAcquireFollowerLock(lockFile, heartbeatMs, now = Date.now()) 
 	try {
 		unlinkSync(lockFile);
 		writeFileSync(lockFile, payload, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
-		return true;
+		return isLockOwnedBySelf(lockFile, now);
 	} catch {
 		return false;
 	}
 }
 
 function markFollowerConnected(lockFile, startedAt) {
+	if (!isLockOwnedBySelf(lockFile, startedAt)) return false;
 	try {
 		const payload = JSON.stringify({ pid: process.pid, startedAt, connected: true });
 		writeFileSync(lockFile, payload, { encoding: 'utf8', mode: 0o600 });
+		return true;
 	} catch {
-		return;
+		return false;
 	}
 }
 
 function releaseOwnedLock(lockFile, startedAt) {
+	if (!isLockOwnedBySelf(lockFile, startedAt)) return;
 	try {
-		const parsed = JSON.parse(readFileSync(lockFile, 'utf8'));
-		if (parsed && parsed.pid === process.pid && parsed.startedAt === startedAt) {
-			unlinkSync(lockFile);
-		}
+		unlinkSync(lockFile);
 	} catch {
 		return;
 	}
@@ -115,37 +123,54 @@ async function postWatchBatch(config, ids, fetchImpl, signal) {
 	});
 }
 
-export async function renewSessionWatches(config, sessionId, fetchImpl = globalThis.fetch, signal) {
+async function drainResponseBody(response) {
+	try {
+		await response?.text?.();
+	} catch {
+		return;
+	}
+}
+
+export async function renewSessionWatches(
+	config,
+	sessionId,
+	fetchImpl = globalThis.fetch,
+	signal,
+	prunedIds = new Set(),
+) {
 	const state = loadSessionState(config, sessionId);
 	const rawIds = Array.isArray(state.watchedIds) ? state.watchedIds : [];
 	if (rawIds.length === 0) return true;
 
-	const staleIds = new Set();
 	const activeIds = [];
 	for (const id of rawIds) {
+		if (prunedIds.has(id)) continue;
 		const revStatus = state.revisions?.[id]?.status;
 		if (revStatus === 'withdrawn' || revStatus === 'superseded') {
-			staleIds.add(id);
+			prunedIds.add(id);
 		} else {
 			activeIds.push(id);
 		}
 	}
+	if (activeIds.length === 0) return true;
 
 	let allSucceeded = true;
 	for (let i = 0; i < activeIds.length; i += 100) {
 		const batch = activeIds.slice(i, i + 100);
 		try {
 			const response = await postWatchBatch(config, batch, fetchImpl, signal);
+			await drainResponseBody(response);
 			if (response.ok) continue;
 			if (response.status === 404) {
 				if (batch.length === 1) {
-					staleIds.add(batch[0]);
+					prunedIds.add(batch[0]);
 					continue;
 				}
 				for (const singleId of batch) {
 					const singleRes = await postWatchBatch(config, [singleId], fetchImpl, signal);
+					await drainResponseBody(singleRes);
 					if (singleRes.status === 404) {
-						staleIds.add(singleId);
+						prunedIds.add(singleId);
 					} else if (!singleRes.ok) {
 						allSucceeded = false;
 					}
@@ -155,17 +180,6 @@ export async function renewSessionWatches(config, sessionId, fetchImpl = globalT
 			}
 		} catch {
 			return false;
-		}
-	}
-
-	if (staleIds.size > 0) {
-		const latest = loadSessionState(config, sessionId);
-		if (!latest.corrupt && Array.isArray(latest.watchedIds)) {
-			const filtered = latest.watchedIds.filter((id) => !staleIds.has(id));
-			if (filtered.length !== latest.watchedIds.length) {
-				latest.watchedIds = filtered;
-				saveSessionState(config, sessionId, latest);
-			}
 		}
 	}
 
@@ -251,15 +265,17 @@ export async function runFollowerLoop(config, sessionId, options = {}) {
 
 	const controller = new AbortController();
 	let lastHeartbeat = startedAt;
-	let lastWatchRenew = startedAt;
+	let nextWatchRenewAt = startedAt + config.watchRenewMs;
+	let renewFailures = 0;
 	let renewingWatches = false;
+	const prunedWatchIds = new Set();
 	const checkIntervalMs = Math.max(50, Math.min(config.heartbeatMs / 2, 1000));
 
 	const shouldStop = () => existsSync(stopFile) || Date.now() - startedAt >= config.followerTtlMs;
 
 	const timer = setInterval(() => {
 		const now = Date.now();
-		if (shouldStop()) {
+		if (shouldStop() || !isLockOwnedBySelf(lockFile, startedAt)) {
 			controller.abort();
 			clearInterval(timer);
 			return;
@@ -273,11 +289,19 @@ export async function runFollowerLoop(config, sessionId, options = {}) {
 				return;
 			}
 		}
-		if (!renewingWatches && now - lastWatchRenew >= config.watchRenewMs) {
+		if (!renewingWatches && now >= nextWatchRenewAt) {
 			renewingWatches = true;
-			void renewSessionWatches(config, sessionId, fetchImpl, controller.signal)
+			void renewSessionWatches(config, sessionId, fetchImpl, controller.signal, prunedWatchIds)
+				.catch(() => false)
 				.then((ok) => {
-					if (ok) lastWatchRenew = Date.now();
+					if (ok) {
+						renewFailures = 0;
+						nextWatchRenewAt = Date.now() + config.watchRenewMs;
+					} else {
+						renewFailures += 1;
+						const backoffMs = Math.min(300_000, Math.max(config.watchRenewMs, 1000 * 2 ** Math.min(renewFailures, 8)));
+						nextWatchRenewAt = Date.now() + backoffMs;
+					}
 				})
 				.finally(() => {
 					renewingWatches = false;
@@ -302,13 +326,18 @@ export async function runFollowerLoop(config, sessionId, options = {}) {
 					signal: controller.signal,
 				});
 				if (response.status === 401 || response.status === 403) {
+					await drainResponseBody(response);
 					logFollowerError(config, `auth failed (${response.status}); stopping follower`);
 					break;
 				}
 				if (!response.ok || !response.body) {
+					await drainResponseBody(response);
 					throw new Error(`unexpected status ${response.status}`);
 				}
-				markFollowerConnected(lockFile, startedAt);
+				if (!markFollowerConnected(lockFile, startedAt)) {
+					await drainResponseBody(response);
+					break;
+				}
 				await consumeSseStream(
 					response.body,
 					(event) => {

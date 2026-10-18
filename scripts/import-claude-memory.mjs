@@ -403,11 +403,13 @@ export async function runImport(argv = [], env = process.env, io = {}) {
 	const config = resolveConfig(env);
 	const baseUrl = args.url ? validateBaseUrl(args.url, env.AGENT_MEMORY_ALLOW_INSECURE_HTTP === '1') : config.baseUrl;
 	const authorization = args.token ? formatAuthorizationHeader(args.token) : config.authorization;
-	const inferredUser =
-		args.user ||
-		config.userId ||
-		extractBasicUsername(authorization) ||
-		(authorization ? createHash('sha256').update(authorization).digest('hex').slice(0, 12) : undefined);
+	const inferredUser = args.user || config.userId || extractBasicUsername(authorization);
+	if (authorization && /^Bearer\s+/i.test(authorization) && !inferredUser) {
+		stderr(
+			'Error: Bearer token authentication requires --user <username> or AGENT_MEMORY_USER so derived memory IDs remain stable across token rotation.',
+		);
+		return { exitCode: 1, records: [] };
+	}
 
 	const principalKey =
 		args.scope === DEFAULT_SCOPE
@@ -476,8 +478,15 @@ export async function runImport(argv = [], env = process.env, io = {}) {
 			const base = basename(record.filePath);
 			let destPath = join(archiveAbs, base);
 			if (existsSync(destPath)) {
+				const ext = extname(base);
+				const stem = ext ? base.slice(0, -ext.length) : base;
 				const shortHash = createHash('sha256').update(record.filePath).digest('hex').slice(0, 8);
-				destPath = join(archiveAbs, `${shortHash}-${base}`);
+				let collisionIndex = 1;
+				destPath = join(archiveAbs, `${stem}-${shortHash}${ext}`);
+				while (existsSync(destPath)) {
+					collisionIndex += 1;
+					destPath = join(archiveAbs, `${stem}-${shortHash}-${collisionIndex}${ext}`);
+				}
 			}
 			renameSync(record.filePath, destPath);
 		}

@@ -3,15 +3,15 @@ import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-export const DEFAULT_BOOTSTRAP_BUDGET = 4000;
-export const DEFAULT_BOOTSTRAP_TIMEOUT_MS = 3000;
-export const DEFAULT_RECALL_BUDGET = 2000;
+const DEFAULT_BOOTSTRAP_BUDGET = 4000;
+const DEFAULT_BOOTSTRAP_TIMEOUT_MS = 3000;
+const DEFAULT_RECALL_BUDGET = 2000;
 export const DEFAULT_RECALL_TIMEOUT_MS = 1500;
 export const DEFAULT_RECALL_LIMIT = 5;
-export const DEFAULT_FOLLOWER_TTL_MS = 4 * 60 * 60 * 1000;
-export const DEFAULT_HEARTBEAT_MS = 10_000;
-export const DEFAULT_WATCH_RENEW_MS = 45 * 60 * 1000;
-export const DEFAULT_CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const DEFAULT_FOLLOWER_TTL_MS = 4 * 60 * 60 * 1000;
+const DEFAULT_HEARTBEAT_MS = 10_000;
+const DEFAULT_WATCH_RENEW_MS = 45 * 60 * 1000;
+const DEFAULT_CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 export const QUERY_MAX_CHARS = 1000;
 
 export function isMainModule(metaUrl, argv1 = process.argv[1]) {

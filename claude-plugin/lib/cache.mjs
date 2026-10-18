@@ -10,6 +10,7 @@ import {
 	readFileSync,
 	readSync,
 	renameSync,
+	rmdirSync,
 	rmSync,
 	statSync,
 	unlinkSync,
@@ -17,6 +18,9 @@ import {
 } from 'node:fs';
 import { join } from 'node:path';
 import { isNeedsReview, resolveAuthorPrincipal } from './format.mjs';
+
+const ENDPOINT_DIR_RE = /^[0-9a-f]{16}$/;
+const SESSION_FILE_RE = /^([0-9a-f]{24})\.(state\.json|events\.jsonl|follower\.lock|stop)$/;
 
 export function getEndpointCacheDir(config) {
 	const key = `${config.baseUrl ?? 'default'}\0${config.authorization ?? ''}`;
@@ -49,7 +53,7 @@ function atomicWriteJson(filePath, data) {
 	renameSync(tmpPath, filePath);
 }
 
-export function createEmptySessionState(sessionId, ownerId) {
+function createEmptySessionState(sessionId, ownerId) {
 	return {
 		sessionId: String(sessionId || 'default'),
 		ownerId: ownerId ?? undefined,
@@ -102,6 +106,30 @@ export function saveSessionState(config, sessionId, state) {
 	atomicWriteJson(stateFile, state);
 }
 
+function upsertRevisionEntry(state, memory) {
+	const prev = state.revisions[memory.id];
+	const nextEntry = {
+		revision: typeof memory.revision === 'number' ? memory.revision : 1,
+		status: memory.status ?? 'active',
+		needsReview: isNeedsReview(memory),
+		author: resolveAuthorPrincipal(memory),
+		ownerId: typeof memory.ownerId === 'string' && memory.ownerId ? memory.ownerId : prev?.ownerId,
+		scopes: Array.isArray(memory.scopes) ? memory.scopes.map(String) : (prev?.scopes ?? []),
+		title: typeof memory.title === 'string' ? memory.title : (prev?.title ?? ''),
+	};
+	if (
+		!prev ||
+		prev.revision !== nextEntry.revision ||
+		prev.status !== nextEntry.status ||
+		prev.needsReview !== nextEntry.needsReview ||
+		prev.ownerId !== nextEntry.ownerId
+	) {
+		state.revisions[memory.id] = nextEntry;
+		return true;
+	}
+	return false;
+}
+
 export function recordMemoriesInState(state, memories, injectedMemories = memories) {
 	let dirty = false;
 	const injectedSet = new Set(state.injectedIds);
@@ -118,6 +146,9 @@ export function recordMemoriesInState(state, memories, injectedMemories = memori
 			state.ownerId = String(memory.ownerId);
 			dirty = true;
 		}
+		if (upsertRevisionEntry(state, memory)) {
+			dirty = true;
+		}
 	}
 
 	for (const memory of injectedMemories) {
@@ -127,22 +158,7 @@ export function recordMemoriesInState(state, memories, injectedMemories = memori
 			state.injectedIds.push(memory.id);
 			dirty = true;
 		}
-		const prev = state.revisions[memory.id];
-		const nextEntry = {
-			revision: typeof memory.revision === 'number' ? memory.revision : 1,
-			status: memory.status ?? 'active',
-			needsReview: isNeedsReview(memory),
-			author: resolveAuthorPrincipal(memory),
-			scopes: Array.isArray(memory.scopes) ? memory.scopes.map(String) : [],
-			title: typeof memory.title === 'string' ? memory.title : '',
-		};
-		if (
-			!prev ||
-			prev.revision !== nextEntry.revision ||
-			prev.status !== nextEntry.status ||
-			prev.needsReview !== nextEntry.needsReview
-		) {
-			state.revisions[memory.id] = nextEntry;
+		if (upsertRevisionEntry(state, memory)) {
 			dirty = true;
 		}
 	}
@@ -232,9 +248,9 @@ function gcSessionsInDir(sessionsDir, config, now) {
 	}
 	const bySession = new Map();
 	for (const name of entries) {
-		const dotIdx = name.indexOf('.');
-		if (dotIdx <= 0) continue;
-		const prefix = name.slice(0, dotIdx);
+		const match = SESSION_FILE_RE.exec(name);
+		if (!match) continue;
+		const prefix = match[1];
 		const fullPath = join(sessionsDir, name);
 		try {
 			const stat = statSync(fullPath);
@@ -253,7 +269,7 @@ function gcSessionsInDir(sessionsDir, config, now) {
 	}
 	for (const group of bySession.values()) {
 		if (group.lockActive) continue;
-		if (now - group.maxMtimeMs > config.followerTtlMs) {
+		if (now - group.maxMtimeMs > config.cacheMaxAgeMs) {
 			for (const filePath of group.files) {
 				try {
 					rmSync(filePath, { force: true });
@@ -276,20 +292,31 @@ export function gcStaleSessions(config, now = Date.now()) {
 		return;
 	}
 	for (const dirent of endpointDirs) {
-		if (!dirent.isDirectory()) continue;
+		if (!dirent.isDirectory() || !ENDPOINT_DIR_RE.test(dirent.name)) continue;
 		const endpointDir = join(config.cacheDir, dirent.name);
 		if (endpointDir === currentEndpointDir) continue;
 		const subSessionsDir = join(endpointDir, 'sessions');
+		const cacheFile = join(endpointDir, 'bootstrap-cache.json');
+		if (!existsSync(subSessionsDir) && !existsSync(cacheFile)) continue;
+
 		gcSessionsInDir(subSessionsDir, config, now);
 		try {
-			const remainingSessions = existsSync(subSessionsDir) ? readdirSync(subSessionsDir) : [];
-			if (remainingSessions.length > 0) continue;
-			const cacheFile = join(endpointDir, 'bootstrap-cache.json');
+			if (existsSync(subSessionsDir)) {
+				const remainingSessions = readdirSync(subSessionsDir);
+				if (remainingSessions.length > 0) continue;
+				try {
+					rmdirSync(subSessionsDir);
+				} catch {
+					continue;
+				}
+			}
 			if (existsSync(cacheFile)) {
 				const stat = statSync(cacheFile);
 				if (now - stat.mtimeMs <= config.cacheMaxAgeMs) continue;
+				rmSync(cacheFile, { force: true });
 			}
-			rmSync(endpointDir, { recursive: true, force: true });
+			rmSync(join(endpointDir, 'follower-errors.log'), { force: true });
+			rmdirSync(endpointDir);
 		} catch {
 			continue;
 		}
@@ -300,13 +327,19 @@ export function getBootstrapCachePath(config) {
 	return join(getEndpointCacheDir(config), 'bootstrap-cache.json');
 }
 
+function isCacheableOfflineMemory(memory) {
+	if (!memory || typeof memory.id !== 'string') return false;
+	if (memory.status && memory.status !== 'active') return false;
+	if (memory.section === 'pinned' || memory.pinned === true) return true;
+	if (!Array.isArray(memory.scopes) || memory.scopes.length === 0) return true;
+	return memory.scopes.every((s) => String(s).startsWith('user:'));
+}
+
 export function saveBootstrapCache(config, memories, now = Date.now()) {
 	const dir = getEndpointCacheDir(config);
 	ensureDir(dir);
 	const cachePath = getBootstrapCachePath(config);
-	const validMemories = (Array.isArray(memories) ? memories : []).filter(
-		(m) => m && typeof m.id === 'string' && (!m.status || m.status === 'active'),
-	);
+	const validMemories = (Array.isArray(memories) ? memories : []).filter(isCacheableOfflineMemory);
 	const pinned = validMemories.filter((m) => m.section === 'pinned' || m.pinned === true);
 
 	atomicWriteJson(cachePath, {

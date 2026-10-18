@@ -39,7 +39,7 @@ export function isNeedsReview(memory) {
 	return Boolean(memory?.needsReview);
 }
 
-export function formatMemoryRecord(memory, nonce, maxBodyChars) {
+function formatMemoryRecord(memory, nonce, maxBodyChars) {
 	const id = escapeAttr(memory?.id ?? 'unknown');
 	const author = escapeAttr(resolveAuthorPrincipal(memory));
 	const lastEditorRaw = resolveLastEditorPrincipal(memory);
@@ -64,7 +64,7 @@ export function formatMemoryRecord(memory, nonce, maxBodyChars) {
 	return `${header}\n${body}\n${footer}`;
 }
 
-export function formatChangeNotice(notice, nonce, maxSummaryChars) {
+function formatChangeNotice(notice, nonce, maxSummaryChars) {
 	const id = escapeAttr(notice.id ?? 'unknown');
 	const kind = escapeAttr(notice.kind ?? 'revised');
 	const author = escapeAttr(notice.author ?? 'unknown');

@@ -24,7 +24,7 @@ export function truncatePrompt(prompt) {
 	return text.slice(0, QUERY_MAX_CHARS);
 }
 
-export function buildChangeNotices(state, drainedEvents, recalledMemories = []) {
+function buildChangeNotices(state, drainedEvents, recalledMemories = []) {
 	const notices = [];
 	const injectedSet = new Set(state.injectedIds);
 	const watchedSet = new Set(state.watchedIds);
@@ -85,20 +85,14 @@ export function buildChangeNotices(state, drainedEvents, recalledMemories = []) 
 		const prev = state.revisions[event.id];
 		const isInjected = injectedSet.has(event.id);
 		const isWatchedOnly = !isInjected && watchedSet.has(event.id);
-		const isOwnFlagged =
-			event.kind === 'flagged' &&
-			((!isInjected && !isWatchedOnly) || Boolean(state.ownerId && prev?.author === state.ownerId));
+		const isKnownOwn = Boolean(state.ownerId && (prev?.ownerId === state.ownerId || prev?.author === state.ownerId));
+		const isOwnFlagged = event.kind === 'flagged' && (isKnownOwn || (!isInjected && !isWatchedOnly));
 		if (!isInjected && !isOwnFlagged) {
 			continue;
 		}
 		const revNum = typeof event.revision === 'number' ? event.revision : (prev?.revision ?? 1);
 		const author = prev?.author ?? (isOwnFlagged && state.ownerId ? state.ownerId : 'unknown');
-		const scopes =
-			Array.isArray(prev?.scopes) && prev.scopes.length > 0
-				? prev.scopes
-				: isOwnFlagged && state.ownerId
-					? [`user:${state.ownerId}`]
-					: [];
+		const scopes = Array.isArray(prev?.scopes) ? prev.scopes : [];
 		const needsReview = event.kind === 'flagged' ? true : Boolean(prev?.needsReview);
 
 		queueNotice({
@@ -124,11 +118,7 @@ export function buildChangeNotices(state, drainedEvents, recalledMemories = []) 
 
 		if (prev && injectedSet.has(memory.id)) {
 			let kind;
-			if (memory.status === 'superseded' && prev.status !== 'superseded') {
-				kind = 'superseded';
-			} else if (memory.status === 'withdrawn' && prev.status !== 'withdrawn') {
-				kind = 'withdrawn';
-			} else if (flagged && !prev.needsReview) {
+			if (flagged && !prev.needsReview) {
 				kind = 'flagged';
 			} else if (revNum > (prev.revision ?? 1)) {
 				kind = 'revised';
@@ -141,12 +131,11 @@ export function buildChangeNotices(state, drainedEvents, recalledMemories = []) 
 					author,
 					scopes,
 					needsReview: flagged,
-					supersededBy: memory.supersededBy,
 					ownFlagged: kind === 'flagged' && isOwn,
 					title: memory.title ?? prev.title,
 				});
 			}
-		} else if (isOwn && flagged) {
+		} else if (isOwn && flagged && !prev?.needsReview) {
 			queueNotice({
 				id: memory.id,
 				kind: 'flagged',
@@ -155,7 +144,7 @@ export function buildChangeNotices(state, drainedEvents, recalledMemories = []) 
 				scopes,
 				needsReview: true,
 				ownFlagged: true,
-				title: memory.title,
+				title: memory.title ?? prev?.title,
 			});
 		}
 	}
@@ -351,7 +340,7 @@ export async function handleUserPromptSubmit(input = {}, options = {}) {
 	}
 
 	const shouldSpawnFollower = options.spawnFollower ?? !options.fetchImpl;
-	if (shouldSpawnFollower && state.watchedIds.length > 0) {
+	if (shouldSpawnFollower) {
 		ensureFollowerRunning(config, sessionId, env);
 	}
 
@@ -360,7 +349,7 @@ export async function handleUserPromptSubmit(input = {}, options = {}) {
 
 	if (config.recallEnabled && query.length > 0) {
 		const fetchImpl = options.fetchImpl ?? globalThis.fetch;
-		const url = `${config.baseUrl}/Memory/?q=${encodeURIComponent(query)}&limit=${encodeURIComponent(config.recallLimit)}&includeSuperseded=true&watch=true`;
+		const url = `${config.baseUrl}/Memory/?q=${encodeURIComponent(query)}&limit=${encodeURIComponent(config.recallLimit)}&watch=true`;
 		try {
 			const response = await fetchImpl(url, {
 				method: 'GET',

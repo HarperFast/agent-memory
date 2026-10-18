@@ -6,6 +6,7 @@ import {
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
+	readdirSync,
 	readFileSync,
 	rmSync,
 	utimesSync,
@@ -401,21 +402,36 @@ describe('SessionStart bootstrap hook and read-through cache', () => {
 		}
 	});
 
-	it('replaces cached bootstrap snapshot authoritatively, evicts withdrawn IDs, and GCs whole sessions only when all files are stale', () => {
+	it('replaces cached bootstrap snapshot authoritatively, filters out unpinned shared memories, evicts withdrawn IDs, and safely GCs only stale plugin session files', () => {
 		const tmp = makeTempDir();
 		try {
 			const config = resolveConfig({
 				AGENT_MEMORY_URL: 'https://memory.example.com',
 				AGENT_MEMORY_TOKEN: 'tok',
 				AGENT_MEMORY_CACHE_DIR: tmp,
-				AGENT_MEMORY_FOLLOWER_TTL_MS: '1000',
+				AGENT_MEMORY_CACHE_MAX_AGE_MS: '1000',
 			});
 			saveBootstrapCache(config, [
 				{ id: 'mem_pinned_old_00001', title: 'Old Pinned', content: 'old pin', section: 'pinned', revision: 1 },
 			]);
 			saveBootstrapCache(config, [
 				{ id: 'mem_pinned_new_00002', title: 'New Pinned', content: 'new pin', section: 'pinned', revision: 1 },
-				{ id: 'mem_recent_new_00003', title: 'Recent', content: 'new', section: 'recent', revision: 1 },
+				{
+					id: 'mem_recent_new_00003',
+					title: 'Recent Private',
+					content: 'new',
+					section: 'recent',
+					scopes: ['user:alice'],
+					revision: 1,
+				},
+				{
+					id: 'mem_team_unpinned_04',
+					title: 'Team Unpinned',
+					content: 'shared',
+					section: 'relevant',
+					scopes: ['team:sre'],
+					revision: 1,
+				},
 			]);
 			const cached = loadBootstrapCache(config);
 			assert.deepEqual(
@@ -429,6 +445,18 @@ describe('SessionStart bootstrap hook and read-through cache', () => {
 				['mem_recent_new_00003'],
 			);
 
+			const foreignNamedDir = join(tmp, 'pip-cache');
+			const foreignHexDir = join(tmp, '0123456789abcdef');
+			mkdirSync(foreignNamedDir, { recursive: true });
+			mkdirSync(foreignHexDir, { recursive: true });
+			const foreignFile1 = join(foreignNamedDir, 'wheel.whl');
+			const foreignFile2 = join(foreignHexDir, 'unrelated.txt');
+			writeFileSync(foreignFile1, 'keep', 'utf8');
+			writeFileSync(foreignFile2, 'keep', 'utf8');
+			const ancientSec = (Date.now() - 60 * 24 * 60 * 60 * 1000) / 1000;
+			utimesSync(foreignNamedDir, ancientSec, ancientSec);
+			utimesSync(foreignHexDir, ancientSec, ancientSec);
+
 			const oldPaths = getSessionPaths(config, 'old-session');
 			saveSessionState(config, 'old-session', loadSessionState(config, 'old-session'));
 			appendFollowerEvent(oldPaths.eventsFile, { id: 'mem_1', kind: 'revised', revision: 2, ts: Date.now() });
@@ -437,11 +465,15 @@ describe('SessionStart bootstrap hook and read-through cache', () => {
 
 			gcStaleSessions(config, Date.now());
 			assert.equal(existsSync(oldPaths.stateFile), true, 'fresh events.jsonl keeps the session state alive');
+			assert.equal(existsSync(foreignFile1), true, 'foreign directory must never be deleted');
+			assert.equal(existsSync(foreignFile2), true, '16-hex directory with non-plugin files must never be deleted');
 
 			utimesSync(oldPaths.eventsFile, pastSec, pastSec);
 			gcStaleSessions(config, Date.now());
 			assert.equal(existsSync(oldPaths.stateFile), false);
 			assert.equal(existsSync(oldPaths.eventsFile), false);
+			assert.equal(existsSync(foreignFile1), true);
+			assert.equal(existsSync(foreignFile2), true);
 		} finally {
 			rmSync(tmp, { recursive: true, force: true });
 		}
@@ -667,17 +699,23 @@ describe('live change notices: follower SSE stream + in-band revision diffing', 
 			const sessionId = 'sess-live';
 			const { eventsFile } = getSessionPaths(config, sessionId);
 
-			// Seed state with two injected memories (mem_watched_1, mem_watched_2) and one non-injected watched candidate (mem_uninjected_3)
 			const state = loadSessionState(config, sessionId);
 			state.ownerId = 'alice';
-			state.injectedIds = ['mem_watched_00000001', 'mem_watched_00000002'];
-			state.watchedIds = ['mem_watched_00000001', 'mem_watched_00000002', 'mem_uninjected_00003'];
+			state.injectedIds = ['mem_watched_00000001', 'mem_watched_00000002', 'mem_watched_00000006'];
+			state.watchedIds = [
+				'mem_watched_00000001',
+				'mem_watched_00000002',
+				'mem_watched_00000006',
+				'mem_uninjected_00003',
+				'mem_own_watched_0007',
+			];
 			state.revisions = {
 				mem_watched_00000001: {
 					revision: 1,
 					status: 'active',
 					needsReview: false,
 					author: 'bob',
+					ownerId: 'bob',
 					scopes: ['global'],
 					title: 'Deploy policy',
 				},
@@ -686,25 +724,45 @@ describe('live change notices: follower SSE stream + in-band revision diffing', 
 					status: 'active',
 					needsReview: false,
 					author: 'bob',
+					ownerId: 'bob',
 					scopes: ['global'],
 					title: 'Rollback guide',
+				},
+				mem_watched_00000006: {
+					revision: 1,
+					status: 'active',
+					needsReview: false,
+					author: 'bob',
+					ownerId: 'bob',
+					scopes: ['global'],
+					title: 'Legacy endpoint',
 				},
 				mem_uninjected_00003: {
 					revision: 1,
 					status: 'active',
 					needsReview: false,
 					author: 'bob',
+					ownerId: 'bob',
 					scopes: ['global'],
 					title: 'Uninjected candidate',
+				},
+				mem_own_watched_0007: {
+					revision: 1,
+					status: 'active',
+					needsReview: false,
+					author: 'alice',
+					ownerId: 'alice',
+					scopes: ['team:sre'],
+					title: 'Alice uninjected',
 				},
 			};
 			saveSessionState(config, sessionId, state);
 
-			// Follower appends a withdrawn event for mem_watched_00000001, an own-flagged event for mem_own_flagged_0004,
-			// and a revised event for non-injected mem_uninjected_00003 (which should be filtered out).
 			appendFollowerEvent(eventsFile, { id: 'mem_watched_00000001', kind: 'withdrawn', revision: 2, ts: 1 });
-			appendFollowerEvent(eventsFile, { id: 'mem_own_flagged_0004', kind: 'flagged', revision: 3, ts: 2 });
-			appendFollowerEvent(eventsFile, { id: 'mem_uninjected_00003', kind: 'revised', revision: 2, ts: 3 });
+			appendFollowerEvent(eventsFile, { id: 'mem_watched_00000006', kind: 'superseded', revision: 2, ts: 2 });
+			appendFollowerEvent(eventsFile, { id: 'mem_own_flagged_0004', kind: 'flagged', revision: 3, ts: 3 });
+			appendFollowerEvent(eventsFile, { id: 'mem_own_watched_0007', kind: 'flagged', revision: 2, ts: 4 });
+			appendFollowerEvent(eventsFile, { id: 'mem_uninjected_00003', kind: 'revised', revision: 2, ts: 5 });
 
 			let fetchCount = 0;
 			const res = await handleUserPromptSubmit(
@@ -716,19 +774,19 @@ describe('live change notices: follower SSE stream + in-band revision diffing', 
 					fetchImpl: async (url) => {
 						fetchCount += 1;
 						assert.ok(url.includes('/Memory/?q='), 'only the single search request should be made');
+						assert.ok(!url.includes('includeSuperseded'), 'recall search must not pass includeSuperseded');
 						return new Response(
 							JSON.stringify({
 								memories: [
-									// In-band revision change on mem_watched_00000002 (superseded)
 									{
 										id: 'mem_watched_00000002',
 										title: 'Rollback guide',
-										content: 'Old rollback steps',
+										content: 'Updated rollback steps',
 										author: { principalId: 'bob' },
+										ownerId: 'bob',
 										scopes: ['global'],
 										revision: 2,
-										status: 'superseded',
-										supersededBy: 'mem_replacement_0005',
+										status: 'active',
 									},
 								],
 							}),
@@ -742,10 +800,15 @@ describe('live change notices: follower SSE stream + in-band revision diffing', 
 			const output = res.hookSpecificOutput?.additionalContext ?? '';
 			assert.ok(output.includes('change="withdrawn"'), 'withdrawn notice from follower event');
 			assert.ok(output.includes('Watched memory "Deploy policy" (mem_watched_00000001) was withdrawn'));
+			assert.ok(output.includes('change="superseded"'), 'superseded notice from follower event');
+			assert.ok(output.includes('Watched memory "Legacy endpoint" (mem_watched_00000006) was superseded'));
 			assert.ok(output.includes('id="mem_own_flagged_0004"'), 'own flagged notice from follower event');
 			assert.ok(output.includes('Your memory mem_own_flagged_0004 was flagged needsReview'));
-			assert.ok(output.includes('change="superseded"'), 'in-band superseded notice');
-			assert.ok(output.includes('supersededBy="mem_replacement_0005"'));
+			assert.ok(
+				output.includes('Your memory "Alice uninjected" (mem_own_watched_0007) was flagged needsReview'),
+				'watched-but-uninjected memory owned by alice must emit an own-flagged notice',
+			);
+			assert.ok(output.includes('change="revised"'), 'in-band revised notice on active memory');
 			assert.ok(
 				!output.includes('mem_uninjected_00003'),
 				'revised event for non-injected memory must not emit a notice',
@@ -770,7 +833,6 @@ describe('live change notices: follower SSE stream + in-band revision diffing', 
 			const { lockFile, eventsFile } = getSessionPaths(config, sessionId);
 			mkdirSync(getSessionPaths(config, sessionId).sessionsDir, { recursive: true });
 
-			// Stale lock takeover check
 			writeFileSync(lockFile, JSON.stringify({ pid: 999999, startedAt: 1, connected: false }), 'utf8');
 			const staleSec = (Date.now() - 10_000) / 1000;
 			utimesSync(lockFile, staleSec, staleSec);
@@ -779,7 +841,6 @@ describe('live change notices: follower SSE stream + in-band revision diffing', 
 			assert.equal(tryAcquireFollowerLock(lockFile, 60), false, 'active lock blocks second follower');
 			rmSync(lockFile, { force: true });
 
-			// Seed watchedIds so watch renewal triggers
 			const state = loadSessionState(config, sessionId);
 			state.watchedIds = ['mem_watch_renew_0001'];
 			saveSessionState(config, sessionId, state);
@@ -799,9 +860,7 @@ describe('live change notices: follower SSE stream + in-band revision diffing', 
 							init.signal.addEventListener('abort', () => {
 								try {
 									controller.close();
-								} catch {
-									// Already closed
-								}
+								} catch {}
 							});
 						},
 					});
@@ -815,7 +874,6 @@ describe('live change notices: follower SSE stream + in-band revision diffing', 
 
 			const loopPromise = runFollowerLoop(config, sessionId, { fetchImpl });
 
-			// Wait until event is written and watch is renewed
 			const deadline = Date.now() + 2000;
 			while (Date.now() < deadline) {
 				if (existsSync(eventsFile) && watchRenewed && isFollowerConnected(config, sessionId)) break;
@@ -947,21 +1005,26 @@ describe('live change notices: follower SSE stream + in-band revision diffing', 
 			saveSessionState(config, sessionId, state);
 
 			const watchCalls = [];
-			const ok = await renewSessionWatches(config, sessionId, async (_url, init) => {
+			const prunedIds = new Set();
+			const watchFetch = async (_url, init) => {
 				const ids = JSON.parse(init.body).ids;
 				watchCalls.push(ids);
 				if (ids.length > 1 || ids[0] === 'mem_deleted_00000002') {
 					return new Response('Not Found', { status: 404 });
 				}
 				return new Response(JSON.stringify({ watched: ids }), { status: 200 });
-			});
+			};
+			const ok = await renewSessionWatches(config, sessionId, watchFetch, undefined, prunedIds);
 			assert.equal(ok, true);
 			assert.equal(watchCalls.length, 3, 'batch call + 2 per-ID fallback calls');
+			assert.equal(prunedIds.has('mem_deleted_00000002'), true, '404 ID is pruned in follower memory');
 			assert.deepEqual(
 				loadSessionState(config, sessionId).watchedIds,
-				['mem_alive_0000000001'],
-				'404 ID is pruned while surviving ID remains watched',
+				['mem_alive_0000000001', 'mem_deleted_00000002'],
+				'state.json remains single-writer (not mutated by follower)',
 			);
+			await renewSessionWatches(config, sessionId, watchFetch, undefined, prunedIds);
+			assert.deepEqual(watchCalls[3], ['mem_alive_0000000001'], 'subsequent renewal skips in-memory pruned ID');
 
 			appendFollowerEvent(eventsFile, { id: 'mem_1', kind: 'revised', revision: 2, ts: 1 });
 			appendFollowerEvent(eventsFile, { id: 'mem_2', kind: 'revised', revision: 3, ts: 2 });
@@ -1077,7 +1140,7 @@ describe('scripts/import-claude-memory.mjs', () => {
 		assert.equal(planWithUser.length, 3, 'excludeTypes: [] (--include-user) includes type:user');
 	});
 
-	it('supports --dry-run, resolves cyclic [[wikilinks]] via two-pass PUT, and supports --delete-migrated', async () => {
+	it('supports --dry-run, resolves cyclic [[wikilinks]] via two-pass PUT, requires --user for Bearer tokens, and supports --delete-migrated and collision-free --archive-dir', async () => {
 		const tmp = makeTempDir();
 		try {
 			const fileA = join(tmp, 'cycle-a.md');
@@ -1110,28 +1173,46 @@ describe('scripts/import-claude-memory.mjs', () => {
 			assert.equal(dryRes.records.length, 2);
 			assert.equal(putCalls.length, 0);
 
-			// Live two-pass import with cycle validation simulating server evidence existence check
+			let bearerErr = '';
+			const bearerNoUser = await runImport(
+				['--url', 'https://memory.example.com', '--token', 'raw-bearer-token', tmp],
+				{},
+				{
+					stdout: () => {},
+					stderr: (msg) => {
+						bearerErr += msg;
+					},
+					fetchImpl: async () => {
+						throw new Error('must not fetch when Bearer user is missing');
+					},
+				},
+			);
+			assert.equal(bearerNoUser.exitCode, 1);
+			assert.ok(bearerErr.includes('Bearer token authentication requires --user'));
+
 			const serverStore = new Map();
+			const mockPutFetch = async (url, init) => {
+				const id = decodeURIComponent(url.split('/Memory/')[1]);
+				const body = JSON.parse(init.body);
+				for (const ev of body.evidence ?? []) {
+					if (ev.kind === 'memory' && !serverStore.has(ev.ref)) {
+						return new Response(JSON.stringify({ code: 'invalid_evidence' }), { status: 400 });
+					}
+				}
+				const prev = serverStore.get(id);
+				const nextRev = prev ? prev.revision + 1 : 1;
+				serverStore.set(id, { ...body, revision: nextRev, ifMatch: init.headers['If-Match'] });
+				putCalls.push({ id, evidenceCount: (body.evidence ?? []).length, ifMatch: init.headers['If-Match'] });
+				return new Response(JSON.stringify({ id, revision: nextRev }), { status: prev ? 200 : 201 });
+			};
+
 			const liveRes = await runImport(
 				['--url', 'https://memory.example.com', '--token', 'Basic YWxpY2U6cGFzcw==', '--delete-migrated', tmp],
 				{},
 				{
 					stdout: () => {},
 					stderr: () => {},
-					fetchImpl: async (url, init) => {
-						const id = decodeURIComponent(url.split('/Memory/')[1]);
-						const body = JSON.parse(init.body);
-						for (const ev of body.evidence ?? []) {
-							if (ev.kind === 'memory' && !serverStore.has(ev.ref)) {
-								return new Response(JSON.stringify({ code: 'invalid_evidence' }), { status: 400 });
-							}
-						}
-						const prev = serverStore.get(id);
-						const nextRev = prev ? prev.revision + 1 : 1;
-						serverStore.set(id, { ...body, revision: nextRev, ifMatch: init.headers['If-Match'] });
-						putCalls.push({ id, evidenceCount: (body.evidence ?? []).length, ifMatch: init.headers['If-Match'] });
-						return new Response(JSON.stringify({ id, revision: nextRev }), { status: prev ? 200 : 201 });
-					},
+					fetchImpl: mockPutFetch,
 				},
 			);
 
@@ -1143,6 +1224,34 @@ describe('scripts/import-claude-memory.mjs', () => {
 			}
 			assert.equal(existsSync(fileA), false, '--delete-migrated removes migrated files');
 			assert.equal(existsSync(fileB), false);
+
+			const archiveDir = join(tmp, 'archived');
+			const repeatedFile = join(tmp, 'repeated.md');
+			for (let run = 1; run <= 3; run += 1) {
+				writeFileSync(
+					repeatedFile,
+					`---\nname: Repeated ${run}\ndescription: run ${run}\ntype: feedback\n---\nBody ${run}.\n`,
+					'utf8',
+				);
+				const archRes = await runImport(
+					[
+						'--url',
+						'https://memory.example.com',
+						'--token',
+						'raw-bearer-token',
+						'--user',
+						'alice',
+						'--archive-dir',
+						archiveDir,
+						repeatedFile,
+					],
+					{},
+					{ stdout: () => {}, stderr: () => {}, fetchImpl: mockPutFetch },
+				);
+				assert.equal(archRes.exitCode, 0);
+			}
+			const archivedFiles = readdirSync(archiveDir);
+			assert.equal(archivedFiles.length, 3, '3 archive runs of recreated file must preserve all 3 copies');
 		} finally {
 			rmSync(tmp, { recursive: true, force: true });
 		}
@@ -1150,7 +1259,7 @@ describe('scripts/import-claude-memory.mjs', () => {
 });
 
 describe('scripts/eval-recall.mjs', () => {
-	it('computes recall@k, hitRate, timeoutRate, and latency percentiles over a JSONL dataset', async () => {
+	it('computes recall@k, hitRate, timeoutRate, and latency percentiles over a JSONL dataset with watch=true by default', async () => {
 		const tmp = makeTempDir();
 		try {
 			const datasetPath = join(tmp, 'queries.jsonl');
@@ -1176,6 +1285,7 @@ describe('scripts/eval-recall.mjs', () => {
 			});
 
 			let outJson = '';
+			const seenUrls = [];
 			const { exitCode, summary } = await runEval(
 				['--dataset', datasetPath, '--k', '2', '--timeout-ms', '50', '--json'],
 				{
@@ -1188,6 +1298,7 @@ describe('scripts/eval-recall.mjs', () => {
 					},
 					stderr: () => {},
 					fetchImpl: async (url) => {
+						seenUrls.push(url);
 						if (url.includes('east')) {
 							return new Response(JSON.stringify({ memories: [{ id: 'mem_1' }, { id: 'mem_2' }] }), { status: 200 });
 						}
@@ -1203,6 +1314,8 @@ describe('scripts/eval-recall.mjs', () => {
 
 			assert.equal(exitCode, 0);
 			const parsed = JSON.parse(outJson);
+			assert.equal(parsed.watch, true, 'watch=true is enabled by default to match handleUserPromptSubmit');
+			assert.ok(seenUrls.every((u) => u.includes('watch=true')));
 			assert.equal(parsed.count, 3);
 			assert.equal(parsed.timeouts, 1);
 			assert.equal(Number(summary.recallAtK.toFixed(2)), 0.33);
