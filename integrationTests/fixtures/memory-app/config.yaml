@@ -8,5 +8,6 @@ jsResource:
 
 '@harperfast/agent-memory':
   package: '@harperfast/agent-memory'
+  mcp: true
   supersession:
     judge: judge-stub

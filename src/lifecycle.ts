@@ -1,6 +1,6 @@
 import { databases, models, transaction } from 'harper';
 import { badRequest, isCallerSafe, memoryError, notFound, type MemoryError } from './errors.ts';
-import { activeDependentIds, CLEARED_REVIEW, flagDependents, forReader } from './provenance.ts';
+import { activeDependentIds, CLEARED_REVIEW, flagDependents, forReader, reviewFlagFor } from './provenance.ts';
 import { assertWritable, canRead, isSuperset, normalizeScopes, type Principal } from './scopes.ts';
 import { DEFAULT_EMBEDDING_MODEL, getSettings } from './settings.ts';
 import { hasSinks, notifySinks } from './sinks.ts';
@@ -41,6 +41,10 @@ export function memoryTable(): any {
 
 export function memoryPinTable(): any {
 	return (databases as any).memory.MemoryPin;
+}
+
+export function memoryWatchTable(): any {
+	return (databases as any).memory.MemoryWatch;
 }
 
 function memoryPinIdFor(principalId: string, memoryId: string): string {
@@ -340,7 +344,7 @@ async function lockRows(Memory: any, ids: Iterable<string>, context: object, lea
  * the resource turns into a response commit whatever had been staged before it. The new context carries the
  * user so Harper's audit log still attributes the write.
  */
-function inOwnTransaction<T>(requestContext: any, operation: (context: object) => Promise<T>): Promise<T> {
+export function inOwnTransaction<T>(requestContext: any, operation: (context: object) => Promise<T>): Promise<T> {
 	const context = { user: requestContext?.user };
 	return transaction(context, () => operation(context)) as Promise<T>;
 }
@@ -656,6 +660,7 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 						...(parsedValidUntil !== undefined && { validUntil: parsedValidUntil }),
 						// A revision is the owner's review: it clears a flag without re-flagging this memory's own citers.
 						...(existing.needsReview && CLEARED_REVIEW),
+						lastEventKind: 'revised',
 						revision: existing.revision + 1,
 						lastEditor: { principalId: principal.id, source: principal.source, revisedAt: new Date().toISOString() },
 					};
@@ -728,6 +733,7 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 						ownerId: principal.id,
 						status: STATUS_ACTIVE,
 						revision: 1,
+						lastEventKind: 'created',
 						evidence,
 						evidenceMemoryIds,
 						supersedes: [...supersedes, ...applied],
@@ -748,7 +754,7 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 				for (const { target, supersededBy } of pointers) {
 					await Memory.patch(
 						target.id,
-						{ status: STATUS_SUPERSEDED, supersededBy, revision: target.revision + 1 },
+						{ status: STATUS_SUPERSEDED, supersededBy, lastEventKind: 'superseded', revision: target.revision + 1 },
 						txn,
 					);
 				}
@@ -882,17 +888,28 @@ export function compareNewest(a: { id: string; createdAt: unknown }, b: { id: st
  * returns to active otherwise. Runs before W is patched, with the targets already locked by the caller; every
  * create that supersedes them takes the same locks. Returns the ids it changed.
  */
-async function reconcileSuperseded(Memory: any, withdrawn: any, context: object): Promise<string[]> {
+async function reconcileSuperseded(Memory: any, withdrawn: any, context: object, now: Date): Promise<string[]> {
 	const changed: string[] = [];
 	for (const targetId of withdrawn.supersedes ?? []) {
 		const target = await Memory.get(targetId, context);
 		if (target?.status !== STATUS_SUPERSEDED) continue;
 		const newest = await newestSuperseder(Memory, targetId, context, withdrawn.id);
 		const next = newest
-			? { status: STATUS_SUPERSEDED, supersededBy: newest.id }
-			: { status: STATUS_ACTIVE, supersededBy: null };
+			? { status: STATUS_SUPERSEDED, supersededBy: newest.id, lastEventKind: 'superseded' }
+			: { status: STATUS_ACTIVE, supersededBy: null, lastEventKind: 'restored' };
 		if (next.status === target.status && next.supersededBy === target.supersededBy) continue;
-		await Memory.patch(targetId, { ...next, revision: target.revision + 1 }, context);
+		// A memory restored to active that also cited the withdrawn memory gets its review flag in the same patch
+		// so its single transition event remains `restored`.
+		const flagPatch =
+			next.status === STATUS_ACTIVE
+				? reviewFlagFor(
+						{ ...target, status: STATUS_ACTIVE },
+						{ id: withdrawn.id, replacementId: withdrawn.supersededBy ?? undefined },
+						'withdrawn',
+						now,
+					)
+				: undefined;
+		await Memory.patch(targetId, { ...next, ...flagPatch, revision: target.revision + 1 }, context);
 		changed.push(targetId);
 	}
 	return changed;
@@ -947,7 +964,7 @@ export async function withdrawMemory(
 			locks.require([...(existing.supersedes ?? []), ...citers]);
 
 			const now = new Date();
-			const restored = await reconcileSuperseded(Memory, existing, txn);
+			const restored = await reconcileSuperseded(Memory, existing, txn, now);
 			// Withdrawal is exempt from assertWritable — locking an owner out of retracting would be worse.
 			// patch, not put: a put would echo @updatedTime back as a caller-supplied value.
 			await Memory.patch(
@@ -956,16 +973,17 @@ export async function withdrawMemory(
 					status: STATUS_WITHDRAWN,
 					withdrawnAt: now,
 					withdrawnReason: reason ?? null,
+					lastEventKind: 'withdrawn',
 					revision: existing.revision + 1,
 				},
 				txn,
 			);
-			// A memory this withdrawal restored can cite it too; the index does not show the restore yet.
+			const restoredSet = new Set(restored);
 			const flagged = await flagDependents(
 				Memory,
 				{ id: existing.id, replacementId: existing.supersededBy ?? undefined },
 				'withdrawn',
-				[...citers, ...restored],
+				citers.filter((citerId) => !restoredSet.has(citerId)),
 				txn,
 				now,
 			);
@@ -1011,6 +1029,7 @@ export async function confirmMemory(
 			{
 				...CLEARED_REVIEW,
 				confirmed: { by: principal.id, at: new Date().toISOString() },
+				lastEventKind: 'revised',
 				revision: existing.revision + 1,
 			},
 			txn,

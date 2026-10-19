@@ -12,6 +12,7 @@ export interface Settings {
 	readonly titleChars: number;
 	readonly contentChars: number;
 	readonly supersession: SupersessionSettings;
+	readonly mcp: boolean;
 }
 
 export const DEFAULT_EMBEDDING_MODEL = 'default';
@@ -25,6 +26,7 @@ let current: Settings = Object.freeze({
 	titleChars: 200,
 	contentChars: 20_000,
 	supersession: DEFAULT_SUPERSESSION,
+	mcp: false,
 });
 
 export function getSettings(): Settings {
@@ -67,12 +69,17 @@ export function parseSettings(options: Record<string, any>): Settings {
 	if (typeof embeddingModel !== 'string' || !embeddingModel) {
 		throw new Error('@harperfast/agent-memory: embeddingModel must be a non-empty string');
 	}
+	const mcp = options.mcp ?? false;
+	if (typeof mcp !== 'boolean') {
+		throw new Error('@harperfast/agent-memory: mcp must be a boolean');
+	}
 	return Object.freeze({
 		urlPath,
 		embeddingModel,
 		titleChars: boundedInteger(options.limits?.titleChars, 200, MAX_TITLE_CHARS, 'limits.titleChars'),
 		contentChars: boundedInteger(options.limits?.contentChars, 20_000, MAX_CONTENT_CHARS, 'limits.contentChars'),
 		supersession: parseSupersession(options.supersession),
+		mcp,
 	});
 }
 

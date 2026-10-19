@@ -94,3 +94,22 @@ export class MismatchProbe extends Resource {
 		}
 	}
 }
+
+// Reproduces the exact request mutations performed by `@harperfast/oauth` `mcp` mode (`withMCPAuth` and
+// `OAuthResource` with `optional: true`) to verify whether they populate `context.user` on Harper core's
+// native `/mcp` endpoint (HarperFast/oauth#279).
+server.http(
+	(request, nextHandler) => {
+		const mode = request.headers?.get?.('x-simulate-oauth-mcp') ?? request.headers?.['x-simulate-oauth-mcp'];
+		if (mode === 'with-mcp-auth') {
+			request._oauthAuth = { valid: true, userId: 'alice', scopes: ['mcp:read', 'mcp:write'] };
+		} else if (mode === 'oauth-resource-string-user') {
+			request._oauthAuth = { valid: true, userId: 'alice', scopes: ['mcp:read', 'mcp:write'] };
+			request.user = 'alice';
+		} else if (mode === 'oauth-hydrated-user') {
+			request.user = { username: 'alice' };
+		}
+		return nextHandler(request);
+	},
+	{ urlPath: '/mcp', runFirst: true },
+);

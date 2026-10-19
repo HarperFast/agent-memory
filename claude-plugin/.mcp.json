@@ -1,0 +1,9 @@
+{
+	"mcpServers": {
+		"agent-memory": {
+			"type": "http",
+			"url": "${AGENT_MEMORY_URL}/mcp",
+			"headersHelper": "node \"${CLAUDE_PLUGIN_ROOT}/bin/headers.mjs\""
+		}
+	}
+}

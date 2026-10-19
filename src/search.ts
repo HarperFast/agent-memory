@@ -1,5 +1,6 @@
 import { logger, models } from 'harper';
 import { badRequest } from './errors.ts';
+import { recordWatches, WATCH_DEFAULT_TTL_SECONDS } from './events.ts';
 import {
 	BOOTSTRAP_PINNED_LIMIT,
 	memoryPinTable,
@@ -61,6 +62,7 @@ export interface SearchParams {
 	limit: number;
 	includeSuperseded: boolean;
 	includeExpired: boolean;
+	watch?: boolean;
 }
 
 function boundedInteger(value: string | null, field: string, fallback: number, max: number): number {
@@ -97,6 +99,7 @@ export function parseSearchParams(params: URLSearchParams): SearchParams {
 		limit: boundedInteger(params.get('limit'), 'limit', SEARCH_DEFAULT_LIMIT, SEARCH_MAX_LIMIT),
 		includeSuperseded: booleanParam(params, 'includeSuperseded'),
 		includeExpired: booleanParam(params, 'includeExpired'),
+		watch: booleanParam(params, 'watch'),
 	};
 }
 
@@ -199,7 +202,16 @@ export async function searchMemories(
 				context,
 			),
 		);
-		return forReader(assertReadable(recent, principal).map(toMemoryView), principal, context, access);
+		const results = await forReader(assertReadable(recent, principal).map(toMemoryView), principal, context, access);
+		if (params.watch) {
+			await recordWatches(
+				results.map((view) => view.id),
+				principal,
+				WATCH_DEFAULT_TTL_SECONDS,
+				context,
+			);
+		}
+		return results;
 	}
 	const laneLimit = Math.min(params.limit * 2, 100);
 	let vector: ArrayLike<number> | undefined;
@@ -257,18 +269,29 @@ export async function searchMemories(
 		context,
 		access,
 	);
-	return views.map((view, index) => ({ ...view, score: ranked[index].score }));
+	const results = views.map((view, index) => ({ ...view, score: ranked[index].score }));
+	if (params.watch) {
+		await recordWatches(
+			results.map((view) => view.id),
+			principal,
+			WATCH_DEFAULT_TTL_SECONDS,
+			context,
+		);
+	}
+	return results;
 }
 
 export interface BootstrapParams {
 	q?: string;
 	budget: number;
+	watch?: boolean;
 }
 
 export function parseBootstrapParams(params: URLSearchParams): BootstrapParams {
 	return {
 		q: optionalQuery(params.get('q')),
 		budget: boundedInteger(params.get('budget'), 'budget', BOOTSTRAP_DEFAULT_BUDGET, BOOTSTRAP_MAX_BUDGET),
+		watch: booleanParam(params, 'watch'),
 	};
 }
 
@@ -366,6 +389,7 @@ export async function bootstrapMemories(params: BootstrapParams, principal: Prin
 						limit: BOOTSTRAP_RELEVANT_LIMIT,
 						includeSuperseded: false,
 						includeExpired: false,
+						watch: false,
 					},
 					principal,
 					context,
@@ -390,6 +414,14 @@ export async function bootstrapMemories(params: BootstrapParams, principal: Prin
 			used += size;
 			memories.push({ ...memory, section });
 		}
+	}
+	if (params.watch) {
+		await recordWatches(
+			memories.map((memory) => memory.id),
+			principal,
+			WATCH_DEFAULT_TTL_SECONDS,
+			context,
+		);
 	}
 	return { memories, budget: params.budget, used };
 }

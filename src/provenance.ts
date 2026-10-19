@@ -31,6 +31,40 @@ export async function activeDependentIds(Memory: any, sourceIds: Iterable<string
 	return [...ids];
 }
 
+export function reviewFlagFor(
+	dependent:
+		| {
+				status?: string;
+				evidenceMemoryIds?: readonly string[];
+				supersedes?: readonly string[];
+				needsReview?: unknown;
+		  }
+		| null
+		| undefined,
+	source: { id: string; replacementId?: string },
+	cause: ReviewCause,
+	now: Date,
+): { needsReview: ReviewFlag; needsReviewSince: Date } | undefined {
+	if (
+		dependent?.status !== STATUS_ACTIVE ||
+		!(dependent.evidenceMemoryIds ?? []).includes(source.id) ||
+		// A memory that supersedes the source replaced it rather than relying on it.
+		(dependent.supersedes ?? []).includes(source.id) ||
+		dependent.needsReview
+	) {
+		return undefined;
+	}
+	return {
+		needsReview: {
+			since: now.toISOString(),
+			cause,
+			sourceId: source.id,
+			...(source.replacementId ? { replacementId: source.replacementId } : {}),
+		},
+		needsReviewSince: now,
+	};
+}
+
 /**
  * The caller found and locked `citerIds` before its first write, adding any the index cannot show yet (rows
  * written in the same transaction). One hop: nothing here flags the citers of a flagged memory.
@@ -43,27 +77,14 @@ export async function flagDependents(
 	context: object,
 	now: Date,
 ): Promise<string[]> {
-	const flag: ReviewFlag = {
-		since: now.toISOString(),
-		cause,
-		sourceId: source.id,
-		...(source.replacementId ? { replacementId: source.replacementId } : {}),
-	};
 	const flagged: string[] = [];
 	for (const dependentId of new Set(citerIds)) {
 		const dependent = await Memory.get(dependentId, context);
-		if (
-			dependent?.status !== STATUS_ACTIVE ||
-			!(dependent.evidenceMemoryIds ?? []).includes(source.id) ||
-			// A memory that supersedes the source replaced it rather than relying on it.
-			(dependent.supersedes ?? []).includes(source.id) ||
-			dependent.needsReview
-		) {
-			continue;
-		}
+		const reviewPatch = reviewFlagFor(dependent, source, cause, now);
+		if (!reviewPatch) continue;
 		await Memory.patch(
 			dependentId,
-			{ needsReview: flag, needsReviewSince: now, revision: dependent.revision + 1 },
+			{ ...reviewPatch, lastEventKind: 'flagged', revision: dependent.revision + 1 },
 			context,
 		);
 		flagged.push(dependentId);

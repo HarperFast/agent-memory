@@ -7,6 +7,7 @@ import {
 	MemoryBootstrapResource,
 	MemoryImportResource,
 	MemoryItemResource,
+	MemoryMcpResource,
 	MemoryResource,
 } from '../dist/resource.js';
 import { applySettings, parseSettings } from '../dist/settings.js';
@@ -25,10 +26,18 @@ beforeEach(() => {
 });
 
 describe('MEMORY_RESOURCES static surface', () => {
-	it('declares static path, static hidden = true, and static REST verbs without loadAsInstance or instance verbs', () => {
+	it('declares static path, static hidden = true on all HTTP resources, and isolates MCP declarations on verb-less MemoryMcpResource', () => {
 		assert.deepEqual(
 			MEMORY_RESOURCES.map((ResourceClass) => ResourceClass.path),
-			['/Memory/*rest', '/Memory/bootstrap', '/Memory/import', '/Memory/:id', '/Memory/:id/:action'],
+			[
+				'/Memory/*rest',
+				'/Memory/bootstrap',
+				'/Memory/import',
+				'/Memory/watch',
+				'/Memory/:id',
+				'/Memory/:id/:action',
+				'/MemoryEvents',
+			],
 		);
 		for (const ResourceClass of MEMORY_RESOURCES) {
 			assert.equal(ResourceClass.hidden, true);
@@ -38,6 +47,20 @@ describe('MEMORY_RESOURCES static surface', () => {
 			assert.equal(Object.hasOwn(ResourceClass.prototype, 'put'), false);
 			assert.equal(Object.hasOwn(ResourceClass.prototype, 'delete'), false);
 			assert.equal(Object.hasOwn(ResourceClass.prototype, 'segments'), false);
+		}
+		assert.equal(MemoryMcpResource.path, '/MemoryMcp');
+		assert.equal(MemoryMcpResource.hidden, false);
+		assert.deepEqual(
+			MemoryMcpResource.mcpTools.map((t) => t.name),
+			['remember', 'revise', 'recall', 'get', 'withdraw', 'pin', 'unpin', 'confirm', 'watch'],
+		);
+		assert.deepEqual(
+			MemoryMcpResource.mcpResources.map((r) => [r.name, r.uriTemplate, r.method, 'read' in r]),
+			[['memory', 'memory:///{id}', 'mcpReadMemory', false]],
+		);
+		for (const verb of ['get', 'post', 'put', 'delete', 'patch', 'subscribe', 'connect']) {
+			assert.equal(Object.hasOwn(MemoryMcpResource, verb), false);
+			assert.equal(Object.hasOwn(MemoryMcpResource.prototype, verb), false);
 		}
 	});
 

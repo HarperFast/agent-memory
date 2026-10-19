@@ -24,7 +24,7 @@ import {
 	WITHDRAW_REASON_MAX_CHARS,
 	withLockPlan,
 } from './lifecycle.ts';
-import { activeDependentIds, CLEARED_REVIEW, flagDependents } from './provenance.ts';
+import { activeDependentIds, CLEARED_REVIEW, flagDependents, reviewFlagFor } from './provenance.ts';
 import { isScopeLabel, MAX_SCOPES_PER_MEMORY, requirePrincipalId, type Principal } from './scopes.ts';
 import { getSettings } from './settings.ts';
 import { hasSinks, notifySinks } from './sinks.ts';
@@ -205,19 +205,41 @@ export async function importMemories(input: unknown, principal: Principal, reque
 						: { status: STATUS_ACTIVE, supersededBy: null };
 				};
 
+				// Rows stored earlier that this batch supersedes (an import that arrived predecessor-first).
+				const changed: string[] = [];
+				const transitions: Array<{ id: string; replacementId: string }> = [];
+				for (const targetId of storedTargetIds) {
+					const target = await Memory.get(targetId, txn);
+					if (!target || target.status === STATUS_WITHDRAWN) continue;
+					const next = await graphState(targetId);
+					if (next.status === target.status && next.supersededBy === target.supersededBy) continue;
+					await Memory.patch(targetId, { ...next, lastEventKind: 'superseded', revision: target.revision + 1 }, txn);
+					changed.push(targetId);
+					if (target.status === STATUS_ACTIVE) transitions.push({ id: targetId, replacementId: next.supersededBy! });
+				}
+
 				for (const row of created) {
 					const state =
 						row.status === STATUS_WITHDRAWN
 							? { status: row.status, supersededBy: row.supersededBy }
 							: await graphState(row.id);
+					let reviewPatch = CLEARED_REVIEW as { needsReview: unknown; needsReviewSince: Date | null };
+					for (const source of transitions) {
+						const flag = reviewFlagFor({ ...row, ...state }, source, 'superseded', now);
+						if (flag) {
+							reviewPatch = flag;
+							break;
+						}
+					}
 					await Memory.put(
 						{
 							...row,
 							...state,
 							embedding: vectors.get(row.id),
 							revision: 1,
+							lastEventKind: 'created',
 							autoSupersedes: [],
-							...CLEARED_REVIEW,
+							...reviewPatch,
 							confirmed: null,
 							author: { principalId: row.ownerId, source: 'import', authoredAt: row.createdAt.toISOString() },
 							lastEditor: null,
@@ -227,26 +249,9 @@ export async function importMemories(input: unknown, principal: Principal, reque
 					);
 				}
 
-				// Rows stored earlier that this batch supersedes (an import that arrived predecessor-first).
-				const changed: string[] = [];
-				const transitions = [];
-				for (const targetId of storedTargetIds) {
-					const target = await Memory.get(targetId, txn);
-					if (!target || target.status === STATUS_WITHDRAWN) continue;
-					const next = await graphState(targetId);
-					if (next.status === target.status && next.supersededBy === target.supersededBy) continue;
-					await Memory.patch(targetId, { ...next, revision: target.revision + 1 }, txn);
-					changed.push(targetId);
-					if (target.status === STATUS_ACTIVE) transitions.push({ id: targetId, replacementId: next.supersededBy! });
-				}
 				// After every target is patched, so a citer this batch also supersedes is no longer active to flag.
 				for (const source of transitions) {
-					// The index does not show this batch's rows inside the transaction, so its citers are named here.
-					const batchCiters = liveCreated
-						.filter((row) => row.evidenceMemoryIds.includes(source.id))
-						.map((row) => row.id);
-					const citerIds = [...citers.get(source.id)!, ...batchCiters];
-					changed.push(...(await flagDependents(Memory, source, 'superseded', citerIds, txn, now)));
+					changed.push(...(await flagDependents(Memory, source, 'superseded', citers.get(source.id)!, txn, now)));
 				}
 
 				// Sinks run once every lock is confirmed, so an attempt the lock plan restarts never reaches one.

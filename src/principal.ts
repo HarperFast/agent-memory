@@ -25,6 +25,10 @@ export function setPrincipalResolver(fn: PrincipalResolver | undefined): void {
 	resolver = fn;
 }
 
+export function hasCustomPrincipalResolver(): boolean {
+	return resolver !== undefined;
+}
+
 function grantRows(): any {
 	return (databases as any).memory.ScopeGrant;
 }

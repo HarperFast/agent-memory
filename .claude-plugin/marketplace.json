@@ -1,0 +1,22 @@
+{
+	"$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+	"name": "agent-memory",
+	"description": "Shared, permissioned, live memory for Claude Code backed by Harper agent-memory",
+	"owner": {
+		"name": "Harper",
+		"url": "https://github.com/HarperFast"
+	},
+	"plugins": [
+		{
+			"name": "agent-memory",
+			"description": "Bootstrap, per-prompt recall, live change notifications, and remote HTTP MCP integration for Harper agent-memory",
+			"version": "0.1.0",
+			"author": {
+				"name": "Harper",
+				"url": "https://github.com/HarperFast"
+			},
+			"source": "./claude-plugin",
+			"category": "productivity"
+		}
+	]
+}

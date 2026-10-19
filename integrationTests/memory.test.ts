@@ -1,10 +1,15 @@
 // Needs `npm run install:fixtures` first: the fixture app loads the packed plugin from its own node_modules.
 import { suite, test, before, after } from 'node:test';
 import { deepStrictEqual, ok, strictEqual } from 'node:assert/strict';
-import { join, dirname } from 'node:path';
+import { spawn } from 'node:child_process';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, dirname, resolve } from 'node:path';
 import { createRequire } from 'node:module';
 import { createHash } from 'node:crypto';
 import { setupHarperWithFixture, teardownHarper, type ContextWithHarper } from '@harperfast/integration-testing';
+import { getSessionPaths } from '../claude-plugin/lib/cache.mjs';
+import { resolveConfig } from '../claude-plugin/lib/config.mjs';
 
 const require = createRequire(import.meta.url);
 const fixturePath = join(import.meta.dirname, 'fixtures', 'memory-app');
@@ -82,7 +87,11 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 				process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT ??
 				join(dirname(require.resolve('harper')), 'bin', 'harper.js'),
 			// Harper otherwise treats a credential-less loopback request as super_user.
-			config: { logging: { stdStreams: true }, authentication: { authorizeLocal: false } },
+			config: {
+				logging: { stdStreams: true },
+				authentication: { authorizeLocal: false },
+				mcp: { application: { mountPath: '/mcp' } },
+			},
 		});
 		await operation({ operation: 'add_role', role: 'member', permission: { super_user: false } });
 		for (const username of ['alice', 'bob', 'carol', 'dave', 'erin']) {
@@ -865,5 +874,899 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 		strictEqual((await call('alice', 'POST', `${id}/scopes`, {})).status, 404);
 		strictEqual((await call('alice', 'POST', `${id}/withdraw`, {})).status, 404);
 		strictEqual((await call('alice', 'POST', `${id}/explode`, {})).status, 404);
+	});
+
+	async function openSSE(user: string, urlPath: string, extraHeaders: Record<string, string> = {}) {
+		const authorization =
+			user === 'admin' ? basic(ctx.harper.admin.username, ctx.harper.admin.password) : basic(user, PASSWORD);
+		const controller = new AbortController();
+		const response = await fetch(`${ctx.harper.httpURL}${urlPath}`, {
+			headers: {
+				Accept: 'text/event-stream',
+				Authorization: authorization,
+				...extraHeaders,
+			},
+			signal: controller.signal,
+		});
+		const events: any[] = [];
+		const waiters: Array<() => void> = [];
+		if (response.ok && response.body) {
+			const reader = response.body.getReader();
+			const decoder = new TextDecoder();
+			let buffer = '';
+			void (async () => {
+				try {
+					while (true) {
+						const { value, done } = await reader.read();
+						if (done) break;
+						buffer += decoder.decode(value, { stream: true });
+						const lines = buffer.split('\n');
+						buffer = lines.pop() ?? '';
+						for (const line of lines) {
+							if (line.startsWith('data:')) {
+								const raw = line.slice(5).trim();
+								if (!raw) continue;
+								try {
+									events.push(JSON.parse(raw));
+									for (const notify of waiters.splice(0)) notify();
+								} catch {
+									// Ignore non-JSON frames.
+								}
+							}
+						}
+					}
+				} catch {
+					// Aborted when test closes SSE stream.
+				}
+			})();
+		}
+		return {
+			status: response.status,
+			events,
+			async waitFor(predicate: (event: any) => boolean, timeoutMs = 10_000): Promise<any> {
+				const deadline = Date.now() + timeoutMs;
+				while (Date.now() < deadline) {
+					const match = events.find(predicate);
+					if (match) return match;
+					await new Promise<void>((resolve) => {
+						const timer = setTimeout(resolve, 100);
+						waiters.push(() => {
+							clearTimeout(timer);
+							resolve();
+						});
+					});
+				}
+				throw new Error(`Timed out waiting for SSE event; received: ${JSON.stringify(events)}`);
+			},
+			close() {
+				controller.abort();
+			},
+		};
+	}
+
+	test('Level 1 SSE subscriptions deliver record-change events without content and enforce read rules at delivery time', async () => {
+		const alicePrivate = await create('alice', 'sse-priv', {
+			title: 'secret',
+			content: 'alice private sse note',
+		});
+		const unauthSub = await openSSE('bob', `/Memory/${alicePrivate.id}`);
+		const missingSub = await openSSE('bob', `/Memory/${'0'.repeat(32)}`);
+		strictEqual(unauthSub.status, 404);
+		strictEqual(missingSub.status, 404);
+		unauthSub.close();
+		missingSub.close();
+
+		const aliceAll = await openSSE('alice', '/Memory/');
+		const bobAll = await openSSE('bob', '/Memory/');
+		const daveAll = await openSSE('dave', '/Memory/');
+		strictEqual(aliceAll.status, 200);
+		strictEqual(bobAll.status, 200);
+		strictEqual(daveAll.status, 200);
+
+		try {
+			const shared = await create('alice', 'sse-shared', {
+				title: 'tern',
+				content: 'tern migration started',
+				visibility: 'shared',
+			});
+			const singleSub = await openSSE('bob', `/Memory/${shared.id}`);
+			strictEqual(singleSub.status, 200);
+
+			try {
+				const createdEvt = await bobAll.waitFor((e) => e.id === shared.id && e.kind === 'created');
+				deepStrictEqual(createdEvt, { id: shared.id, kind: 'created', revision: 1 });
+				ok(!('content' in createdEvt) && !('title' in createdEvt));
+
+				// Revise shared memory -> bob receives revised on both /Memory/ and /Memory/<id>
+				const rev = await call(
+					'alice',
+					'PUT',
+					shared.id,
+					{ title: 'tern', content: 'tern migration updated', visibility: 'shared' },
+					{ 'If-Match': '"1"' },
+				);
+				strictEqual(rev.status, 200);
+				deepStrictEqual(await singleSub.waitFor((e) => e.id === shared.id && e.kind === 'revised'), {
+					id: shared.id,
+					kind: 'revised',
+					revision: 2,
+				});
+
+				// Narrow scope to private -> bob must NOT receive the revision event (mid-subscription revocation)
+				const narrowed = await call(
+					'alice',
+					'PUT',
+					shared.id,
+					{ title: 'tern', content: 'now private to alice', visibility: 'private' },
+					{ 'If-Match': '"2"' },
+				);
+				strictEqual(narrowed.status, 200);
+				deepStrictEqual(await aliceAll.waitFor((e) => e.id === shared.id && e.revision === 3), {
+					id: shared.id,
+					kind: 'revised',
+					revision: 3,
+				});
+
+				// Widen back to shared, cite from bob, supersede, and withdraw superseder to exercise
+				// flagged, superseded, restored, and withdrawn events.
+				strictEqual(
+					(
+						await call(
+							'alice',
+							'PUT',
+							shared.id,
+							{ title: 'tern', content: 'shared again', visibility: 'shared' },
+							{ 'If-Match': '"3"' },
+						)
+					).status,
+					200,
+				);
+				await bobAll.waitFor((e) => e.id === shared.id && e.revision === 4);
+				await singleSub.waitFor((e) => e.id === shared.id && e.revision === 4);
+				ok(!bobAll.events.some((e) => e.id === shared.id && e.revision === 3));
+				ok(!singleSub.events.some((e) => e.id === shared.id && e.revision === 3));
+
+				const citer = await create('bob', 'sse-citer', {
+					title: 'tern plan',
+					content: 'follow tern migration',
+					visibility: 'shared',
+					evidence: [{ kind: 'memory', ref: shared.id }],
+				});
+				const replacement = await create('alice', 'sse-repl', {
+					title: 'tern',
+					content: 'tern migration moved south',
+					visibility: 'shared',
+					supersedes: [shared.id],
+				});
+				deepStrictEqual(await singleSub.waitFor((e) => e.id === shared.id && e.kind === 'superseded'), {
+					id: shared.id,
+					kind: 'superseded',
+					revision: 5,
+				});
+				deepStrictEqual(await bobAll.waitFor((e) => e.id === citer.id && e.kind === 'flagged'), {
+					id: citer.id,
+					kind: 'flagged',
+					revision: 2,
+				});
+
+				// Withdraw shared replacement -> both alice (owner) and bob (label reader) receive withdrawn for replacement,
+				// and restored on shared.id; withdrawing alicePrivate delivers withdrawn to alice only, not bob.
+				strictEqual((await call('alice', 'DELETE', replacement.id, undefined, { 'If-Match': '"1"' })).status, 200);
+				strictEqual((await call('alice', 'DELETE', alicePrivate.id, undefined, { 'If-Match': '"1"' })).status, 200);
+				deepStrictEqual(await aliceAll.waitFor((e) => e.id === replacement.id && e.kind === 'withdrawn'), {
+					id: replacement.id,
+					kind: 'withdrawn',
+					revision: 2,
+				});
+				deepStrictEqual(await aliceAll.waitFor((e) => e.id === alicePrivate.id && e.kind === 'withdrawn'), {
+					id: alicePrivate.id,
+					kind: 'withdrawn',
+					revision: 2,
+				});
+				deepStrictEqual(await bobAll.waitFor((e) => e.id === replacement.id && e.kind === 'withdrawn'), {
+					id: replacement.id,
+					kind: 'withdrawn',
+					revision: 2,
+				});
+				deepStrictEqual(await singleSub.waitFor((e) => e.id === shared.id && e.kind === 'restored'), {
+					id: shared.id,
+					kind: 'restored',
+					revision: 6,
+				});
+
+				// ScopeGrant revocation mid-subscription: dave loses customer:* and no longer receives customer:x events.
+				const cxMem = await create('carol', 'sse-cx', {
+					title: 'cx',
+					content: 'customer x event',
+					scopes: ['customer:x'],
+				});
+				await daveAll.waitFor((e) => e.id === cxMem.id && e.kind === 'created');
+				await operation({ operation: 'delete', database: 'memory', table: 'ScopeGrant', ids: ['user:dave'] });
+				try {
+					strictEqual(
+						(
+							await call(
+								'carol',
+								'PUT',
+								cxMem.id,
+								{ title: 'cx', content: 'after dave grant revoked', scopes: ['customer:x'] },
+								{ 'If-Match': '"1"' },
+							)
+						).status,
+						200,
+					);
+					const marker = await create('alice', 'sse-marker', {
+						title: 'marker',
+						content: 'shared marker after cx update',
+						visibility: 'shared',
+					});
+					await daveAll.waitFor((e) => e.id === marker.id && e.kind === 'created');
+					await bobAll.waitFor((e) => e.id === marker.id && e.kind === 'created');
+					ok(!daveAll.events.some((e) => e.id === cxMem.id && e.revision === 2));
+					ok(!bobAll.events.some((e) => e.id === alicePrivate.id));
+				} finally {
+					await operation({
+						operation: 'upsert',
+						database: 'memory',
+						table: 'ScopeGrant',
+						records: [{ id: 'user:dave', read: ['customer:*'] }],
+					});
+				}
+			} finally {
+				singleSub.close();
+			}
+		} finally {
+			aliceAll.close();
+			bobAll.close();
+			daveAll.close();
+		}
+	});
+
+	test('Level 2 watches: POST /Memory/watch, watch=true on search and bootstrap, and /MemoryEvents stream', async () => {
+		const alicePriv = await create('alice', 'watch-priv', {
+			title: 'secret',
+			content: 'alice private watch target',
+		});
+		const watchUnreadable = await call('bob', 'POST', 'watch', { ids: [alicePriv.id] });
+		const watchMissing = await call('bob', 'POST', 'watch', { ids: ['0'.repeat(32)] });
+		strictEqual(watchUnreadable.status, 404);
+		deepStrictEqual(watchUnreadable.body, watchMissing.body);
+
+		// /MemoryEvents rejects principal in path
+		const withPath = await openSSE('bob', '/MemoryEvents/bob');
+		strictEqual(withPath.status, 404);
+		withPath.close();
+
+		const watchedMem = await create('alice', 'watch-shared-1', {
+			title: 'albatross',
+			content: 'albatross wingspan measurement',
+			visibility: 'shared',
+		});
+		const searchWatched = await create('alice', 'watch-search-target', {
+			title: 'frigatebird',
+			content: 'frigatebird thermal soaring altitude',
+			visibility: 'shared',
+		});
+		const bootWatched = await create('bob', 'watch-boot-target', {
+			title: 'skua',
+			content: 'skua nesting territory',
+			visibility: 'shared',
+		});
+
+		const explicitWatch = await call('bob', 'POST', 'watch', { ids: [watchedMem.id], ttlSeconds: 7200 });
+		strictEqual(explicitWatch.status, 200, JSON.stringify(explicitWatch.body));
+		deepStrictEqual(explicitWatch.body.watched, [watchedMem.id]);
+		const initialExpiry = Date.parse(explicitWatch.body.expiresAt);
+		ok(!Number.isNaN(initialExpiry));
+
+		// A shorter TTL request must not shorten the existing 7200 s watch.
+		const shorterWatch = await call('bob', 'POST', 'watch', { ids: [watchedMem.id], ttlSeconds: 60 });
+		strictEqual(shorterWatch.status, 200);
+		strictEqual(Date.parse(shorterWatch.body.expiresAt), initialExpiry);
+
+		const searchRes = await call('bob', 'GET', '?q=frigatebird&watch=true');
+		strictEqual(searchRes.status, 200);
+		ok(searchRes.body.memories.some((m: any) => m.id === searchWatched.id));
+
+		const bootRes = await call('bob', 'GET', 'bootstrap?q=skua&watch=true');
+		strictEqual(bootRes.status, 200);
+		ok(bootRes.body.memories.some((m: any) => m.id === bootWatched.id));
+
+		// Created after bootstrap?watch=true so bootstrap's recent section does not watch them.
+		const unwatchedMem = await create('alice', 'watch-shared-2', {
+			title: 'petrel',
+			content: 'petrel burrow count',
+			visibility: 'shared',
+		});
+		const bobCiter = await create('bob', 'watch-bob-citer', {
+			title: 'unwatched citer',
+			content: 'cites unwatchedMem so bob gets flagged event even without watching bobCiter',
+			visibility: 'shared',
+			evidence: [{ kind: 'memory', ref: unwatchedMem.id }],
+		});
+
+		const bobEvents = await openSSE('bob', '/MemoryEvents');
+		strictEqual(bobEvents.status, 200);
+		try {
+			// Revise unwatchedMem -> bob should NOT receive it
+			strictEqual(
+				(
+					await call(
+						'alice',
+						'PUT',
+						unwatchedMem.id,
+						{ title: 'petrel', content: 'petrel burrow count updated', visibility: 'shared' },
+						{ 'If-Match': '"1"' },
+					)
+				).status,
+				200,
+			);
+			// Revise watchedMem, searchWatched, bootWatched -> bob receives all three
+			strictEqual(
+				(
+					await call(
+						'alice',
+						'PUT',
+						watchedMem.id,
+						{ title: 'albatross', content: 'albatross updated', visibility: 'shared' },
+						{ 'If-Match': '"1"' },
+					)
+				).status,
+				200,
+			);
+			strictEqual(
+				(
+					await call(
+						'alice',
+						'PUT',
+						searchWatched.id,
+						{ title: 'frigatebird', content: 'frigatebird updated', visibility: 'shared' },
+						{ 'If-Match': '"1"' },
+					)
+				).status,
+				200,
+			);
+			strictEqual(
+				(
+					await call(
+						'bob',
+						'PUT',
+						bootWatched.id,
+						{ title: 'skua', content: 'skua updated', visibility: 'shared' },
+						{ 'If-Match': '"1"' },
+					)
+				).status,
+				200,
+			);
+
+			await bobEvents.waitFor((e) => e.id === watchedMem.id && e.kind === 'revised');
+			await bobEvents.waitFor((e) => e.id === searchWatched.id && e.kind === 'revised');
+			await bobEvents.waitFor((e) => e.id === bootWatched.id && e.kind === 'revised');
+			ok(!bobEvents.events.some((e) => e.id === unwatchedMem.id));
+
+			// Withdraw watchedMem -> bob receives 'withdrawn' for the watched shared memory
+			strictEqual((await call('alice', 'DELETE', watchedMem.id, undefined, { 'If-Match': '"2"' })).status, 200);
+			deepStrictEqual(await bobEvents.waitFor((e) => e.id === watchedMem.id && e.kind === 'withdrawn'), {
+				id: watchedMem.id,
+				kind: 'withdrawn',
+				revision: 3,
+			});
+
+			// Withdraw unwatchedMem -> flags bobCiter (owned by bob), so bob receives flagged on /MemoryEvents
+			strictEqual((await call('alice', 'DELETE', unwatchedMem.id, undefined, { 'If-Match': '"2"' })).status, 200);
+			deepStrictEqual(await bobEvents.waitFor((e) => e.id === bobCiter.id && e.kind === 'flagged'), {
+				id: bobCiter.id,
+				kind: 'flagged',
+				revision: 2,
+			});
+		} finally {
+			bobEvents.close();
+		}
+	});
+
+	async function mcpCall(
+		user: string | null,
+		method: string,
+		params: Record<string, unknown> = {},
+		sessionId?: string,
+		extraHeaders: Record<string, string> = {},
+	) {
+		const headers: Record<string, string> = {
+			'Content-Type': 'application/json',
+			Accept: 'application/json',
+			...extraHeaders,
+		};
+		if (user !== null) {
+			headers.Authorization =
+				user === 'admin' ? basic(ctx.harper.admin.username, ctx.harper.admin.password) : basic(user, PASSWORD);
+		}
+		if (sessionId) {
+			headers['Mcp-Session-Id'] = sessionId;
+			headers['MCP-Protocol-Version'] = '2025-06-18';
+		}
+		const response = await fetch(`${ctx.harper.httpURL}/mcp`, {
+			method: 'POST',
+			headers,
+			body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+		});
+		const text = await response.text();
+		let parsed: any;
+		try {
+			parsed = JSON.parse(text);
+		} catch {
+			parsed = text;
+		}
+		return {
+			status: response.status,
+			sessionId: response.headers.get('mcp-session-id') ?? undefined,
+			body: parsed,
+		};
+	}
+
+	async function initMcpSession(user: string | null, extraHeaders: Record<string, string> = {}) {
+		const init = await mcpCall(
+			user,
+			'initialize',
+			{
+				protocolVersion: '2025-06-18',
+				capabilities: {},
+				clientInfo: { name: 'memory-integration-test', version: '1.0.0' },
+			},
+			undefined,
+			extraHeaders,
+		);
+		strictEqual(init.status, 200, JSON.stringify(init.body));
+		ok(init.sessionId, 'MCP initialize must return Mcp-Session-Id');
+		return init.sessionId!;
+	}
+
+	test('MCP endpoint exposes the 9 memory tools and memory:///{id} resource template, and enforces lifecycle rules', async () => {
+		const aliceSession = await initMcpSession('alice');
+		const bobSession = await initMcpSession('bob');
+
+		const toolsRes = await mcpCall('alice', 'tools/list', {}, aliceSession);
+		strictEqual(toolsRes.status, 200, JSON.stringify(toolsRes.body));
+		const allToolNames: string[] = toolsRes.body.result.tools.map((t: any) => t.name).sort();
+		ok(
+			!allToolNames.some((n) => n.endsWith('_Memory') || n.endsWith('_MemoryEvents') || n.endsWith('_MemoryMcp')),
+			`no generic table/resource tools should be auto-generated for Memory, MemoryEvents, or MemoryMcp: ${JSON.stringify(allToolNames)}`,
+		);
+		const toolNames = allToolNames.filter((n) => n !== 'get_MismatchProbe');
+		deepStrictEqual(
+			toolNames,
+			['confirm', 'get', 'pin', 'recall', 'remember', 'revise', 'unpin', 'watch', 'withdraw'],
+			`unexpected MCP tools: ${JSON.stringify(toolNames)}`,
+		);
+
+		const templatesRes = await mcpCall('alice', 'resources/templates/list', {}, aliceSession);
+		strictEqual(templatesRes.status, 200, JSON.stringify(templatesRes.body));
+		const uris: string[] = templatesRes.body.result.resourceTemplates.map((t: any) => t.uriTemplate);
+		ok(uris.includes('memory:///{id}'), `expected memory:///{id} in resourceTemplates: ${JSON.stringify(uris)}`);
+
+		// remember (create)
+		const rememberId = memId('mcp-rem-1');
+		const rememberRes = await mcpCall(
+			'alice',
+			'tools/call',
+			{
+				name: 'remember',
+				arguments: {
+					id: rememberId,
+					title: 'mcp osprey',
+					content: 'osprey sighted via mcp remember tool',
+					visibility: 'shared',
+				},
+			},
+			aliceSession,
+		);
+		strictEqual(rememberRes.status, 200, JSON.stringify(rememberRes.body));
+		ok(!rememberRes.body.result.isError, JSON.stringify(rememberRes.body));
+		const created = JSON.parse(rememberRes.body.result.content[0].text);
+		strictEqual(created.id, rememberId);
+		strictEqual(created.revision, 1);
+
+		// revise
+		const reviseRes = await mcpCall(
+			'alice',
+			'tools/call',
+			{
+				name: 'revise',
+				arguments: {
+					id: rememberId,
+					revision: 1,
+					title: 'mcp osprey',
+					content: 'osprey sighted twice via mcp revise tool',
+					visibility: 'shared',
+				},
+			},
+			aliceSession,
+		);
+		const revised = JSON.parse(reviseRes.body.result.content[0].text);
+		strictEqual(revised.revision, 2);
+
+		// get & resources/read
+		const getRes = await mcpCall('bob', 'tools/call', { name: 'get', arguments: { id: rememberId } }, bobSession);
+		strictEqual(JSON.parse(getRes.body.result.content[0].text).memory.revision, 2);
+
+		const readRes = await mcpCall('bob', 'resources/read', { uri: `memory:///${rememberId}` }, bobSession);
+		strictEqual(readRes.status, 200, JSON.stringify(readRes.body));
+		strictEqual(JSON.parse(readRes.body.result.contents[0].text).revision, 2);
+
+		// Unreadable memory over MCP get and resources/read
+		const aliceSecretId = memId('mcp-secret');
+		await mcpCall(
+			'alice',
+			'tools/call',
+			{
+				name: 'remember',
+				arguments: { id: aliceSecretId, title: 'secret', content: 'private mcp note', visibility: 'private' },
+			},
+			aliceSession,
+		);
+		const bobGetSecret = await mcpCall(
+			'bob',
+			'tools/call',
+			{ name: 'get', arguments: { id: aliceSecretId } },
+			bobSession,
+		);
+		strictEqual(bobGetSecret.body.result.isError, true);
+		const bobReadSecret = await mcpCall('bob', 'resources/read', { uri: `memory:///${aliceSecretId}` }, bobSession);
+		ok(bobReadSecret.body.error, 'resources/read on unreadable memory must return JSON-RPC error');
+
+		// pin, unpin, watch, recall (with watch: true)
+		const pinRes = await mcpCall('bob', 'tools/call', { name: 'pin', arguments: { id: rememberId } }, bobSession);
+		strictEqual(JSON.parse(pinRes.body.result.content[0].text).pinned, true);
+		const unpinRes = await mcpCall('bob', 'tools/call', { name: 'unpin', arguments: { id: rememberId } }, bobSession);
+		strictEqual(JSON.parse(unpinRes.body.result.content[0].text).pinned, false);
+
+		const watchRes = await mcpCall(
+			'bob',
+			'tools/call',
+			{ name: 'watch', arguments: { ids: [rememberId], ttlSeconds: 120 } },
+			bobSession,
+		);
+		deepStrictEqual(JSON.parse(watchRes.body.result.content[0].text).watched, [rememberId]);
+
+		const recallRes = await mcpCall(
+			'bob',
+			'tools/call',
+			{ name: 'recall', arguments: { q: 'osprey', watch: true } },
+			bobSession,
+		);
+		ok(JSON.parse(recallRes.body.result.content[0].text).memories.some((m: any) => m.id === rememberId));
+
+		// cite, withdraw source -> confirm citer
+		const citerId = memId('mcp-citer');
+		await mcpCall(
+			'bob',
+			'tools/call',
+			{
+				name: 'remember',
+				arguments: {
+					id: citerId,
+					title: 'osprey report',
+					content: 'cites osprey observation',
+					visibility: 'shared',
+					evidence: [{ kind: 'memory', ref: rememberId }],
+				},
+			},
+			bobSession,
+		);
+		const withdrawRes = await mcpCall(
+			'alice',
+			'tools/call',
+			{ name: 'withdraw', arguments: { id: rememberId, revision: 2, reason: 'retracted' } },
+			aliceSession,
+		);
+		strictEqual(JSON.parse(withdrawRes.body.result.content[0].text).memory.status, 'withdrawn');
+
+		const confirmRes = await mcpCall(
+			'bob',
+			'tools/call',
+			{ name: 'confirm', arguments: { id: citerId, revision: 2 } },
+			bobSession,
+		);
+		strictEqual(JSON.parse(confirmRes.body.result.content[0].text).memory.needsReview, null);
+
+		// Verify Harper core gap on resources/subscribe for custom URI scheme (HarperFast/harper#3250)
+		const mcpSse = await openSSE('alice', '/mcp', { 'Mcp-Session-Id': aliceSession });
+		strictEqual(mcpSse.status, 200);
+		try {
+			const subRes = await mcpCall('alice', 'resources/subscribe', { uri: `memory:///${aliceSecretId}` }, aliceSession);
+			strictEqual(subRes.body.error?.code, -32602);
+			ok(
+				String(subRes.body.error?.message).includes('resource is not subscribable'),
+				`unexpected subscribe error: ${JSON.stringify(subRes.body)}`,
+			);
+		} finally {
+			mcpSse.close();
+		}
+	});
+
+	test('verifies @harperfast/oauth MCP composition against Harper core /mcp (HarperFast/oauth#279)', async () => {
+		// Positive control: prove the `server.http` hook runs on `/mcp` and succeeds when it populates a
+		// Harper user object (`{ username: 'alice' }`) on `request.user`.
+		const hydratedHeaders = { 'x-simulate-oauth-mcp': 'oauth-hydrated-user' };
+		const session0 = await initMcpSession(null, hydratedHeaders);
+		const call0 = await mcpCall(
+			null,
+			'tools/call',
+			{ name: 'recall', arguments: { q: 'osprey' } },
+			session0,
+			hydratedHeaders,
+		);
+		strictEqual(call0.body.result.isError, undefined, JSON.stringify(call0.body));
+		ok(Array.isArray(JSON.parse(call0.body.result.content[0].text).memories));
+
+		// 1. `withMCPAuth` sets `request._oauthAuth = { valid: true, userId: 'alice', ... }` and leaves `request.user` undefined.
+		// Harper core's /mcp adapter reads `request.user`, so `context.user` is undefined and tool calls fail auth.
+		const withMcpAuthHeaders = { 'x-simulate-oauth-mcp': 'with-mcp-auth' };
+		const session1 = await initMcpSession(null, withMcpAuthHeaders);
+		const call1 = await mcpCall(
+			null,
+			'tools/call',
+			{ name: 'recall', arguments: { q: 'anything' } },
+			session1,
+			withMcpAuthHeaders,
+		);
+		strictEqual(call1.body.result.isError, true);
+		ok(String(call1.body.result.content[0].text).includes('Authenticated principal required'));
+
+		// 2. `@harperfast/oauth`'s global HTTP hook sets `request.user = payload.username` (a bare string).
+		// Harper core's /mcp passes `userObject: 'alice'` into `context.user`, which fails `resolvePrincipal`
+		// because `resolveHarperUser` requires a user object with `typeof user.username === 'string'`.
+		const oauthHookHeaders = { 'x-simulate-oauth-mcp': 'oauth-resource-string-user' };
+		const session2 = await initMcpSession(null, oauthHookHeaders);
+		const noteId = memId('oauth-hook-note');
+		const call2 = await mcpCall(
+			null,
+			'tools/call',
+			{ name: 'remember', arguments: { id: noteId, title: 'oauth note', content: 'created as alice' } },
+			session2,
+			oauthHookHeaders,
+		);
+		strictEqual(call2.body.result.isError, true);
+		ok(String(call2.body.result.content[0].text).includes('Authenticated principal required'));
+	});
+
+	function execNodeScript(scriptPath: string, args: string[], stdinText: string, env: Record<string, string>) {
+		return new Promise<{ code: number | null; stdout: string; stderr: string }>((resolvePromise, rejectPromise) => {
+			const child = spawn(process.execPath, [scriptPath, ...args], {
+				env: { ...process.env, ...env },
+				stdio: ['pipe', 'pipe', 'pipe'],
+			});
+			let stdout = '';
+			let stderr = '';
+			child.stdout.on('data', (chunk) => {
+				stdout += chunk.toString('utf8');
+			});
+			child.stderr.on('data', (chunk) => {
+				stderr += chunk.toString('utf8');
+			});
+			child.on('error', rejectPromise);
+			child.on('close', (code) => {
+				resolvePromise({ code, stdout, stderr });
+			});
+			if (stdinText) {
+				child.stdin.write(stdinText);
+			}
+			child.stdin.end();
+		});
+	}
+
+	test('claude-plugin hooks, /MemoryEvents follower, import-claude-memory.mjs, and eval-recall.mjs end-to-end', async () => {
+		const repoRoot = resolve(import.meta.dirname, '..');
+		const hookScript = join(repoRoot, 'claude-plugin', 'hooks', 'hook.mjs');
+		const headersScript = join(repoRoot, 'claude-plugin', 'bin', 'headers.mjs');
+		const importScript = join(repoRoot, 'scripts', 'import-claude-memory.mjs');
+		const evalScript = join(repoRoot, 'scripts', 'eval-recall.mjs');
+
+		const tmpDir = mkdtempSync(join(tmpdir(), 'agent-memory-claude-e2e-'));
+		const cacheDir = join(tmpDir, 'cache');
+		const sessionId = 'e2e-claude-session-1';
+		const bobEnv: Record<string, string> = {
+			AGENT_MEMORY_URL: ctx.harper.httpURL,
+			AGENT_MEMORY_TOKEN: basic('bob', PASSWORD),
+			AGENT_MEMORY_USER: 'bob',
+			AGENT_MEMORY_CACHE_DIR: cacheDir,
+			AGENT_MEMORY_HEARTBEAT_MS: '100',
+		};
+		const { lockFile, eventsFile } = getSessionPaths(resolveConfig(bobEnv), sessionId);
+
+		try {
+			const headersRes = await execNodeScript(headersScript, [], '', bobEnv);
+			strictEqual(headersRes.code, 0, headersRes.stderr);
+			const mcpHeaders = JSON.parse(headersRes.stdout);
+			strictEqual(mcpHeaders.Authorization, basic('bob', PASSWORD));
+
+			const bobPinned = await create('bob', 'e2e-bob-pinned', {
+				title: 'Pinned curlew invariant',
+				content: 'curlew telemetry must include ring number',
+			});
+			strictEqual((await call('bob', 'POST', `${bobPinned.id}/pin`, {})).status, 200);
+
+			const aliceShared = await create('alice', 'e2e-alice-shared', {
+				title: 'turnstone tide table',
+				content: 'turnstone foraging peaks two hours before low tide',
+				visibility: 'shared',
+			});
+			const bobCiter = await create('bob', 'e2e-bob-citer', {
+				title: 'turnstone camera setup',
+				content: 'deploy camera two hours before low tide per turnstone table',
+				visibility: 'shared',
+				evidence: [{ kind: 'memory', ref: aliceShared.id }],
+			});
+			await settleIndex('bob', 'turnstone');
+
+			const bootHook = await execNodeScript(
+				hookScript,
+				[],
+				JSON.stringify({ hook_event_name: 'SessionStart', session_id: sessionId, source: 'startup' }),
+				bobEnv,
+			);
+			strictEqual(bootHook.code, 0, bootHook.stderr);
+			const bootOut = JSON.parse(bootHook.stdout);
+			const bootContext: string = bootOut.hookSpecificOutput.additionalContext;
+			ok(bootContext.includes(bobPinned.id), `expected pinned memory in bootstrap context: ${bootContext}`);
+			ok(bootContext.includes('author="bob"'));
+			ok(bootContext.includes('scopes="user:bob"'));
+			ok(bootContext.includes('needsReview="false"'));
+
+			let followerConnected = false;
+			const lockDeadline = Date.now() + 3000;
+			while (Date.now() < lockDeadline) {
+				if (existsSync(lockFile)) {
+					try {
+						const lockData = JSON.parse(readFileSync(lockFile, 'utf8'));
+						if (lockData.connected) {
+							followerConnected = true;
+							break;
+						}
+					} catch {}
+				}
+				await new Promise((r) => setTimeout(r, 40));
+			}
+			ok(followerConnected, `expected follower to connect and write lockFile ${lockFile}`);
+
+			const recallHook1 = await execNodeScript(
+				hookScript,
+				[],
+				JSON.stringify({
+					hook_event_name: 'UserPromptSubmit',
+					session_id: sessionId,
+					prompt: 'turnstone foraging low tide',
+				}),
+				bobEnv,
+			);
+			strictEqual(recallHook1.code, 0, recallHook1.stderr);
+			const recallOut1 = JSON.parse(recallHook1.stdout);
+			const recallContext1: string = recallOut1.hookSpecificOutput?.additionalContext ?? '';
+			if (!bootContext.includes(aliceShared.id)) {
+				ok(recallContext1.includes(aliceShared.id), `expected ${aliceShared.id} in recall output`);
+			}
+
+			const recallHookDup = await execNodeScript(
+				hookScript,
+				[],
+				JSON.stringify({
+					hook_event_name: 'UserPromptSubmit',
+					session_id: sessionId,
+					prompt: 'turnstone foraging low tide',
+				}),
+				bobEnv,
+			);
+			strictEqual(recallHookDup.code, 0);
+			strictEqual(recallHookDup.stdout.trim(), '{}', 'already-injected memories must not be re-injected');
+
+			strictEqual((await call('alice', 'DELETE', aliceShared.id, undefined, { 'If-Match': '"1"' })).status, 200);
+
+			let eventsArrived = false;
+			const eventDeadline = Date.now() + 3000;
+			while (Date.now() < eventDeadline) {
+				if (existsSync(eventsFile)) {
+					const content = readFileSync(eventsFile, 'utf8');
+					if (content.includes(aliceShared.id) && content.includes(bobCiter.id)) {
+						eventsArrived = true;
+						break;
+					}
+				}
+				await new Promise((r) => setTimeout(r, 40));
+			}
+			ok(eventsArrived, `expected follower events for ${aliceShared.id} and ${bobCiter.id} in ${eventsFile}`);
+
+			const noticeHook = await execNodeScript(
+				hookScript,
+				[],
+				JSON.stringify({
+					hook_event_name: 'UserPromptSubmit',
+					session_id: sessionId,
+					prompt: 'unrelated query xyz123',
+				}),
+				bobEnv,
+			);
+			strictEqual(noticeHook.code, 0, noticeHook.stderr);
+			const noticeContext: string = JSON.parse(noticeHook.stdout).hookSpecificOutput?.additionalContext ?? '';
+			ok(
+				noticeContext.includes(`id="${aliceShared.id}" change="withdrawn"`),
+				`expected withdrawn notice for ${aliceShared.id}: ${noticeContext}`,
+			);
+			ok(
+				noticeContext.includes(`id="${bobCiter.id}" change="flagged"`),
+				`expected flagged notice for ${bobCiter.id}: ${noticeContext}`,
+			);
+
+			const memDir = join(tmpDir, 'claude-memory');
+			mkdirSync(memDir, { recursive: true });
+			writeFileSync(join(memDir, 'MEMORY.md'), '# Index\n- [Redshank](redshank.md)\n- [Greenshank](greenshank.md)\n');
+			writeFileSync(
+				join(memDir, 'redshank.md'),
+				[
+					'---',
+					'name: Redshank protocol',
+					'description: Redshank banding rule referencing [[Greenshank reference]]',
+					'type: feedback',
+					'---',
+					'Always band redshanks on the right tibia.',
+					'',
+					'**Why:** Left tibia bands interfere with salt-gland sensor tags.',
+					'**How to apply:** Check sensor placement before banding.',
+				].join('\n'),
+			);
+			writeFileSync(
+				join(memDir, 'greenshank.md'),
+				[
+					'---',
+					'name: Greenshank reference',
+					'description: Greenshank estuary coordinates',
+					'type: reference',
+					'---',
+					'Greenshank roost is at sector 7G.',
+				].join('\n'),
+			);
+
+			const importRes = await execNodeScript(importScript, ['--json', memDir], '', bobEnv);
+			strictEqual(importRes.code, 0, importRes.stderr);
+			const imported = JSON.parse(importRes.stdout);
+			strictEqual(imported.count, 2, 'MEMORY.md index must be skipped');
+
+			const redshankRec = imported.records.find((r: any) => r.name === 'Redshank protocol');
+			const greenshankRec = imported.records.find((r: any) => r.name === 'Greenshank reference');
+			ok(redshankRec && greenshankRec);
+
+			const storedRedshank = (await call('bob', 'GET', redshankRec.id)).body.memory;
+			strictEqual(storedRedshank.ownerId, 'bob');
+			deepStrictEqual(storedRedshank.scopes, ['user:bob']);
+			deepStrictEqual(storedRedshank.tags, ['type:feedback']);
+			ok(storedRedshank.content.includes('**Why:** Left tibia bands interfere'));
+			ok(storedRedshank.content.includes('**How to apply:** Check sensor placement'));
+			deepStrictEqual(storedRedshank.evidenceMemoryIds, [greenshankRec.id]);
+
+			await settleIndex('bob', 'redshank');
+
+			const datasetFile = join(tmpDir, 'eval.jsonl');
+			writeFileSync(
+				datasetFile,
+				[
+					JSON.stringify({ prompt: 'redshank banding right tibia sensor', expectedIds: [redshankRec.id] }),
+					JSON.stringify({ prompt: 'greenshank estuary roost sector 7G', expectedIds: [greenshankRec.id] }),
+				].join('\n'),
+			);
+			const evalRes = await execNodeScript(evalScript, ['--dataset', datasetFile, '--k', '5', '--json'], '', bobEnv);
+			strictEqual(evalRes.code, 0, evalRes.stderr);
+			const evalSummary = JSON.parse(evalRes.stdout);
+			strictEqual(evalSummary.count, 2);
+			strictEqual(evalSummary.recallAtK, 1);
+			strictEqual(evalSummary.timeouts, 0);
+			ok(typeof evalSummary.latencyMs.p50 === 'number');
+		} finally {
+			await execNodeScript(
+				hookScript,
+				[],
+				JSON.stringify({ hook_event_name: 'SessionEnd', session_id: sessionId }),
+				bobEnv,
+			).catch(() => {});
+			await new Promise((r) => setTimeout(r, 150));
+			rmSync(tmpDir, { recursive: true, force: true });
+		}
 	});
 });

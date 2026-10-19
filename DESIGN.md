@@ -28,12 +28,13 @@ allowlists, idempotent `PUT` create/revise with `If-Match` revision precondition
 
 ## Implementation status
 
-| Area                                                                                                             | v0 core                                           |
-| ---------------------------------------------------------------------------------------------------------------- | ------------------------------------------------- |
-| Lifecycle, scopes and grants, supersede and restore, hybrid search, bootstrap, import, sinks, principal resolver | implemented (`src/`)                              |
-| Write-time supersession candidates, the judge and auto mode (`supersession.*` options)                           | implemented (`src/supersession.ts`)               |
-| Provenance review flags (`needsReview`, `confirm`)                                                               | implemented (`src/provenance.ts`)                 |
-| Live updates (subscriptions, `MemoryWatch`, `/MemoryEvents`)                                                     | not yet; the `MemoryWatch` table is declared only |
+| Area                                                                                                             | v0 core                             |
+| ---------------------------------------------------------------------------------------------------------------- | ----------------------------------- |
+| Lifecycle, scopes and grants, supersede and restore, hybrid search, bootstrap, import, sinks, principal resolver | implemented (`src/`)                |
+| Write-time supersession candidates, the judge and auto mode (`supersession.*` options)                           | implemented (`src/supersession.ts`) |
+| Provenance review flags (`needsReview`, `confirm`)                                                               | implemented (`src/provenance.ts`)   |
+| Live updates (Level 1 subscriptions, Level 2 `MemoryWatch` and `/MemoryEvents`)                                  | implemented (`src/events.ts`)       |
+| MCP tools and `memory:///{id}` resource (`mcp` option)                                                           | implemented (`src/mcp.ts`)          |
 
 ## Data model
 
@@ -53,19 +54,27 @@ See `schema/memory.graphql`. The table is not `@export`ed: every read and write 
 
 Server-owned fields: `ownerId`, `status`, `revision`, `author`, `lastEditor`, `supersededBy`,
 `autoSupersedes`, `evidenceMemoryIds`, `needsReview`, `needsReviewSince`, `confirmed`, `createdAt`,
-`embeddingModel`. `createdAt` is set by the lifecycle rather than `@createdTime`, because Harper's
+`embeddingModel`, `lastEventKind`. `createdAt` is set by the lifecycle rather than `@createdTime`, because Harper's
 `@createdTime` overwrites a supplied value on insert and import must preserve it. `updatedAt` stays
 `@updatedTime`. `needsReviewSince` mirrors `needsReview.since` because Harper does not index object
-values; it is never in a view. Rows written before a field existed read it as absent, which every
-reader treats as null.
+values; `lastEventKind` records the lifecycle event kind (`created`, `revised`, `superseded`, `withdrawn`,
+`restored`, `flagged`) on each write so real-time subscribers receive the exact transition. Neither
+`needsReviewSince` nor `lastEventKind` is ever in a view. Rows written before a field existed read it as
+absent, which every reader treats as null.
 
 ## Identity
 
 The principal is the Harper user on the request context (`context.user.username`). The plugin does no
 authentication of its own and has no credential tables.
 
-- Interactive MCP clients (Claude Code, desktop, claude.ai connectors) authenticate with OAuth 2.1
-  through `@harperfast/oauth` `mcp` mode, which resolves to a Harper user.
+- Interactive MCP clients (Claude Code, desktop, claude.ai connectors): intended to authenticate with
+  OAuth 2.1 through `@harperfast/oauth` `mcp` mode (`withMCPAuth`), which does not yet populate a Harper
+  user object on `context.user` for Harper core's `/mcp` endpoint (`withMCPAuth` only attaches its
+  middleware to `server.http` so `request.user` stays `undefined` on `/mcp`, and `@harperfast/oauth`'s
+  session-cookie hook sets `request.user` to a username string rather than `{ username, role }`, so
+  `resolvePrincipal` rejects with `401 principal_required`; see
+  [HarperFast/oauth#279](https://github.com/HarperFast/oauth/issues/279)). Until that lands, MCP clients
+  against `/mcp` authenticate with Harper credentials or a host-app middleware / principal resolver.
 - Headless agents use Harper credentials bound to a user (operation tokens, or a host-app API key that
   resolves to a user).
 - An app with its own principal registry (harper-eye's `AgentPrincipal`) can install a resolver with
@@ -270,18 +279,25 @@ one of its supports changing.
 
 ## HTTP surface
 
-Mounted at `urlPath` (default `Memory`); hidden from MCP and OpenAPI auto-export until the MCP task.
+Mounted at `urlPath` (default `Memory`, with the per-caller watch stream at `<urlPath>Events`, default
+`MemoryEvents`); every HTTP route class stays `hidden = true`, while `MemoryMcpResource` (registered at
+`MemoryMcp` with `static path = '/MemoryMcp'`, no prototype CRUD methods, and `MemoryEndpoint`'s static
+verb and `connect` overrides so direct HTTP, SSE, or WebSocket requests to `/MemoryMcp` return `405`) is
+mounted with `hidden = false` only when the plugin option `mcp` is `true` (default `false`).
 
-| Route                                                                   | Purpose                                                                                                  |
-| ----------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
-| `PUT /Memory/<id>`                                                      | create (`201 { id, revision, candidates }`), idempotent retry (`200`), or revise with `If-Match` (`200`) |
-| `GET /Memory/<id>`                                                      | read (`{ memory }` + `ETag: "<revision>"`)                                                               |
-| `DELETE /Memory/<id>?reason=`                                           | withdraw with `If-Match: "<revision>"` (tombstone, returns `{ memory }`)                                 |
-| `GET /Memory/?q=&tag=&scope=&limit=&includeSuperseded=&includeExpired=` | search (no `q`: newest first)                                                                            |
-| `GET /Memory/bootstrap?q=&budget=`                                      | session-start context                                                                                    |
-| `POST /Memory/<id>/pin` · `/unpin`                                      | per-reader pin / unpin (empty or `{}` body)                                                              |
-| `POST /Memory/<id>/confirm`                                             | owner's review: clears `needsReview`, records `confirmed` (returns `{ memory }`)                         |
-| `POST /Memory/import`                                                   | bulk import (`super_user`)                                                                               |
+| Route                                                                          | Purpose                                                                                                  |
+| ------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------- |
+| `PUT /Memory/<id>`                                                             | create (`201 { id, revision, candidates }`), idempotent retry (`200`), or revise with `If-Match` (`200`) |
+| `GET /Memory/<id>`                                                             | read (`{ memory }` + `ETag: "<revision>"`)                                                               |
+| `DELETE /Memory/<id>?reason=`                                                  | withdraw with `If-Match: "<revision>"` (tombstone, returns `{ memory }`)                                 |
+| `GET /Memory/?q=&tag=&scope=&limit=&includeSuperseded=&includeExpired=&watch=` | search (no `q`: newest first; `watch=true` watches every returned id)                                    |
+| `GET /Memory/bootstrap?q=&budget=&watch=`                                      | session-start context (`watch=true` watches every returned id)                                           |
+| `POST /Memory/<id>/pin` · `/unpin`                                             | per-reader pin / unpin (empty or `{}` body)                                                              |
+| `POST /Memory/<id>/confirm`                                                    | owner's review: clears `needsReview`, records `confirmed` (returns `{ memory }`)                         |
+| `POST /Memory/watch`                                                           | watch readable memories (`{ ids, ttlSeconds? }` → `{ watched, expiresAt }`)                              |
+| `GET /Memory` · `/Memory/<id>` (SSE / WebSocket)                               | Level 1 record-change subscription (`{ id, kind, revision }`)                                            |
+| `GET /MemoryEvents` (SSE / WebSocket)                                          | Level 2 per-caller watch and `needsReview` event stream (`{ id, kind, revision }`)                       |
+| `POST /Memory/import`                                                          | bulk import (`super_user`)                                                                               |
 
 Errors are `{ error, code }` (plus `index` for an import row). Only errors the plugin creates carry
 their own message; anything else is a 500 `internal_error`. Harper's retryable failures — 503 (an index
@@ -294,14 +310,15 @@ lease, since a batch writes up to 100 rows and flags their citers inside one tra
 
 ## Search and bootstrap
 
-- `GET /Memory/?q=&tag=&scope=&limit=&includeSuperseded=&includeExpired=` — hybrid: HNSW over
+- `GET /Memory/?q=&tag=&scope=&limit=&includeSuperseded=&includeExpired=&watch=` — hybrid: HNSW over
   `embedding` (query embedded with the same model) and the `@fullText` index, fused with reciprocal
   rank fusion (k = 60, `2 × limit` per lane). If embedding the query string fails, search and bootstrap
   fall back to the full-text lane and log a rate-limited warning. Both lanes carry the status, expiry (`validUntil` null
   or `> now` unless `includeExpired=true`) and readable-scope conditions. `scope=` narrows within the
   readable set; it never widens it. Results include `supersededBy` when `includeSuperseded` is set,
   and `needsReview` under the Provenance visibility rule; withdrawn memories never appear. The vector lane has no distance cutoff, so it contributes the
-  nearest readable memories whatever their distance.
+  nearest readable memories whatever their distance. Passing `watch=true` records a `MemoryWatch` (with
+  the default 1 h TTL) for every memory id returned in the result.
 - **Searchable at commit**: both indexes are Harper derived indexes maintained after commit (`audit:
 true` puts `@embed`'s HNSW index on the native plane). Each lane passes `waitForIndexMilliseconds`,
   so a search covers every write committed before it began; an index that is already current does not
@@ -317,31 +334,95 @@ true` puts `@embed`'s HNSW index on the native plane). Each lane passes `waitFor
   skips (and logs) vectors of another size, and rejects a query vector of another size. Search then
   serves the full-text lane alone and logs the rejection once per mismatch episode for that model. Switching dimensions needs a
   re-embedding migration, which v0 does not provide.
-- `GET /Memory/bootstrap?q=&budget=` — the caller's pinned memories (up to 50 `MemoryPin` rows for
+- `GET /Memory/bootstrap?q=&budget=&watch=` — the caller's pinned memories (up to 50 `MemoryPin` rows for
   `principal.id`, newest pin first, whose target memory is active, unexpired and readable by the caller), then the caller's own
   memories that need review (section `needsReview`: up to 20 the caller may see, newest flag first,
   through the indexed `needsReviewSince`, from at most the 100 newest flags, so hidden flags cannot make a
   bootstrap scan without bound), then the caller's recent
   memories, then memories relevant to `q`, deduplicated and packed into a character budget (title +
   content; default 8000). Expired memories (`validUntil <= now`) are excluded from every section.
-  A memory that does not fit is skipped rather than ending the pack. Used at session start.
+  A memory that does not fit is skipped rather than ending the pack. Passing `watch=true` records a
+  `MemoryWatch` (default 1 h TTL) for every memory id returned across all sections. Used at session start.
 - Ranking may add recency decay and retrieval/citation counts later; decay is a ranking function only,
   never deletion.
 
 ## Live updates
 
-Three levels, built in order (none in the v0 core):
+Three levels, built in order:
 
-1. **Record changes**: the `Memory` resource supports Harper subscriptions (WebSocket, SSE, MQTT).
-   Each event is checked against the subscriber's read rule before delivery. Event kinds: `created`,
-   `revised`, `superseded`, `withdrawn`, `restored`.
-2. **Watches**: `POST /Memory/watch { ids, ttlSeconds }` (and `watch=true` on search, which watches
-   every returned id) records a `MemoryWatch`. A change to a watched memory is delivered on the
-   principal's event stream, `/MemoryEvents/<principal>`, and as an MCP
-   `notifications/resources/updated` for `memory://<id>`. Watches expire with their task.
-   The notification fires when "a memory you relied on changed", not on every write.
+1. **Record changes**: `Memory` (`/Memory` and `/Memory/<id>`) supports Harper real-time subscriptions
+   over WebSocket and SSE (`Accept: text/event-stream`). Every event is checked against the subscriber's
+   read rule (`canRead`) at delivery time: `ScopeGrant` rows and custom principal resolver results are
+   cached for up to 5 s and invalidated via the worker hub's `ScopeGrant` subscription, so a scope
+   narrowing or grant revocation revokes visibility mid-subscription; Harper user role assignments on
+   `context.user` are captured when the connection opens and take effect on reconnect. For `withdrawn`,
+   read access checks the memory's scope labels ignoring `status = withdrawn` (matching Provenance), so
+   label readers and watchers learn that a shared memory they could read was withdrawn (`GET /Memory/<id>`
+   still returns 404 to non-owners). Events carry `{ id, kind, revision }` — never content — with `kind`
+   one of `created`, `revised`, `superseded`, `withdrawn`, `restored`, or `flagged` (`needsReview` set),
+   so a reader re-reads through the guarded `GET`. Subscriptions are live-only (`omitCurrent: true`) with
+   at-most-once delivery and no replay across disconnects; if Harper core re-emits existing rows on a
+   table reload (`copyApply`, `harper-pro#495`) beyond the per-connection 1,024-entry deduplication
+   window, rows may replay their stored `lastEventKind`, which clients handle idempotently by comparing
+   `revision`. If a slow subscriber accumulates more than 256 undrained events in its client buffer (or
+   its filter stalls for 30 s with 256 pending events), or if the worker's `Memory`, `MemoryWatch`, or
+   `ScopeGrant` subscription ends, active streams close so the client reconnects and re-reads watched ids
+   (comparing `revision`) or re-bootstraps (`watch=true`) to catch up.
+2. **Watches**: `POST /Memory/watch { ids, ttlSeconds? }` (1–100 ids; `ttlSeconds` integer in
+   `1..86400`, default 3600) and `watch=true` on search and bootstrap record `MemoryWatch` rows
+   (`<principalId>:<memoryId>`, `expiresAt @expiresAt`), keeping whichever `expiresAt` is later when a
+   watch already exists and returning the earliest effective `expiresAt` across the watched ids. Each
+   worker indexes active watches per principal in memory (lazily pruning expired entries on lookup and
+   sweeping expired entries whenever a principal's bucket reaches 4,096 watches). `POST /Memory/watch`
+   requires read access on every requested id and rejects unreadable ids with the same 404
+   (`memory_not_found`) as missing ones before writing any watch. A per-caller event stream at
+   `/MemoryEvents` (`<urlPath>Events` when `urlPath` is customized; identity comes from `context`, with no
+   principal in the path — `/MemoryEvents/<principal>` returns 404) delivers `{ id, kind, revision }` over
+   SSE or WebSocket whenever:
+   - a memory with an unexpired `MemoryWatch` for the caller changes and passes the caller's delivery-time
+     read check, or
+   - one of the caller's own memories (`ownerId === principal.id`) is flagged `needsReview`
+     (`kind: 'flagged'`, or `restored` / `created` with a newly folded `needsReview` flag visible to the
+     caller). The notification fires when "a memory you relied on changed, or your own memory needs
+     review", not on every write.
+   - **MCP resource subscriptions (`resources/subscribe`)**: Harper core's `resources/subscribe` handler
+     (`subscribeToResource` in `components/mcp/resources.ts`) only accepts `harper+rest://` and `http(s)://`
+     URIs and rejects custom `mcpResources` URI schemes such as `memory:///{id}` with
+     `-32602 resource is not subscribable: memory:///{id}`. Per design we do not patch Harper core: the
+     needed core hook is filed at [HarperFast/harper#3250](https://github.com/HarperFast/harper/issues/3250),
+     and MCP clients should subscribe to `/MemoryEvents` (calling the `watch` tool or `recall` with
+     `watch: true`) instead.
 3. **Standing queries**: notify when a new memory would now rank in a result a session already used.
    Depends on core post-commit derived-index delivery (harper#2489). Not in v0.
+
+## MCP surface
+
+Behind the plugin option `mcp` (`boolean`, default `false`), `handleApplication` mounts `MemoryMcpResource`
+(`static path = '/MemoryMcp'`, `static hidden = false`, extending `MemoryEndpoint` with no prototype CRUD
+methods) to expose MCP tools and a resource template on Harper's native `/mcp` endpoint (`src/mcp.ts`),
+each delegating to the same lifecycle, search, and watch functions and enforcing the same permission checks
+as REST:
+
+- **`static mcpTools`**:
+  - `remember` — create a memory (`PUT`; generates a UUID when `id` is omitted, or idempotently retries an
+    identical create).
+  - `revise` — revise an existing memory (`PUT` with required `revision` mapped to `If-Match: "<revision>"`).
+  - `recall` — hybrid search (`q`, `tags`/`tag`, `scopes`/`scope`, `limit`, `includeSuperseded`,
+    `includeExpired`, and optional `watch: true` to watch every returned id).
+  - `get` — fetch a single memory by `id` (`{ memory }`, or 404 if missing/unreadable).
+  - `withdraw` — withdraw an owned memory (`DELETE` with required `revision` and optional `reason`).
+  - `pin` / `unpin` — pin or unpin a memory for session bootstrap.
+  - `confirm` — clear `needsReview` on an owned memory and record `confirmed` (optional `revision` mapped
+    to `If-Match`).
+  - `watch` — watch `1..100` readable memory ids (`{ ids, ttlSeconds? }` → `{ watched, expiresAt }`).
+- **`static mcpResources`**: `uriTemplate: 'memory:///{id}'` (`mimeType: 'application/json'`,
+  `method: 'mcpReadMemory'`), whose read calls `getMemory` and returns the guarded memory view (or
+  `undefined` when missing/unreadable, which Harper's MCP layer surfaces as a JSON-RPC read error).
+- Tool and resource handlers are bound on `MemoryMcpResource.prototype` under `mcp*` method names
+  (`mcpRemember`, `mcpRevise`, `mcpRecall`, `mcpGet`, `mcpWithdraw`, `mcpPin`, `mcpUnpin`, `mcpConfirm`,
+  `mcpWatch`, `mcpReadMemory`), while every HTTP route class stays `hidden = true`, so neither Harper's
+  MCP discovery nor OpenAPI export auto-generates generic REST verb tools or unguarded `harper+rest://`
+  templates alongside the explicit surface.
 
 ## Extension points
 
@@ -358,13 +439,13 @@ Three levels, built in order (none in the v0 core):
   `PUT` retry calls no sink. harper-eye uses it for the interim Reflex source-row handoff until memory is a
   Reflex lane.
 - `setPrincipalResolver(fn)` — see Identity.
-- Options (`config.yaml` under the plugin's key): `urlPath`, `embeddingModel` (default `default`),
-  `limits.{contentChars, titleChars}` (default 20000 / 200), and `supersession.{mode, similarity,
-judge}` (`off | suggest | auto`, default `suggest`; 0.82; none; `auto` without `judge` is rejected as
-  malformed). The plugin's table embedder embeds with the model recorded on the row. A changed option is checked for well-formedness before it applies; a
-  malformed change is logged and the previous configuration keeps serving (model compatibility is not
-  checked — see "One vector space"). Changing `urlPath` mounts the new path and
-  removes the old one if the plugin still owns it.
+- Options (`config.yaml` under the plugin's key): `urlPath`, `mcp` (default `false`), `embeddingModel`
+  (default `default`), `limits.{contentChars, titleChars}` (default 20000 / 200), and
+  `supersession.{mode, similarity, judge}` (`off | suggest | auto`, default `suggest`; 0.82; none; `auto`
+  without `judge` is rejected as malformed). The plugin's table embedder embeds with the model recorded on
+  the row. A changed option is checked for well-formedness before it applies; a malformed change is logged
+  and the previous configuration keeps serving (model compatibility is not checked — see "One vector
+  space"). Changing `urlPath` mounts the new path and removes the old one if the plugin still owns it.
 
 ## Import
 
@@ -392,6 +473,107 @@ conflict }] }`; an invalid row fails the batch with 400 and its `index`.
 
 The first source is the team's Flair instance: agent id → Harper username via a mapping file; Flair
 `private` → `user:<owner>`, shared → `global`; `supersedes` and `validTo` carried over.
+
+## Claude Code plugin
+
+`claude-plugin/` (published at the repository root via `.claude-plugin/marketplace.json`) integrates
+`agent-memory` into Claude Code without adding harness-specific routes to the Harper server:
+
+- **Remote HTTP MCP (`claude-plugin/.mcp.json`, `claude-plugin/bin/headers.mjs`)**: `.mcp.json` declares
+  Harper's native Streamable HTTP endpoint directly (`"type": "http"`, `"url": "${AGENT_MEMORY_URL}/mcp"`,
+  `"headersHelper": "node \"${CLAUDE_PLUGIN_ROOT}/bin/headers.mjs\""`) rather than wrapping REST calls in a
+  local `stdio` proxy.
+  - _Trade-off_: pointing directly at `/mcp` keeps a single tool schema source of truth on the server
+    (`remember`, `revise`, `recall`, `get`, `withdraw`, `pin`, `unpin`, `confirm`, `watch`) and authenticates
+    each request with the caller's Harper-user-bound credential (`Bearer` or `Basic`) read by `headersHelper`
+    from `process.env` or `~/.config/agent-memory/env`, so `AGENT_MEMORY_TOKEN` is never exported to
+    `CLAUDE_ENV_FILE` where model `Bash` commands could read it. In exchange, the host Harper app must enable
+    `mcp: true`, and `AGENT_MEMORY_URL` must be present in the process environment (or Claude Code's
+    `settings.json` `env` block) at startup because Claude Code expands `${AGENT_MEMORY_URL}` in `.mcp.json`
+    before `SessionStart` hooks run. When `AGENT_MEMORY_URL` is found only in `~/.config/agent-memory/env`,
+    `SessionStart` injects a configuration notice reminding the user to export it in their shell or settings.
+- **Bootstrap hook (`SessionStart`: `startup`, `resume`, `compact`)**: calls
+  `GET /Memory/bootstrap?budget=<chars>&watch=true` (default budget `4000` characters via
+  `AGENT_MEMORY_BOOTSTRAP_BUDGET`, timeout `3000` ms via `AGENT_MEMORY_BOOTSTRAP_TIMEOUT_MS`), formats
+  returned memories within the character budget (counting wrapper overhead and skipping oversized records to
+  continue checking smaller ones), records `injectedIds`, `watchedIds`, and per-id `{ revision, status,
+needsReview, author, ownerId, scopes }` for all watched and injected memories in atomic per-session state
+  (`state.json` written via temp-file + `rename`), and updates the local read-through cache
+  (`bootstrap-cache.json`). `startup` and `compact` reset `injectedIds` so bootstrap context is
+  re-established; `resume` preserves `injectedIds`.
+- **Recall hook (`UserPromptSubmit`)**: truncates the submitted prompt to `QUERY_MAX_CHARS` (`1000`
+  characters) and calls `GET /Memory/?q=<prompt>&limit=<k>&watch=true` (`k` defaults to `5` via
+  `AGENT_MEMORY_RECALL_LIMIT`, bounding per-prompt `MemoryWatch` upserts to `<= k` active hits; local RocksDB
+  `eval-recall.mjs` benchmark with `watch=true`: `p50 ~ 4-8 ms`, `p95 ~ 10-18 ms`) under a single shared
+  `AbortSignal` deadline (default `1500` ms via `AGENT_MEMORY_RECALL_TIMEOUT_MS`, clamped to `<= 2000` ms and
+  backed by a `3` s command timeout in `hooks.json`). Only active (`status === 'active'`) memories not yet in
+  `state.injectedIds` are injected as recalled records within `AGENT_MEMORY_RECALL_BUDGET` (default `2000`
+  characters). On timeout, network error, or server error, or when `state.json` is corrupt, the hook skips
+  recall and always exits `0` (`hook.mjs` installs top-level `uncaughtException`, `unhandledRejection`, and
+  `EPIPE` guards and calls `process.exit(0)` after flushing stdout). Setting `AGENT_MEMORY_RECALL=off` skips
+  the per-prompt network search when users do not want prompts sent in query strings or to the server's
+  embedding provider, while still draining `<session>.events.jsonl` to surface pending live change notices.
+- **Live changes (`/MemoryEvents` follower + in-band revision diffing)**:
+  - _Trade-off vs. `GET /Memory/changes?since=<ts>`_: combining a per-session `/MemoryEvents` SSE follower
+    with in-band revision diffing consumes PR #9's existing server surface with zero new server routes or
+    timestamp change-log indexes, delivering `withdrawn`, `superseded`, `revised`, and `flagged` events in
+    real time via `/MemoryEvents` (with in-band recall diffing as a fallback for `revised` and `flagged` on
+    active memories) without adding a second per-prompt HTTP round-trip on the `UserPromptSubmit` latency path.
+  - `SessionStart` unlinks any prior `.stop` sentinel, garbage-collects inactive sessions as a unit only when
+    all of their session files (`state.json`, `events.jsonl`, `follower.lock`, `.stop`) are older than
+    `AGENT_MEMORY_CACHE_MAX_AGE_MS` (default `24` hours; endpoint-directory GC only inspects 16-hex plugin
+    directories containing plugin files and removes empty directories with non-recursive `rmdirSync`), and
+    spawns a detached per-session follower (`claude-plugin/lib/follower.mjs`, `stdio: 'ignore'`, `unref()`).
+    The follower acquires `<session>.follower.lock` with `O_EXCL` (taking over locks whose heartbeat `mtime`
+    is older than `3 * AGENT_MEMORY_HEARTBEAT_MS`), verifies lock ownership (`pid` and `startedAt`) before
+    every heartbeat and on exit, connects to `GET /MemoryEvents` (`Accept: text/event-stream`) with jittered
+    reconnect, appends incoming `{ id, kind, revision, ts }` frames to `<session>.events.jsonl` (`O_APPEND`),
+    and periodically renews `POST /Memory/watch` for active watched IDs in batches of `<= 100` before the
+    3600 s watch TTL expires (falling back to per-ID watch requests, tracking pruned `404` / withdrawn /
+    superseded IDs in memory so `state.json` remains single-writer from hooks only, and applying exponential
+    backoff on renewal failures). `SessionEnd` writes `<session>.stop` so the follower aborts any active
+    stream or backoff timer and exits cleanly.
+  - On `UserPromptSubmit`, the hook drains `<session>.events.jsonl` from `state.eventsOffset` using bounded
+    byte-offset reads (`openSync`/`readSync`, resetting to offset `0` if the file was truncated or recreated)
+    and compares `revision`, `status`, and `needsReview` on memories returned by recall against
+    `state.revisions`. When an injected memory (`injectedIds`) is `superseded`, `revised`, `withdrawn`, or
+    `flagged` (`needsReview`), or when one of the caller's own memories is `flagged` (which `/MemoryEvents`
+    delivers to the owner), the hook emits an attributed `[memory-change-<nonce> ...]` notice built directly
+    from `state.revisions` and the event payload, requiring zero extra per-notice `GET /Memory/<id>` calls.
+    Notices are marked notified in `state.notifiedRevisions` only after they fit within the turn's character
+    budget; any overflow notices are persisted in `state.pendingNotices` for subsequent turns.
+- **Untrusted-data injection format (`claude-plugin/lib/format.mjs`)**: every injected memory and change
+  notice carries `id`, `author` (`author.principalId`, plus `lastEditor` when different), `scopes`,
+  `revision`, and `needsReview` (`"true"` or `"false"`) inside a per-call random nonced wrapper
+  (`<agent-memory-data-<nonce> role="stored-data" notice="...">...</agent-memory-data-<nonce>>` and
+  `[memory-<nonce> ...]...[/memory-<nonce>]`). Attribute values escape quotes, brackets, angle brackets, and
+  newlines, and any occurrence of the nonce or tag names in memory bodies is scrubbed so stored content
+  cannot break out of the data block or masquerade as instructions.
+- **Read-through offline cache (`bootstrap-cache.json`)**: stores only `pinned` (`section === 'pinned'`) and
+  private (`user:*`) memories from the last successful `/Memory/bootstrap` snapshot authoritatively under
+  `AGENT_MEMORY_CACHE_DIR` (`0700` dir, `0600` file, bounded by `AGENT_MEMORY_CACHE_MAX_AGE_MS`, default `24`
+  hours), excluding unpinned shared/team-scoped (`global`, `team:*`, `project:*`) bootstrap memories and
+  evicting any memory IDs that later transition to `withdrawn` or `superseded`. Pinned shared memories remain
+  in the user-only (`0600`) cache up to `24` hours so offline bootstrap preserves explicit user pins unless
+  evicted by live events or purged immediately on `401`/`403`. Used only when `/Memory/bootstrap` fails due to
+  network unreachability, timeout, or `5xx`, prepending a `[STALE CACHE ...]` notice.
+- **Routing skill & CLI utilities**:
+  - `claude-plugin/skills/memory-routing/SKILL.md`: routes team-relevant findings, decisions, and shared
+    lessons to `agent-memory` while keeping machine-specific paths, worktree state, and personal workflow
+    preferences in Claude's native file memory (`~/.claude/projects/.../memory/`), enforcing a strict
+    single-home rule.
+  - `scripts/import-claude-memory.mjs`: migrates selected native Claude memory Markdown files into
+    `agent-memory` with `--dry-run`, skipping `user`-type personal profile files by default (`--include-user`
+    to opt in), deriving per-principal deterministic ids (`cm_<sha256(principalKey:name)[:32]>`, matching
+    `^[A-Za-z0-9_-]{16,64}$`; requires `--user` or `AGENT_MEMORY_USER` when authenticating with a `Bearer`
+    token so derived IDs remain stable across token rotation), mapping frontmatter `type` to `type:<type>`
+    tags, preserving `Why`/`How to apply` lines in `content`, defaulting scope to `user:<self>`, and
+    converting `[[name]]` wikilinks to `{ kind: 'memory', ref }` evidence via a two-pass `PUT /Memory/<id>`
+    write (`If-Match` on pass 2 when forward/cyclic links exist).
+  - `scripts/eval-recall.mjs`: evaluates a JSONL dataset of `{ prompt, expectedIds }` against the recall
+    hook's exact search query (`GET /Memory/?q=<prompt>&limit=<k>&watch=true` by default; `--no-watch` to opt
+    out), reporting `recall@k`, hit rate, timeout rate, and full-response latency percentiles (`min`, `p50`,
+    `p95`, `max`, `mean` ms).
 
 ## Not in v0
 
