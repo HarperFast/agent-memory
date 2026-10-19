@@ -111,3 +111,50 @@ npm test                    # build + unit tests (in-memory harper stub)
 npm run install:fixtures    # pack the plugin into the integration fixture app
 npm run test:integration    # boots Harper with the fixture and exercises the HTTP surface
 ```
+
+## Import
+
+`scripts/import-flair.mjs` copies memories from a [Flair](https://github.com/tpsdev-ai/flair) instance
+into an app running this plugin, through `POST /Memory/import`. Run it from a checkout (Node 22+); it
+has no dependencies and is not part of the published package. Mapping rules: [DESIGN.md](DESIGN.md#import).
+
+```sh
+# 1. Preview: counts and ids only, nothing sent to the target
+FLAIR_ADMIN_PASS=… node scripts/import-flair.mjs --flair https://flair.example.com \
+  --snapshot flair-memories.jsonl --principal-map principals.json --dry-run
+
+# 2. Import from the frozen snapshot
+AGENT_MEMORY_USER=… AGENT_MEMORY_PASS=… node scripts/import-flair.mjs \
+  --from-jsonl flair-memories.jsonl --principal-map principals.json --target https://app.example.com
+```
+
+| Option                    | Meaning                                                                                                       |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `--flair <url>`           | Read every memory live from Flair (`GET /Memory/` as the Flair admin)                                         |
+| `--snapshot <file>`       | With `--flair`: also write the rows read to a new JSONL file (mode 0600, never overwritten)                   |
+| `--from-jsonl <file>`     | Read raw Flair Memory rows, one per line (a `--snapshot` file, or `memories.jsonl` from a Flair REM snapshot) |
+| `--principal-map <file>`  | JSON object mapping Flair agent ids to Harper usernames: `{ "flair-agent": "harper-user" }`                   |
+| `--target <url>`          | Base URL of the app; rows go to `<url>/Memory/import`                                                         |
+| `--dry-run`               | Print the mapping summary and stop                                                                            |
+| `--batch-size <n>`        | Rows per request, 1–100 (default 100)                                                                         |
+| `--max-content-chars <n>` | Content length limit, 1–100000 (default 20000; match the target's `limits.contentChars`)                      |
+
+Credentials come only from the environment: `FLAIR_ADMIN_USER` (default `admin`) and `FLAIR_ADMIN_PASS`
+for Flair, `AGENT_MEMORY_USER` and `AGENT_MEMORY_PASS` (a `super_user`) for the target. URLs must be
+`https` (plain `http` only for loopback hosts) and must not embed credentials.
+
+The summary (JSON on stdout) counts rows by owner, scope and status, and lists what was skipped
+(unmapped agents, ephemeral rows, rows outside content/tag limits), `supersedes` links that were dropped (`missing`, `skipped`, `self`,
+`cycle`, or `narrowing` when the replacement would hide the old memory from some of its readers), and
+Flair visibility values other than `private`/`shared` (imported as `global`). It never contains memory
+content. The whole export is held in memory while it is mapped.
+Before importing, check that the principals who read shared Flair memories hold `global` read in the
+target.
+
+A failed batch stops the run; earlier batches stay committed. Re-run the same command from the same
+snapshot and principal map: rows already imported come back `unchanged`, and a row that was edited in
+the target since comes back `conflict` and is left alone. A live `--flair` re-run reads Flair again, so
+rows changed in Flair since the first run also come back `conflict`; import from a snapshot to avoid that.
+Do not edit imported memories in the target until the import has finished. The result lists conflicted
+rows (`conflicts`) and the rows superseded by one of them (`dependsOnConflict`); check those
+by hand.

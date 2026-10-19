@@ -1,0 +1,14 @@
+{"id":"m01","agentId":"agent-ann","content":"SECRET-m01 first draft","visibility":"private","durability":"standard","tags":["deploy"],"createdAt":"2026-01-01T00:00:00.000Z","validTo":"2026-01-02T00:00:00.000Z","embedding":[0.1,0.2,0.3],"retrievalCount":4,"provenance":"{\"v\":1}"}
+{"id":"m02","agentId":"agent-ann","content":"SECRET-m02 second draft","visibility":"shared","durability":"persistent","createdAt":"2026-01-02T00:00:00.000Z","supersedes":"m01","validTo":"2026-01-03T00:00:00.000Z"}
+{"id":"m03","agentId":"agent-bob","content":"SECRET-m03 final","createdAt":"2026-01-03T00:00:00.000Z","supersedes":"m02"}
+{"id":"m04","agentId":"agent-bob","content":"SECRET-m04 points at a memory not in the export","visibility":"private","createdAt":"2026-01-04T00:00:00.000Z","supersedes":"gone"}
+{"id":"m05","agentId":"agent-ghost","content":"SECRET-m05 unmapped agent","visibility":"shared","createdAt":"2026-01-05T00:00:00.000Z"}
+{"id":"m06","agentId":"agent-ann","content":"SECRET-m06 supersedes a skipped memory","visibility":"private","createdAt":"2026-01-06T00:00:00.000Z","supersedes":"m05"}
+{"id":"m07","agentId":"agent-bob","content":"SECRET-m07 working state","visibility":"private","durability":"ephemeral","createdAt":"2026-01-07T00:00:00.000Z","expiresAt":"2999-01-01T00:00:00.000Z"}
+{"id":"m08","agentId":"agent-ann","content":"SECRET-m08 archived replacement","visibility":"shared","createdAt":"2026-01-09T00:00:00.000Z","supersedes":"m09","archived":true,"archivedAt":"2026-02-01T00:00:00.000Z"}
+{"id":"m09","agentId":"agent-ann","content":"SECRET-m09 still current","visibility":"shared","createdAt":"2026-01-08T00:00:00.000Z"}
+{"id":"m10","agentId":"agent-bob","content":"SECRET-m10 legacy tier","visibility":"office","createdAt":"2026-01-10T00:00:00.000Z"}
+{"id":"m11","agentId":"agent-ann","content":"SECRET-m11 cycle","createdAt":"2026-01-11T00:00:00.000Z","supersedes":"m12"}
+{"id":"m12","agentId":"agent-ann","content":"SECRET-m12 cycle","createdAt":"2026-01-12T00:00:00.000Z","supersedes":"m11"}
+{"id":"m13","agentId":"agent-ann","content":"SECRET-m13 narrows m10","visibility":"private","createdAt":"2026-01-13T00:00:00.000Z","supersedes":"m10"}
+
