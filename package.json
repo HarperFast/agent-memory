@@ -25,6 +25,7 @@
 		"format:write": "prettier --write ."
 	},
 	"devDependencies": {
+		"@anthropic-ai/sdk": "^0.135.0",
 		"@harperfast/integration-testing": "1.0.5",
 		"@types/node": "^22.0.0",
 		"harper": "^5.3.1",
