@@ -1236,10 +1236,7 @@ function linkRefusal(
 	);
 }
 
-/**
- * The replacement may itself be superseded, so a chain found in history can be linked newest first; that is why a
- * link, unlike a create, has to refuse closing a cycle.
- */
+/** The replacement may itself be superseded, so a chain found in history can be linked newest first. */
 export async function linkSupersedes(id: unknown, input: unknown, principal: Principal, requestContext: object = {}) {
 	const payload = rejectUnknownFields(input, LINK_FIELDS, 'supersedes');
 	if (!isMemoryId(id)) throw notFound();

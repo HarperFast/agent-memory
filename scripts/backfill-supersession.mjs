@@ -41,7 +41,6 @@ const JUDGE_SCHEMA = {
 	additionalProperties: false,
 };
 
-/** Identifies the text a judge saw, so apply can refuse a pair whose memories changed since. */
 export function fingerprint(memory) {
 	return createHash('sha256')
 		.update(`${memory.title ?? ''}\n${memory.content}`)
@@ -232,7 +231,6 @@ async function buildReport({ request, backend, target, model, concurrency, stder
 
 const isDate = (value) => typeof value === 'string' && Number.isFinite(Date.parse(value));
 
-/** Every pair is checked before the first write, so a malformed edit applies nothing. */
 export function parseDecisions(value) {
 	if (value?.format !== REPORT_FORMAT || value.version !== REPORT_VERSION || !Array.isArray(value.pairs)) {
 		throw new Error(`decisions file is not a version ${REPORT_VERSION} ${REPORT_FORMAT} report`);
@@ -276,7 +274,6 @@ async function applyDecisions({ request, pairs, stderr }) {
 		if (result.status === 404) return { missing: true };
 		return result.status === 200 ? { memory: result.json.memory } : { failure: result };
 	};
-	// The judge saw a specific text on each side; anything else is not what the operator approved.
 	const check = async (pair) => {
 		const newer = await read(pair.newId);
 		const older = await read(pair.oldId);

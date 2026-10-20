@@ -80,13 +80,20 @@ describe('claude backend', () => {
 			'ok',
 			`process.stdout.write(JSON.stringify({ type: 'result', is_error: false, result: 'x', structured_output: { verdict: 'supersedes' } }));`,
 		);
-		const env = { ...process.env, AGENT_MEMORY_PASS: 'target-secret', FLAIR_ADMIN_PASS: 'source-secret', KEEP_ME: '1' };
+		const env = {
+			...process.env,
+			AGENT_MEMORY_PASS: 'target-secret',
+			FLAIR_ADMIN_PASS: 'source-secret',
+			ANTHROPIC_API_KEY: 'api-key',
+			KEEP_ME: '1',
+		};
 		assert.deepEqual(await complete(cli, { model: 'haiku', env }), { verdict: 'supersedes' });
 		assert.equal(await readFile(`${cli}.stdin`, 'utf8'), PROMPT);
 		const { argv, cwd, env: childEnv } = JSON.parse(await readFile(`${cli}.argv`, 'utf8'));
 		assert.equal(cwd, tmpdir());
 		assert.ok(childEnv.includes('KEEP_ME'));
 		assert.ok(!childEnv.some((name) => name.startsWith('AGENT_MEMORY_') || name.startsWith('FLAIR_')));
+		assert.ok(!childEnv.includes('ANTHROPIC_API_KEY'), 'the claude judge uses the CLI login, not the API key');
 		assert.ok(!argv.some((arg) => arg.includes('SECRET')), 'the prompt never appears in argv');
 		for (const flag of ['-p', '--safe-mode', '--strict-mcp-config', '--no-session-persistence']) {
 			assert.ok(argv.includes(flag), flag);
@@ -120,8 +127,8 @@ describe('claude backend', () => {
 		assert.equal(await failure(complete(join(dir, 'missing'))), 'cli_not_found');
 	});
 
-	it('survives a CLI that exits before reading the prompt', async () => {
-		const cli = await fakeCli('early-exit', `process.exit(0);`, { readStdin: false });
+	it('reports the exit status of a CLI that exits before reading the prompt', async () => {
+		const cli = await fakeCli('early-exit', `process.exit(4);`, { readStdin: false });
 		const code = await failure(
 			createModelBackend('claude', { command: cli }).complete({
 				system: 'Judge.',
@@ -129,7 +136,9 @@ describe('claude backend', () => {
 				schema: SCHEMA,
 			}),
 		);
-		assert.ok(['cli_stdin_closed', 'cli_invalid_output'].includes(code), code);
+		assert.equal(code, 'cli_exit_4');
+		const killed = await fakeCli('killed', `process.kill(process.pid, 'SIGKILL');`, { readStdin: false });
+		assert.equal(await failure(complete(killed)), 'cli_signal_SIGKILL');
 	});
 
 	// These fakes act before reading stdin, and the deadlines leave seconds for a slow start on a loaded machine: a

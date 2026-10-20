@@ -314,14 +314,14 @@ AGENT_MEMORY_USER=… AGENT_MEMORY_PASS=… node scripts/backfill-supersession.m
   --target https://app.example.com --apply backfill-decisions.json
 ```
 
-| Option              | Meaning                                                                                      |
-| ------------------- | -------------------------------------------------------------------------------------------- |
-| `--target <url>`    | Base URL of the app                                                                          |
-| `--report <file>`   | Write the judged pairs to this new file (never overwritten)                                  |
-| `--apply <file>`    | Link the approved `supersedes` pairs of an edited report                                     |
-| `--judge <backend>` | `claude` (default: the local Claude Code CLI, your login), `anthropic` (`ANTHROPIC_API_KEY`) |
-| `--model <id>`      | Model for the judge (default: the CLI's own default; `claude-opus-5-5` for `anthropic`)      |
-| `--concurrency <n>` | Judge calls in flight, 1–16 (default 4)                                                      |
+| Option              | Meaning                                                                                                          |
+| ------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `--target <url>`    | Base URL of the app                                                                                              |
+| `--report <file>`   | Write the judged pairs to this new file (never overwritten)                                                      |
+| `--apply <file>`    | Link the approved `supersedes` pairs of an edited report                                                         |
+| `--judge <backend>` | `claude` (default: the local Claude Code CLI on your login, never an API key), `anthropic` (`ANTHROPIC_API_KEY`) |
+| `--model <id>`      | Model for the judge (default: the CLI's own default; `claude-opus-5-5` for `anthropic`)                          |
+| `--concurrency <n>` | Judge calls in flight, 1–16 (default 4)                                                                          |
 
 The report lists, per pair, both ids and titles, the similarity, the verdict and a one-sentence
 rationale, but no memory content; stdout and stderr carry only ids, counts and codes. Apply skips a pair

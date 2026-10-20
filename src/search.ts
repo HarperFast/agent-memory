@@ -136,14 +136,15 @@ export function parseSearchParams(params: URLSearchParams): SearchParams {
 	return parsed;
 }
 
-/** Memories before (`less_than`) or after (`greater_than`) `position` in `createdAt`-then-id order. */
+const EARLIEST = new Date(-8.64e15);
+
 export function createdOrderConditions(
 	comparator: 'less_than' | 'greater_than',
 	position: CreatedPosition,
 ): Condition[] {
 	const { createdAt, id } = position;
 	return [
-		// A plain range on `createdAt`, so Harper scans the index from the cursor; an `or` at the top cannot drive it.
+		// A plain range on `createdAt` first, so Harper can scan its index from the cursor; an `or` cannot drive a scan.
 		{ attribute: 'createdAt', comparator: `${comparator}_equal`, value: createdAt },
 		{
 			operator: 'or',
@@ -252,9 +253,15 @@ export async function searchMemories(
 			Memory.search(
 				params.order === 'created'
 					? {
-							conditions: params.after
-								? [...conditions, ...createdOrderConditions('greater_than', params.after)]
-								: conditions,
+							// The createdAt range leads and the planner may not reorder it, so the index drives the scan and a
+							// page reads about `limit` rows (plus the rest of one same-timestamp group, sorted by id).
+							conditions: [
+								...(params.after
+									? createdOrderConditions('greater_than', params.after)
+									: [{ attribute: 'createdAt', comparator: 'greater_than_equal', value: EARLIEST }]),
+								...conditions,
+							],
+							enforceExecutionOrder: true,
 							sort: { attribute: 'createdAt', next: { attribute: 'id' } },
 							select: VIEW_FIELDS,
 							limit: params.limit,

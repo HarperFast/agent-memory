@@ -450,11 +450,14 @@ lease, since a batch writes up to 100 rows and flags their citers inside one tra
   the default 1 h TTL) for every memory id returned in the result.
 - `GET /Memory/?order=created&after=<createdAt>,<id>&limit=` — without `q`, lists oldest first by `createdAt`, then
   id, under the same status, expiry, tag, scope and readable-set conditions as a search. `after` is the last
-  row of the previous page (`createdAt` as ISO, then id). The query carries a plain `createdAt >= t`, which lets
-  Harper scan the `createdAt` index from the cursor (an `or` at the top of the conditions cannot drive the
-  scan, so each page would cost the rows before it), and the tie-break `createdAt > t or id > lastId` as a
-  filter. Every page holds exactly `limit` rows even when an import batch shares one timestamp, and nothing
-  is skipped or repeated. A memory created during a walk with an earlier `createdAt` (an import preserving
+  row of the previous page (`createdAt` as ISO, then id). The query leads with a plain `createdAt >= t` (a floor
+  date on the first page) and sets `enforceExecutionOrder`, so Harper scans the `createdAt` index from the
+  cursor whatever the other conditions estimate; the tie-break `createdAt > t or id > lastId` and the usual
+  conditions filter that scan. Every page holds exactly `limit` rows even when an import batch shares one
+  timestamp, and nothing is skipped or repeated. A page inside a group of rows sharing one `createdAt` still
+  reads and sorts that group by id. Measured on Harper 5.3 (one node, local): walking 5,000 memories that
+  include a 2,000-row same-timestamp group took 101 pages at limit 50, 3 ms p50, 13 ms p95 and 27 ms at worst
+  (inside the group); 484 ms in all. A memory created during a walk with an earlier `createdAt` (an import preserving
   its source time) lands behind the cursor; walk again to see it. `order` with `q`, or `after` without
   `order=created`, is 400. Neither condition uses `equals` on `createdAt`: Harper 5.3's count estimate for
   `equals` on a Date attribute throws.
@@ -731,7 +734,8 @@ detection into a one-off, reviewed cleanup of history that arrived without its l
 - **Judges** (`scripts/lib/model-backend.mjs`, written for the import classifier too): `claude` (default)
   runs the local Claude Code CLI with `--safe-mode` (no CLAUDE.md, hooks, plugins or MCP servers; managed
   policy hooks still run), the prompt on stdin, JSON-schema output, and an environment without the scripts'
-  own `AGENT_MEMORY_*` and `FLAIR_*` credentials; `anthropic` calls the Messages API with
+  own `AGENT_MEMORY_*` and `FLAIR_*` credentials or `ANTHROPIC_API_KEY` (so it always runs on the operator's CLI
+  login); `anthropic` calls the Messages API with
   structured output and server-side fallbacks, keyed only from `ANTHROPIC_API_KEY`; `stub` decides by a
   marker in the newer memory (tests). Failures surface as codes, never the prompt or reply.
 - **Output**: stdout and stderr carry ids, counts and codes only.
