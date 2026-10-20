@@ -1,0 +1,16 @@
+{"id":"c01","agentId":"agent-ann","content":"SECRET-c01 Zentrix Labs cluster zx-prod-3 stalled on compaction; raising compaction threads fixed it.","visibility":"shared","tags":["rocksdb"],"createdAt":"2026-03-01T00:00:00.000Z"}
+{"id":"c02","agentId":"agent-ann","content":"SECRET-c02 Replication catches up after a restart once the subscription resumes from its last txn id.","visibility":"shared","createdAt":"2026-03-02T00:00:00.000Z"}
+{"id":"c03","agentId":"agent-ann","content":"SECRET-c03 private note about Zentrix Labs on-call rotation.","visibility":"private","createdAt":"2026-03-03T00:00:00.000Z"}
+{"id":"c04","agentId":"agent-bob","content":"SECRET-c04 Orbweaver Freight saw 502s from lb1.orbweaver.example until the proxy timeout was raised.","visibility":"shared","createdAt":"2026-03-04T00:00:00.000Z"}
+{"id":"c05","agentId":"agent-bob","content":"SECRET-c05 FAIL-CLASSIFIER the classifier errors on this one.","createdAt":"2026-03-05T00:00:00.000Z"}
+{"id":"c06","agentId":"agent-bob","content":"SECRET-c06 GARBLED the classifier answers outside its schema.","visibility":"shared","createdAt":"2026-03-06T00:00:00.000Z"}
+{"id":"c07","agentId":"agent-ann","content":"SECRET-c07 LEAKY-LESSON Zentrix Labs index rebuild took six hours on 10.1.2.3.","visibility":"shared","createdAt":"2026-03-07T00:00:00.000Z"}
+{"id":"c08","agentId":"agent-ann","content":"SECRET-c08 STICKY-LESSON Orbweaver Freight blob uploads failed above 2 GB.","visibility":"shared","createdAt":"2026-03-08T00:00:00.000Z"}
+{"id":"c09","agentId":"agent-ann","content":"SECRET-c09 Zentrix Labs first write-up of the cache stampede.","visibility":"shared","createdAt":"2026-03-09T00:00:00.000Z"}
+{"id":"c10","agentId":"agent-ann","content":"SECRET-c10 Zentrix Labs final write-up of the cache stampede: add jitter to sourcedFrom expiry.","visibility":"shared","createdAt":"2026-03-10T00:00:00.000Z","supersedes":"c09"}
+{"id":"c11","agentId":"agent-bob","content":"SECRET-c11 Generic note: audit log retention defaults to 30 days.","visibility":"shared","createdAt":"2026-03-11T00:00:00.000Z"}
+{"id":"c12","agentId":"agent-bob","content":"SECRET-c12 Zentrix Labs raised audit retention to 90 days.","visibility":"shared","createdAt":"2026-03-12T00:00:00.000Z","supersedes":"c11"}
+{"id":"c13","agentId":"agent-ann","content":"SECRET-c13 Zentrix Labs archived incident.","visibility":"shared","createdAt":"2026-03-13T00:00:00.000Z","archived":true,"archivedAt":"2026-04-01T00:00:00.000Z"}
+{"id":"c14","agentId":"agent-ann","content":"SECRET-c14 Zentrix Labs workaround that expired.","visibility":"shared","createdAt":"2026-03-14T00:00:00.000Z","validTo":"2026-04-01T00:00:00.000Z"}
+{"id":"c15","agentId":"agent-bob","content":"SECRET-c15 A/B Corp tenant quota incident.","visibility":"shared","createdAt":"2026-03-15T00:00:00.000Z"}
+{"id":"c16","agentId":"agent-bob","content":"SECRET-c16 A B Corp tenant quota incident.","visibility":"shared","createdAt":"2026-03-16T00:00:00.000Z"}

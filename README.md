@@ -188,7 +188,8 @@ npm run test:integration    # boots Harper with the fixture and exercises the HT
 
 `scripts/import-flair.mjs` copies memories from a [Flair](https://github.com/tpsdev-ai/flair) instance
 into an app running this plugin, through `POST /Memory/import`. Run it from a checkout (Node 22+); it
-has no dependencies and is not part of the published package. Mapping rules: [DESIGN.md](DESIGN.md#import).
+has no dependencies (`--classifier anthropic` needs the `@anthropic-ai/sdk` dev dependency) and is not part of
+the published package. Mapping rules: [DESIGN.md](DESIGN.md#import).
 
 ```sh
 # 1. Preview: counts and ids only, nothing sent to the target
@@ -198,6 +199,20 @@ FLAIR_ADMIN_PASS=… node scripts/import-flair.mjs --flair https://flair.example
 # 2. Import from the frozen snapshot
 AGENT_MEMORY_USER=… AGENT_MEMORY_PASS=… node scripts/import-flair.mjs \
   --from-jsonl flair-memories.jsonl --principal-map principals.json --target https://app.example.com
+```
+
+When shared Flair memories may hold customer detail, classify before step 2 instead of importing them as
+`global` ([DESIGN.md](DESIGN.md#customer-classification---classify---decisions)):
+
+```sh
+# 2a. Propose scopes and lesson drafts; writes the report only
+node scripts/import-flair.mjs --from-jsonl flair-memories.jsonl --principal-map principals.json \
+  --classify --lessons --org-map orgs.json --report classification.json
+
+# 2b. Review and edit classification.json (scopes, slugs, lessons), then import what it says
+AGENT_MEMORY_USER=… AGENT_MEMORY_PASS=… node scripts/import-flair.mjs \
+  --from-jsonl flair-memories.jsonl --principal-map principals.json \
+  --decisions classification.json --target https://app.example.com
 ```
 
 | Option                    | Meaning                                                                                                       |
@@ -210,6 +225,14 @@ AGENT_MEMORY_USER=… AGENT_MEMORY_PASS=… node scripts/import-flair.mjs \
 | `--dry-run`               | Print the mapping summary and stop                                                                            |
 | `--batch-size <n>`        | Rows per request, 1–100 (default 100)                                                                         |
 | `--max-content-chars <n>` | Content length limit, 1–100000 (default 20000; match the target's `limits.contentChars`)                      |
+| `--classify`              | Propose a scope for every row that would be `global`; needs `--report`, contacts no target                    |
+| `--report <file>`         | With `--classify`: the report to write (mode 0600, never overwritten)                                         |
+| `--org-map <file>`        | With `--classify`: JSON object mapping organization names and aliases to slugs: `{ "Acme Corp": "acme" }`     |
+| `--lessons`               | With `--classify`: also draft a sanitized `global` lesson for each active customer record                     |
+| `--classifier <name>`     | With `--classify`: `claude` (default; the local Claude Code CLI) or `anthropic` (`ANTHROPIC_API_KEY`)         |
+| `--classifier-model <id>` | With `--classify`: the model the classifier uses                                                              |
+| `--concurrency <n>`       | With `--classify`: model calls in flight, 1–16 (default 4)                                                    |
+| `--decisions <file>`      | Import with an edited report applied (with `--dry-run` or `--target`); makes no model calls                   |
 
 Credentials come only from the environment: `FLAIR_ADMIN_USER` (default `admin`) and `FLAIR_ADMIN_PASS`
 for Flair, `AGENT_MEMORY_USER` and `AGENT_MEMORY_PASS` (a `super_user`) for the target. URLs must be
@@ -230,3 +253,17 @@ rows changed in Flair since the first run also come back `conflict`; import from
 Do not edit imported memories in the target until the import has finished. The result lists conflicted
 rows (`conflicts`) and the rows superseded by one of them (`dependsOnConflict`); check those
 by hand.
+
+Classification sends each shared memory to the chosen model, so run it on your own machine, never on a
+fleet worker. The report holds customer detail: keep it private and delete it after the import. In the
+report, each row has `scopes` (`["global"]` or `customer:<slug>` labels), the `organizations` found,
+a one-sentence `rationale`, and `lesson` (`null` for none, or `{ title, content }`). Rows the
+classifier could not decide are `customer:unclassified`, readable only by `customer:*` holders.
+`newOrganizations` and `slugCollisions` list the slugs to check. `--decisions` refuses a report whose
+rows no longer match the source, so re-run `--classify` after the source changes. Sources are imported
+first; a lesson goes in only when its source is stored as imported and still active (`lessons.skipped`
+lists the rest). Rows a plain import already sent as `global` come back `conflict` and keep their
+scopes. The `claude` classifier runs `claude -p` with your login and no tools, plugins, hooks or
+project instructions, except hooks your administrator manages. If such a hook forwards prompts, use
+`--classifier anthropic`. Owners always read their own memories, so map no Flair agent to a fleet
+principal.
