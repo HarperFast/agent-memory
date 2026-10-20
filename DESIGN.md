@@ -451,9 +451,11 @@ lease, since a batch writes up to 100 rows and flags their citers inside one tra
 - `GET /Memory/?order=created&after=<createdAt>,<id>&limit=` — without `q`, lists oldest first by `createdAt`, then
   id, under the same status, expiry, tag, scope and readable-set conditions as a search. `after` is the last
   row of the previous page (`createdAt` as ISO, then id). The query leads with a plain `createdAt >= t` (a floor
-  date on the first page) and sets `enforceExecutionOrder`, so Harper scans the `createdAt` index from the
-  cursor whatever the other conditions estimate; the tie-break `createdAt > t or id > lastId` and the usual
-  conditions filter that scan. Every page holds exactly `limit` rows even when an import batch shares one
+  date on the first page) plus the tie-break `createdAt > t or id > lastId` and the usual conditions. For a
+  walk of everything (a `super_user` with no `tag` or `scope`) it sets `enforceExecutionOrder`, so Harper scans
+  the `createdAt` index from the cursor whatever the other conditions estimate; for a narrower listing Harper
+  starts from its most selective condition and sorts the few matching rows, since pinning the scan would make
+  a caller who reads 3 rows of a large store read the whole index. Every page holds exactly `limit` rows even when an import batch shares one
   timestamp, and nothing is skipped or repeated. A page inside a group of rows sharing one `createdAt` still
   reads and sorts that group by id. Measured on Harper 5.3 (one node, local): walking 5,000 memories that
   include a 2,000-row same-timestamp group took 101 pages at limit 50, 3 ms p50, 13 ms p95 and 27 ms at worst

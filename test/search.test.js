@@ -337,6 +337,17 @@ describe('created-order cursor', () => {
 		assert.deepEqual(search.sort, { attribute: 'createdAt', next: { attribute: 'id' } });
 	});
 
+	it('pins the createdAt scan only for an unfiltered super_user walk', async () => {
+		const pinned = async (principal, query) => {
+			await searchMemories(params(`order=created${query}`), principal, context);
+			return __test.searchLog.at(-1).query.enforceExecutionOrder;
+		};
+		assert.equal(await pinned(root, ''), true);
+		assert.equal(await pinned(root, '&tag=ops'), false);
+		assert.equal(await pinned(root, '&scope=team:x'), false);
+		assert.equal(await pinned(alice, ''), false);
+	});
+
 	it('keeps the readable-set and status conditions in the query', async () => {
 		await importMemories(
 			{

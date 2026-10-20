@@ -253,15 +253,15 @@ export async function searchMemories(
 			Memory.search(
 				params.order === 'created'
 					? {
-							// The createdAt range leads and the planner may not reorder it, so the index drives the scan and a
-							// page reads about `limit` rows (plus the rest of one same-timestamp group, sorted by id).
 							conditions: [
 								...(params.after
 									? createdOrderConditions('greater_than', params.after)
 									: [{ attribute: 'createdAt', comparator: 'greater_than_equal', value: EARLIEST }]),
 								...conditions,
 							],
-							enforceExecutionOrder: true,
+							// A walk of everything (a super_user, no tag or scope filter) pins the createdAt range to drive the
+							// scan; a narrower listing lets Harper start from its most selective condition and sort the few rows.
+							enforceExecutionOrder: principal.superUser && params.tags.length === 0 && params.scopes.length === 0,
 							sort: { attribute: 'createdAt', next: { attribute: 'id' } },
 							select: VIEW_FIELDS,
 							limit: params.limit,
