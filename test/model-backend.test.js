@@ -141,6 +141,23 @@ describe('claude backend', () => {
 		assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' }, 'the child was reaped before the call settled');
 	});
 
+	it('settles at the timeout when the CLI exited but a descendant still holds its output open', async () => {
+		const cli = await fakeCli(
+			'orphan',
+			`const { spawn } = require('node:child_process');
+const holder = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 20000)'], { stdio: ['ignore', 'inherit', 'ignore'] });
+writeFileSync(${JSON.stringify(join(dir, 'orphan.pid'))}, String(holder.pid));
+process.exit(0);`,
+		);
+		const started = Date.now();
+		try {
+			assert.equal(await failure(complete(cli, { timeoutMs: 300 })), 'cli_timeout');
+			assert.ok(Date.now() - started < 4_000);
+		} finally {
+			process.kill(Number(await readFile(join(dir, 'orphan.pid'), 'utf8')), 'SIGKILL');
+		}
+	});
+
 	it('kills a CLI whose output exceeds the cap', async () => {
 		const cli = await fakeCli(
 			'flood',
@@ -206,6 +223,13 @@ describe('anthropic backend', () => {
 		assert.equal(body.fallbacks, 'default');
 		assert.deepEqual(body.output_config, { effort: 'medium', format: { type: 'json_schema', schema: SCHEMA } });
 		assert.deepEqual(body.messages, [{ role: 'user', content: PROMPT }]);
+	});
+
+	it('takes the key from the env it was given, never the process environment', async () => {
+		process.env.ANTHROPIC_API_KEY ??= 'process-key';
+		requests.length = 0;
+		assert.equal(await failure(call({ env: {} })), 'anthropic_no_api_key');
+		assert.equal(requests.length, 0);
 	});
 
 	it('fails on a refusal, a truncated reply, unparseable text and an HTTP error, by code only', async () => {

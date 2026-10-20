@@ -74,14 +74,26 @@ function completeWithCli({ system, prompt, schema }, { model, env, timeoutMs, co
 		const chunks = [];
 		let bytes = 0;
 		let failure;
+		let terminating = false;
 		let killTimer;
 		// The prompt goes over stdin, never argv, where other local users could read it.
 		const child = spawn(command, args, { cwd: tmpdir(), env, stdio: ['pipe', 'pipe', 'ignore'] });
+		// A descendant that inherited stdout would otherwise hold 'close' back after the CLI itself exits.
+		const release = () => {
+			child.stdout.destroy();
+			child.stdin.destroy();
+		};
 		const fail = (code) => {
 			failure ??= code;
-			if (child.exitCode !== null || child.signalCode !== null || killTimer) return;
-			child.kill('SIGTERM');
-			killTimer = setTimeout(() => child.kill('SIGKILL'), CLI_KILL_GRACE_MS);
+			// Set first: a failed kill() emits 'error' synchronously, which calls fail() again.
+			if (terminating) return;
+			terminating = true;
+			killTimer = setTimeout(() => {
+				child.kill('SIGKILL');
+				release();
+			}, CLI_KILL_GRACE_MS);
+			if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM');
+			else release();
 		};
 		const timer = setTimeout(() => fail('cli_timeout'), timeoutMs);
 		child.on('error', (error) => {
@@ -122,16 +134,27 @@ function anthropicCompleter({ model, env, timeoutMs, effort, maxTokens }) {
 	let sdk;
 	return async ({ system, prompt, schema }) => {
 		if (!sdk) {
-			// Loaded only for this backend, so the default `claude` path needs no installed dependency.
-			const { default: Anthropic } = await import('@anthropic-ai/sdk');
-			sdk = {
-				Anthropic,
-				client: new Anthropic({
-					...(env.ANTHROPIC_API_KEY ? { apiKey: env.ANTHROPIC_API_KEY } : {}),
-					timeout: timeoutMs,
-					maxRetries: ANTHROPIC_MAX_RETRIES,
-				}),
-			};
+			// The key comes from `env` alone, so a caller's environment is never silently replaced by the process's.
+			if (!env.ANTHROPIC_API_KEY) throw new ModelBackendError('anthropic_no_api_key');
+			let Anthropic;
+			try {
+				// Loaded only for this backend, so the default `claude` path needs no installed dependency.
+				({ default: Anthropic } = await import('@anthropic-ai/sdk'));
+			} catch {
+				throw new ModelBackendError('anthropic_sdk_missing');
+			}
+			try {
+				sdk = {
+					Anthropic,
+					client: new Anthropic({
+						apiKey: env.ANTHROPIC_API_KEY,
+						timeout: timeoutMs,
+						maxRetries: ANTHROPIC_MAX_RETRIES,
+					}),
+				};
+			} catch {
+				throw new ModelBackendError('anthropic_client_failed');
+			}
 		}
 		let response;
 		try {
