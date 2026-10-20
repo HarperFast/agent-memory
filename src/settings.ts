@@ -1,3 +1,5 @@
+import { CONTENT_CHECK_OFF, parseContentCheck, type ContentCheckSettings, type SecretsSource } from './patterns.ts';
+
 export type SupersessionMode = 'off' | 'suggest' | 'auto';
 
 export interface SupersessionSettings {
@@ -12,6 +14,7 @@ export interface Settings {
 	readonly titleChars: number;
 	readonly contentChars: number;
 	readonly supersession: SupersessionSettings;
+	readonly customerContentCheck: ContentCheckSettings;
 	readonly mcp: boolean;
 }
 
@@ -26,6 +29,7 @@ let current: Settings = Object.freeze({
 	titleChars: 200,
 	contentChars: 20_000,
 	supersession: DEFAULT_SUPERSESSION,
+	customerContentCheck: CONTENT_CHECK_OFF,
 	mcp: false,
 });
 
@@ -62,7 +66,7 @@ function parseSupersession(options: unknown): SupersessionSettings {
 	return Object.freeze({ mode, similarity, ...(judge ? { judge: judge as string } : {}) });
 }
 
-export function parseSettings(options: Record<string, any>): Settings {
+export function parseSettings(options: Record<string, any>, secrets: SecretsSource = () => undefined): Settings {
 	const urlPath = String(options.urlPath ?? 'Memory').replace(/^\/+|\/+$/g, '');
 	if (!urlPath) throw new Error('@harperfast/agent-memory: urlPath must not be empty');
 	const embeddingModel = options.embeddingModel ?? DEFAULT_EMBEDDING_MODEL;
@@ -79,6 +83,7 @@ export function parseSettings(options: Record<string, any>): Settings {
 		titleChars: boundedInteger(options.limits?.titleChars, 200, MAX_TITLE_CHARS, 'limits.titleChars'),
 		contentChars: boundedInteger(options.limits?.contentChars, 20_000, MAX_CONTENT_CHARS, 'limits.contentChars'),
 		supersession: parseSupersession(options.supersession),
+		customerContentCheck: parseContentCheck(options.customerContentCheck, secrets),
 		mcp,
 	});
 }

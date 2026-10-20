@@ -1,5 +1,5 @@
 import { memoryTable, type MemoryView, STATUS_ACTIVE } from './lifecycle.ts';
-import { anyOf, canRead, type Principal } from './scopes.ts';
+import { anyOf, canRead, readsCustomerContent, type Principal } from './scopes.ts';
 
 export type ReviewCause = 'superseded' | 'withdrawn';
 
@@ -92,24 +92,48 @@ export async function flagDependents(
 	return flagged;
 }
 
+// Which customer a flag matched reveals that the name is on the customer list.
+function withoutFlagLabels<T extends MemoryView>(view: T): T {
+	const flag = view.contentFlag as { labels?: unknown } | null;
+	if (!flag?.labels) return view;
+	const { labels: _hidden, ...visible } = flag;
+	return { ...view, contentFlag: visible };
+}
+
 /**
  * A flag names its source and replacement, so it is shown only to a reader who
  * can read the source through its labels or owns it (withdrawal ignored: that reader could read it before), and
- * names the replacement only when the reader can read it now. Sinks keep the unredacted views. `access` caches
- * the looked-up rows across calls for one request.
+ * names the replacement only when the reader can read it now. A content flag's labels are shown only to a reader
+ * cleared for customer content. Sinks keep the unredacted views. `access` caches the looked-up rows across calls
+ * for one request.
  */
 export async function forReader<T extends MemoryView>(
-	views: readonly T[],
+	unredacted: readonly T[],
 	principal: Principal,
 	context?: object,
 	access = new Map<string, Promise<any>>(),
 ): Promise<T[]> {
-	if (principal.superUser || !views.some((view) => view.needsReview)) return [...views];
+	const cleared = readsCustomerContent(principal);
+	const views =
+		cleared || !unredacted.some((view) => (view.contentFlag as any)?.labels)
+			? unredacted
+			: unredacted.map(withoutFlagLabels);
+	// Only a quarantined replacement can be unreadable to a label reader of what it supersedes.
+	const checksReplacement = (view: T) => !cleared && typeof view.supersededBy === 'string';
+	if (principal.superUser) return [...views];
+	if (!views.some((view) => view.needsReview || checksReplacement(view))) return [...views];
 	const missing = new Set<string>();
 	for (const view of views) {
 		const flag = view.needsReview as ReviewFlag | null;
-		if (!flag) continue;
-		for (const id of [flag.sourceId, flag.replacementId]) if (id && !access.has(id)) missing.add(id);
+		for (const id of [flag?.sourceId, flag?.replacementId]) if (id && !access.has(id)) missing.add(id);
+	}
+	for (const view of views) {
+		const id = view.supersededBy as string;
+		if (!checksReplacement(view) || access.has(id) || missing.has(id)) continue;
+		// A primary-key read: a search costs about 6 ms more on a single GET of a superseded memory.
+		const record = Promise.resolve(memoryTable().get(id, context));
+		record.catch(() => {});
+		access.set(id, record);
 	}
 	if (missing.size > 0) {
 		// Cached as a promise, so a concurrent caller waits for this lookup rather than reading an unfinished one.
@@ -118,7 +142,7 @@ export async function forReader<T extends MemoryView>(
 			for await (const record of memoryTable().search(
 				{
 					conditions: [anyOf([...missing].map((id) => ({ attribute: 'id', comparator: 'equals', value: id })))],
-					select: ['id', 'ownerId', 'scopes', 'status'],
+					select: ['id', 'ownerId', 'scopes', 'status', 'contentFlag'],
 				},
 				context,
 			)) {
@@ -134,11 +158,20 @@ export async function forReader<T extends MemoryView>(
 		}
 	}
 	return Promise.all(
-		views.map(async (view) => {
+		views.map(async (shown) => {
+			let view = shown;
+			if (checksReplacement(view)) {
+				const replacement = await access.get(view.supersededBy as string);
+				// The check reads a memory's chosen id, so a quarantined replacement's id is held back like the memory.
+				if (replacement?.contentFlag && !canRead(replacement, principal)) view = { ...view, supersededBy: null };
+			}
 			const flag = view.needsReview as ReviewFlag | null;
 			if (!flag) return view;
 			const source = await access.get(flag.sourceId);
-			if (!source || !canRead({ ownerId: source.ownerId, scopes: source.scopes }, principal)) {
+			if (
+				!source ||
+				!canRead({ ownerId: source.ownerId, scopes: source.scopes, contentFlag: source.contentFlag }, principal)
+			) {
 				return { ...view, needsReview: null };
 			}
 			if (!flag.replacementId) return view;

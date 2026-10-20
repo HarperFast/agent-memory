@@ -1,0 +1,23 @@
+rest: true
+
+jsResource:
+  files: 'resources.js'
+
+# The suite supplies synthetic names through this variable; the real list never enters a repository.
+env:
+  AGENT_MEMORY_TEST_CUSTOMER_NAMES:
+    required: true
+
+'@harperfast/agent-memory':
+  package: '@harperfast/agent-memory'
+  mcp: true
+  customerContentCheck:
+    mode: flag
+    model: content-stub
+    patterns:
+      namesSecret: AGENT_MEMORY_TEST_CUSTOMER_NAMES
+      hosts:
+        - label: zorb-host
+          host: '*.zorbcloud.test'
+        - label: zorb-lab
+          cidr: '10.77.0.0/16'

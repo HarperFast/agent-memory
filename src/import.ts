@@ -24,7 +24,9 @@ import {
 	WITHDRAW_REASON_MAX_CHARS,
 	withLockPlan,
 } from './lifecycle.ts';
+import { checkedText, matchCustomerContent } from './patterns.ts';
 import { activeDependentIds, CLEARED_REVIEW, flagDependents, reviewFlagFor } from './provenance.ts';
+import { type ContentFlag, contentFlagFields, decideContentFlag } from './quarantine.ts';
 import { isScopeLabel, MAX_SCOPES_PER_MEMORY, requirePrincipalId, type Principal } from './scopes.ts';
 import { getSettings } from './settings.ts';
 import { hasSinks, notifySinks } from './sinks.ts';
@@ -129,6 +131,11 @@ export async function importMemories(input: unknown, principal: Principal, reque
 	const settings = getSettings();
 	const Memory = memoryTable();
 	ensureEmbedder(Memory);
+	// Patterns only: a batch would otherwise start a model call per row.
+	const check = { ...settings.customerContentCheck, model: undefined };
+	const contentFlagFor = (row: any, now: Date) =>
+		decideContentFlag(check, undefined, row.scopes, () => matchCustomerContent(checkedText(row), check.matcher), now)
+			.flag;
 
 	const targetIds = new Set<string>(rows.flatMap((row: { supersedes: string[] }) => row.supersedes));
 	// A stored row this batch supersedes flags its citers, and citing serializes with that, as on PUT.
@@ -160,6 +167,15 @@ export async function importMemories(input: unknown, principal: Principal, reque
 		if (batch.length > 0) await flush(batch);
 	};
 	const stored = await Promise.all(rows.map((row: { id: string }) => Memory.get(row.id, requestContext)));
+	// Matched before the batch takes its locks, for the rows it expects to create.
+	const flaggedAt = new Date();
+	const contentFlags = new Map<string, ContentFlag | null>(
+		check.mode === 'flag'
+			? rows
+					.filter((_row: unknown, index: number) => !stored[index])
+					.map((row: any) => [row.id, contentFlagFor(row, flaggedAt)])
+			: [],
+	);
 	await embed(rows.filter((_row: unknown, index: number) => !stored[index]).map((row: { id: string }) => row.id));
 
 	const write = () =>
@@ -241,6 +257,8 @@ export async function importMemories(input: unknown, principal: Principal, reque
 							autoSupersedes: [],
 							...reviewPatch,
 							confirmed: null,
+							...contentFlagFields(contentFlags.has(row.id) ? contentFlags.get(row.id)! : contentFlagFor(row, now)),
+							scopeConfirmed: null,
 							author: { principalId: row.ownerId, source: 'import', authoredAt: row.createdAt.toISOString() },
 							lastEditor: null,
 							embeddingModel: settings.embeddingModel,

@@ -17,7 +17,7 @@ export async function handleApplication(scope: Scope): Promise<void> {
 
 	// Validates before publishing anything, so a rejected reload leaves the previous configuration serving.
 	const configure = () => {
-		const settings = parseSettings((scope.options.getAll() ?? {}) as Record<string, any>);
+		const settings = parseSettings((scope.options.getAll() ?? {}) as Record<string, any>, () => scope.secrets);
 		const pathChanged = settings.urlPath !== mountedPath;
 		if (pathChanged) {
 			for (const ResourceClass of MEMORY_RESOURCES) {

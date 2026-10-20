@@ -3,7 +3,15 @@ import { Resource } from 'harper';
 import { badRequest, memoryError, normalizeError, notFound } from './errors.ts';
 import { subscribeMemory, subscribeMemoryEvents, watchMemories, type SubscriptionStream } from './events.ts';
 import { importMemories } from './import.ts';
-import { confirmMemory, getMemory, pinMemory, putMemory, unpinMemory, withdrawMemory } from './lifecycle.ts';
+import {
+	confirmMemory,
+	confirmScopeMemory,
+	getMemory,
+	pinMemory,
+	putMemory,
+	unpinMemory,
+	withdrawMemory,
+} from './lifecycle.ts';
 import { MEMORY_MCP_METHODS, MEMORY_MCP_RESOURCES, MEMORY_MCP_TOOLS } from './mcp.ts';
 import { resolvePrincipal } from './principal.ts';
 import type { Principal } from './scopes.ts';
@@ -122,7 +130,7 @@ function scheduleFlushHeaders(context: any): void {
 	attempt(5);
 }
 
-const MEMORY_ACTIONS = ['pin', 'unpin', 'confirm'];
+const MEMORY_ACTIONS = ['pin', 'unpin', 'confirm', 'confirm-scope'];
 
 function rejectUnsupportedVerb(target: any): never {
 	if (target?.rest || target?.pathname) throw notFound();
@@ -264,13 +272,13 @@ export class MemoryItemResource extends MemoryEndpoint {
 
 	static async put(target: any, data: any, context: object) {
 		return handle('put', context, async (principal, ctx) => {
-			const { id, revision, created, candidates } = await putMemory(
+			const { id, revision, created, memory, candidates } = await putMemory(
 				String(target?.id ?? ''),
 				await readBody(data),
 				principal,
 				ctx,
 			);
-			return json({ id, revision, candidates }, created ? 201 : 200);
+			return json({ id, revision, candidates, contentFlag: memory.contentFlag }, created ? 201 : 200);
 		});
 	}
 
@@ -301,6 +309,8 @@ export class MemoryActionResource extends MemoryEndpoint {
 					return json(await unpinMemory(id, input, principal, ctx));
 				case 'confirm':
 					return json({ memory: await confirmMemory(id, input, principal, ctx) });
+				case 'confirm-scope':
+					return json({ memory: await confirmScopeMemory(id, input, principal, ctx) });
 				default:
 					throw notFound();
 			}

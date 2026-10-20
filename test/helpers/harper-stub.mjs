@@ -199,6 +199,10 @@ class StubTable {
 			results.sort((a, b) => (a[sort.attribute] > b[sort.attribute] ? direction : -direction));
 		}
 		results = results.slice(query.offset ?? 0, (query.offset ?? 0) + (query.limit ?? Infinity));
+		// Projected as Harper does, so a reader that needs a field the query did not select sees it missing.
+		if (query.select) {
+			results = results.map((record) => Object.fromEntries(query.select.map((field) => [field, record[field]])));
+		}
 		return (async function* () {
 			for (const record of results) yield Object.freeze(structuredClone(record));
 		})();

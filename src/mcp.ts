@@ -3,6 +3,7 @@ import { badRequest, isCallerSafe, memoryError, normalizeError, notFound } from 
 import { WATCH_MAX_IDS, WATCH_MAX_TTL_SECONDS, watchMemories } from './events.ts';
 import {
 	confirmMemory,
+	confirmScopeMemory,
 	EVIDENCE_KINDS,
 	getMemory,
 	isMemoryId,
@@ -50,6 +51,7 @@ const RECALL_FIELDS = [
 	'limit',
 	'includeSuperseded',
 	'includeExpired',
+	'flagged',
 	'watch',
 ] as const;
 
@@ -134,6 +136,7 @@ export const MEMORY_MCP_TOOLS = [
 				limit: { type: 'integer', minimum: 1, maximum: SEARCH_MAX_LIMIT },
 				includeSuperseded: { type: 'boolean' },
 				includeExpired: { type: 'boolean' },
+				flagged: { type: 'boolean', description: 'Only memories flagged for possible customer detail.' },
 				watch: { type: 'boolean' },
 			},
 		},
@@ -196,6 +199,21 @@ export const MEMORY_MCP_TOOLS = [
 		name: 'confirm',
 		method: 'mcpConfirm',
 		description: 'Confirm an owned memory after reviewing its flagged evidence.',
+		inputSchema: {
+			type: 'object',
+			additionalProperties: false,
+			required: ['id'],
+			properties: {
+				id: { type: 'string' },
+				revision: { type: 'integer', minimum: 1 },
+			},
+		},
+	},
+	{
+		name: 'confirm-scope',
+		method: 'mcpConfirmScope',
+		description:
+			'Confirm that a memory flagged for possible customer detail may stay global (requires customer:* write).',
 		inputSchema: {
 			type: 'object',
 			additionalProperties: false,
@@ -295,7 +313,7 @@ function parseRecallParams(input: unknown): SearchParams {
 		limit = payload.limit;
 	}
 
-	const booleanField = (name: 'includeSuperseded' | 'includeExpired' | 'watch'): boolean => {
+	const booleanField = (name: 'includeSuperseded' | 'includeExpired' | 'flagged' | 'watch'): boolean => {
 		const value = payload[name];
 		if (value === undefined || value === null) return false;
 		if (typeof value !== 'boolean') {
@@ -311,6 +329,7 @@ function parseRecallParams(input: unknown): SearchParams {
 		limit,
 		includeSuperseded: booleanField('includeSuperseded'),
 		includeExpired: booleanField('includeExpired'),
+		flagged: booleanField('flagged'),
 		watch: booleanField('watch'),
 	};
 }
@@ -342,9 +361,10 @@ export const MEMORY_MCP_METHODS = {
 				id: memoryId,
 				revision,
 				created,
+				memory,
 				candidates,
 			} = await putMemory(id, body, principal, mcpLifecycleContext(ctx));
-			return { id: memoryId, revision, created, candidates };
+			return { id: memoryId, revision, created, candidates, contentFlag: memory.contentFlag };
 		});
 	},
 
@@ -366,9 +386,10 @@ export const MEMORY_MCP_METHODS = {
 				id: memoryId,
 				revision: nextRevision,
 				created,
+				memory,
 				candidates,
 			} = await putMemory(id, body, principal, mcpLifecycleContext(ctx, ifMatch));
-			return { id: memoryId, revision: nextRevision, created, candidates };
+			return { id: memoryId, revision: nextRevision, created, candidates, contentFlag: memory.contentFlag };
 		});
 	},
 
@@ -422,6 +443,17 @@ export const MEMORY_MCP_METHODS = {
 			const ifMatch =
 				payload.revision === undefined || payload.revision === null ? undefined : formatRevision(payload.revision);
 			const memory = await confirmMemory(payload.id, {}, principal, mcpLifecycleContext(ctx, ifMatch));
+			return { memory };
+		});
+	},
+
+	mcpConfirmScope(params: unknown, context: unknown) {
+		return runMcpTool('confirm-scope', context, async (principal, ctx) => {
+			const payload = rejectUnknownFields(params, ['id', 'revision'], 'confirm-scope');
+			if (!isMemoryId(payload.id)) throw notFound();
+			const ifMatch =
+				payload.revision === undefined || payload.revision === null ? undefined : formatRevision(payload.revision);
+			const memory = await confirmScopeMemory(payload.id, {}, principal, mcpLifecycleContext(ctx, ifMatch));
 			return { memory };
 		});
 	},

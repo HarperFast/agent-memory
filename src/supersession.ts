@@ -1,6 +1,6 @@
 import { logger, models } from 'harper';
 import { memoryTable, STATUS_ACTIVE } from './lifecycle.ts';
-import { anyOf, readableCondition, type Principal } from './scopes.ts';
+import { anyOf, readableConditions, type Principal } from './scopes.ts';
 import {
 	assertReadable,
 	collect,
@@ -72,7 +72,6 @@ export async function findCandidates(
 	context: object,
 ): Promise<CandidateMatch[]> {
 	if (!query.vector || query.vector.length === 0 || query.scopes.length === 0) return [];
-	const readable = readableCondition(principal);
 	let hits: any[];
 	try {
 		hits = await collect(
@@ -84,10 +83,10 @@ export async function findCandidates(
 						anyOf(query.scopes.map((label) => ({ attribute: 'scopes', comparator: 'equals', value: label }))),
 						// Only rows embedded by the written row's model share its vector space.
 						{ attribute: 'embeddingModel', comparator: 'equals', value: query.embeddingModel },
-						...(readable ? [readable] : []),
+						...readableConditions(principal),
 					],
 					sort: { attribute: 'embedding', target: Array.from(query.vector) },
-					select: ['id', 'title', 'content', 'revision', 'ownerId', 'scopes', 'status', '$distance'],
+					select: ['id', 'title', 'content', 'revision', 'ownerId', 'scopes', 'status', 'contentFlag', '$distance'],
 					limit: CANDIDATE_LIMIT + query.excludeIds.length,
 				},
 				context,
@@ -119,14 +118,61 @@ export async function findCandidates(
 }
 
 /** Only a complete one-word answer counts; anything else (truncated, filtered, a tool call, prose) abstains. */
-export function parseVerdict(result: any): Verdict | undefined {
+function parseOneWord<T extends string>(result: any, words: readonly T[]): T | undefined {
 	if (result?.finishReason !== 'stop' || result.toolCalls?.length) return undefined;
 	const answer = String(result.content ?? '')
 		.trim()
 		.toLowerCase()
 		.replace(/^["'`*\s]+|["'`*.!\s]+$/g, '');
-	return (VERDICTS as readonly string[]).includes(answer) ? (answer as Verdict) : undefined;
+	return (words as readonly string[]).includes(answer) ? (answer as T) : undefined;
 }
+
+export function parseVerdict(result: any): Verdict | undefined {
+	return parseOneWord(result, VERDICTS);
+}
+
+export type OneWordOutcome<T extends string> =
+	{ answer: T } | { failure: 'timeout' | 'unusable' | 'error'; error?: unknown };
+
+/**
+ * `outcome` never rejects and never waits past `timeoutMs`, so a backend that ignores the abort cannot hold its
+ * caller open; `settled` resolves when the provider call itself does, for a caller that bounds calls in flight.
+ */
+export function askOneWord<T extends string>(
+	input: { system: string; messages: Array<{ role: 'user'; content: string }> },
+	options: { model: string; maxTokens: number; timeoutMs: number },
+	words: readonly T[],
+): { outcome: Promise<OneWordOutcome<T>>; settled: Promise<void> } {
+	const controller = new AbortController();
+	let call: Promise<unknown>;
+	try {
+		call = Promise.resolve(
+			models.generate(input, { model: options.model, maxTokens: options.maxTokens, signal: controller.signal }),
+		);
+	} catch (error) {
+		call = Promise.reject(error);
+	}
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const deadline = new Promise<'timeout'>((resolve) => {
+		timer = setTimeout(() => {
+			controller.abort();
+			resolve('timeout');
+		}, options.timeoutMs);
+	});
+	const outcome = Promise.race([call, deadline])
+		.then(
+			(result): OneWordOutcome<T> => {
+				if (result === 'timeout') return { failure: 'timeout' };
+				const answer = parseOneWord(result, words);
+				return answer ? { answer } : { failure: 'unusable' };
+			},
+			(error): OneWordOutcome<T> => ({ failure: 'error', error }),
+		)
+		.finally(() => clearTimeout(timer));
+	return { outcome, settled: call.then(noop, noop) };
+}
+
+function noop(): void {}
 
 function describe(tag: string, memory: { title: string | null; content: string }): string {
 	return `<${tag}>\nTitle: ${memory.title ?? ''}\n${String(memory.content).slice(0, JUDGE_CONTENT_CHARS)}\n</${tag}>`;
@@ -137,41 +183,25 @@ async function judgeOne(
 	match: CandidateMatch,
 	judge: string,
 ): Promise<Verdict | undefined> {
-	const controller = new AbortController();
-	let timer: ReturnType<typeof setTimeout> | undefined;
-	let call: Promise<unknown> | undefined;
-	try {
-		call = models.generate(
-			{
-				system: JUDGE_SYSTEM,
-				messages: [
-					{ role: 'user', content: `${describe('new_memory', written)}\n\n${describe('existing_memory', match)}` },
-				],
-			},
-			{ model: judge, maxTokens: JUDGE_MAX_TOKENS, signal: controller.signal },
-		);
-		// A backend that ignores the abort must not hold the write's response open.
-		const deadline = new Promise<'timeout'>((resolve) => {
-			timer = setTimeout(() => {
-				controller.abort();
-				resolve('timeout');
-			}, JUDGE_TIMEOUT_MS);
-		});
-		const result = await Promise.race([call, deadline]);
-		if (result === 'timeout') {
-			warnRateLimited('judge', `supersession judge "${judge}" timed out; candidate left unjudged`);
-			return undefined;
-		}
-		const verdict = parseVerdict(result);
-		if (!verdict) warnRateLimited('judge', `supersession judge "${judge}" gave no usable verdict`);
-		return verdict;
-	} catch (error) {
-		warnRateLimited('judge', `supersession judge "${judge}" failed; candidate left unjudged`, error);
-		return undefined;
-	} finally {
-		clearTimeout(timer);
-		call?.catch(() => {});
+	const outcome = await askOneWord(
+		{
+			system: JUDGE_SYSTEM,
+			messages: [
+				{ role: 'user', content: `${describe('new_memory', written)}\n\n${describe('existing_memory', match)}` },
+			],
+		},
+		{ model: judge, maxTokens: JUDGE_MAX_TOKENS, timeoutMs: JUDGE_TIMEOUT_MS },
+		VERDICTS,
+	).outcome;
+	if ('answer' in outcome) return outcome.answer;
+	if (outcome.failure === 'timeout') {
+		warnRateLimited('judge', `supersession judge "${judge}" timed out; candidate left unjudged`);
+	} else if (outcome.failure === 'unusable') {
+		warnRateLimited('judge', `supersession judge "${judge}" gave no usable verdict`);
+	} else {
+		warnRateLimited('judge', `supersession judge "${judge}" failed; candidate left unjudged`, outcome.error);
 	}
+	return undefined;
 }
 
 /** Runs outside every transaction: no record lock is held across a model call. */

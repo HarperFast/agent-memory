@@ -433,11 +433,16 @@ async function resolveDeliverableEvent(
 	// ignoring `status: 'withdrawn'`, so watchers and label readers learn a shared memory was withdrawn.
 	const readable =
 		kind === 'withdrawn'
-			? canRead({ ownerId: record.ownerId, scopes: record.scopes }, currentPrincipal)
+			? canRead({ ownerId: record.ownerId, scopes: record.scopes, contentFlag: record.contentFlag }, currentPrincipal)
 			: canRead(record, currentPrincipal);
 	if (!readable) return undefined;
 
-	if (kind === 'flagged' && !(await hasVisibleFlag(record, currentPrincipal))) {
+	// A content flag names nothing beyond the memory itself, so a reader of the memory may learn of it; a review
+	// flag names its source, so it stays subject to the source's visibility.
+	if (
+		kind === 'flagged' &&
+		(record.needsReview ? !(await hasVisibleFlag(record, currentPrincipal)) : !record.contentFlag)
+	) {
 		return undefined;
 	}
 	const updatedStamp =
@@ -733,14 +738,26 @@ export async function subscribeMemoryEvents(
 		throw notFound();
 	}
 
+	// Any flag on a new row is new. A revise that sets one takes its `since` from the same clock reading as its own
+	// timestamp; a flag kept from before does not match, so an edit to an already flagged memory is not news (unless it
+	// lands in the same millisecond as the write that flagged it, which costs one repeated notice).
+	const isNewContentFlag = (kind: MemoryEventKind, record: any): boolean => {
+		const since = record?.contentFlag?.since;
+		if (since === undefined) return false;
+		return kind === 'created' || (kind === 'revised' && since === record.lastEditor?.revisedAt);
+	};
+	const isFlagEvent = (kind: MemoryEventKind, record: any): boolean =>
+		kind === 'flagged' ||
+		((kind === 'restored' || kind === 'created') && Boolean(record?.needsReview)) ||
+		isNewContentFlag(kind, record);
+
 	const matchesWatchOrOwnFlag = (raw: any): { maybeOwnFlagged: boolean; watchConfirmed: boolean } | undefined => {
 		const eventRecord = raw?.value;
 		const id = String(raw?.id ?? eventRecord?.id ?? '');
 		const kind = eventRecord?.lastEventKind;
 		if (!id || !isEventKind(kind)) return undefined;
-		const hasFoldedOrDirectFlag =
-			kind === 'flagged' || ((kind === 'restored' || kind === 'created') && Boolean(eventRecord?.needsReview));
-		const maybeOwnFlagged = hasFoldedOrDirectFlag && (!eventRecord?.ownerId || eventRecord.ownerId === principal.id);
+		const maybeOwnFlagged =
+			isFlagEvent(kind, eventRecord) && (!eventRecord?.ownerId || eventRecord.ownerId === principal.id);
 		if (maybeOwnFlagged) return { maybeOwnFlagged: true, watchConfirmed: false };
 		if (!hasActiveWatch(principal.id, id)) return undefined;
 		return { maybeOwnFlagged: false, watchConfirmed: true };
@@ -760,12 +777,12 @@ export async function subscribeMemoryEvents(
 			if (!deliverable) return undefined;
 			const { event, record, currentPrincipal, dedupToken } = deliverable;
 
-			if (
-				(event.kind === 'flagged' ||
-					((event.kind === 'restored' || event.kind === 'created') && Boolean(record.needsReview))) &&
-				record.ownerId === currentPrincipal.id
-			) {
-				if (event.kind === 'flagged' || (await hasVisibleFlag(record, currentPrincipal))) {
+			if (isFlagEvent(event.kind, record) && record.ownerId === currentPrincipal.id) {
+				if (
+					event.kind === 'flagged' ||
+					isNewContentFlag(event.kind, record) ||
+					(await hasVisibleFlag(record, currentPrincipal))
+				) {
 					return { event, dedupToken };
 				}
 			}
