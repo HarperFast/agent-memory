@@ -1247,7 +1247,6 @@ export async function linkSupersedes(id: unknown, input: unknown, principal: Pri
 	const ifMatch = getHeader(requestContext, 'if-match');
 	const Memory = memoryTable();
 	const check = getSettings().customerContentCheck;
-	let modelCheck: { memory: any } | undefined;
 
 	// Only a link the cheap checks allow plans the targets, their citers and the replacement's ancestors.
 	const planned = await Memory.get(id, requestContext);
@@ -1277,11 +1276,10 @@ export async function linkSupersedes(id: unknown, input: unknown, principal: Pri
 		}
 	}
 
-	const linked = await withLockPlan(
+	return withLockPlan(
 		requestContext,
 		plan,
 		async (txn, locks) => {
-			modelCheck = undefined;
 			const existing = await Memory.get(id, txn);
 			if (!existing) throw notFound();
 			if (existing.ownerId !== principal.id && !principal.superUser) {
@@ -1349,7 +1347,6 @@ export async function linkSupersedes(id: unknown, input: unknown, principal: Pri
 			);
 			const changed = await applySupersede(Memory, supersede, txn, now);
 			const memory = toMemoryView(await Memory.get(id, txn));
-			if (decision.modelCheck) modelCheck = { memory: await Memory.get(id, txn) };
 			if (hasSinks()) {
 				await notifySinks('write', memory, txn);
 				for (const changedId of changed) {
@@ -1360,8 +1357,6 @@ export async function linkSupersedes(id: unknown, input: unknown, principal: Pri
 		},
 		LONG_LOCK_LEASE_MS,
 	);
-	if (modelCheck) scheduleModelCheck(id, modelCheck.memory, requestContext);
-	return linked;
 }
 
 export async function confirmMemory(
