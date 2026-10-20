@@ -1321,11 +1321,17 @@ export async function linkSupersedes(id: unknown, input: unknown, principal: Pri
 			if (newIds.some((targetId) => ancestors.includes(targetId))) throw supersedeCycle();
 
 			const now = new Date();
-			// A create checks the ids it supersedes with the rest of its text; a link adds ids the same way.
+			// A create checks the ids it supersedes with the rest of its text. A link changes only those ids, so a flag,
+			// or a review that cleared the text, stays unless a new id itself names a customer.
 			const finalSupersedes = [...already, ...newIds];
 			const decision = decideContentFlag(
 				check,
-				{ scopes: existing.scopes ?? [], textChanged: () => true, flag: existing.contentFlag ?? null },
+				{
+					scopes: existing.scopes ?? [],
+					textChanged: () =>
+						matchCustomerContent(checkedText({ id: '', supersedes: newIds }), check.matcher).length > 0,
+					flag: existing.contentFlag ?? null,
+				},
 				existing.scopes ?? [],
 				() => matchCustomerContent(checkedText({ ...existing, supersedes: finalSupersedes }), check.matcher),
 				now,

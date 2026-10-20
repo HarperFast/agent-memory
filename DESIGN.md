@@ -242,7 +242,7 @@ first-class operation, and the write path proposes it.
   maps every id to the target revision the caller judged, checked under the target's lock (412). The
   replacement gains the new ids in `supersedes`, a `revision` bump and `lastEventKind: revised`; its
   `needsReview`, `lastEditor` and `autoSupersedes` are untouched (a link is neither the owner's review nor a
-  judge's link; the customer-content check runs again over the new ids, as it does for the ids of a create).
+  judge's link; the customer-content check re-runs, over the replacement's whole text, only when a new id itself names a customer, as it does for the ids of a create; a flag or a review otherwise stays).
   Ids it already supersedes are skipped, so a repeated link writes nothing. A memory
   supersedes at most 100 (409 `supersedes_too_many`, the import cap), bounding what a withdrawal re-derives.
   The cap and the target checks, revisions included, run on the planning read too, so a refused link locks

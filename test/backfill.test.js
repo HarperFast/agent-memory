@@ -1,6 +1,5 @@
-import { beforeEach, describe, it } from 'node:test';
+import { after, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { after } from 'node:test';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -423,6 +422,20 @@ describe('linking and the customer-content check', () => {
 		assert.deepEqual(flagged.contentFlag.labels, ['customer:zorblax']);
 		assert.equal(flagged.revision, 3);
 		assert.equal(stored(named.id).status, 'superseded');
+	});
+
+	it('keeps a flag and a review as they were when the new id names nobody', async () => {
+		check();
+		const target = await create('clean-target', shared(`${GREBE} in spring`));
+		const replacement = await create('zorblax-flagged', shared(`${GREBE} for Zorblax`));
+		assert.equal(stored(replacement.id).contentFlagged, true);
+		const reviewed = { by: 'dave', at: '2026-10-20T00:00:00.000Z' };
+		await databases.memory.Memory.patch(replacement.id, { scopeConfirmed: reviewed });
+		await link(replacement.id, [target.id]);
+		const after = stored(replacement.id);
+		assert.equal(after.contentFlagged, true);
+		assert.deepEqual(after.scopeConfirmed, reviewed);
+		assert.deepEqual(after.supersedes, [target.id]);
 	});
 
 	it('leaves a replacement that is not global unflagged', async () => {
