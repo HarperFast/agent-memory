@@ -1,17 +1,14 @@
 #!/usr/bin/env node
-// Proposes and applies `supersedes` links between memories that already exist (after a bulk import, say). Report
-// mode asks the server for each memory's older candidates and a judge for a verdict per pair, and writes a review
-// report; apply mode links only the pairs an operator approved in that report. Nothing reaches stdout or stderr but
-// ids, counts and codes: memory content stays in the 0600 report.
+// Nothing reaches stdout or stderr but ids, counts and codes: memory content stays out of them and of the report.
 import { createHash } from 'node:crypto';
 import { access, readFile } from 'node:fs/promises';
 import { parseArgs } from 'node:util';
-import { assertSafeUrl, basicAuth, failureCode, isEntryPoint, publishPrivateFile, UsageError } from './lib/cli.mjs';
+import { assertSafeUrl, basicAuth, failureCode, isEntryPoint, reservePrivateFile, UsageError } from './lib/cli.mjs';
 import { createModelBackend, MODEL_BACKENDS } from './lib/model-backend.mjs';
 
-export const REPORT_FORMAT = 'agent-memory-supersession-backfill';
-export const REPORT_VERSION = 1;
-export const VERDICTS = ['supersedes', 'refines', 'unrelated'];
+const REPORT_FORMAT = 'agent-memory-supersession-backfill';
+const REPORT_VERSION = 1;
+const VERDICTS = ['supersedes', 'refines', 'unrelated'];
 const PAGE_SIZE = 50;
 const REQUEST_TIMEOUT_MS = 60_000;
 const JUDGE_CONTENT_CHARS = 4000;
@@ -19,7 +16,10 @@ const RATIONALE_MAX_CHARS = 200;
 const DEFAULT_CONCURRENCY = 4;
 const MAX_CONCURRENCY = 16;
 const LINK_ATTEMPTS = 3;
+const READ_ATTEMPTS = 3;
 const RETRY_DELAY_MS = 250;
+// Bounds the memory bodies held at once: the walk keeps ids alone, and pairs of one newer memory are judged together.
+const BODY_CACHE_ENTRIES = 256;
 const MEMORY_ID = /^[A-Za-z0-9_-]{16,64}$/;
 
 const JUDGE_SYSTEM = [
@@ -117,16 +117,27 @@ function requestError(what, result) {
 	return new Error(`${what} failed: ${result.status ? `HTTP ${result.status}` : 'no response'} (${result.code})`);
 }
 
+const pause = (attempt) => new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS * attempt));
+
+// A 503 is the server asking for a retry: an index catching up, a lock not granted in time.
+async function readWithRetry(request, path) {
+	for (let attempt = 1; ; attempt++) {
+		const result = await request('GET', path);
+		if ((result.status !== 503 && result.status !== 0) || attempt === READ_ATTEMPTS) return result;
+		await pause(attempt);
+	}
+}
+
 async function walkMemories(request, stderr) {
 	const memories = [];
 	let after = '';
 	for (;;) {
-		const result = await request(
-			'GET',
+		const result = await readWithRetry(
+			request,
 			`Memory/?order=created&limit=${PAGE_SIZE}&includeSuperseded=true&includeExpired=true${after}`,
 		);
 		if (result.status !== 200 || !Array.isArray(result.json?.memories)) throw requestError('listing memories', result);
-		memories.push(...result.json.memories);
+		for (const { id } of result.json.memories) memories.push(id);
 		stderr.write(`walked ${memories.length} memories\n`);
 		if (result.json.memories.length < PAGE_SIZE) return memories;
 		const last = result.json.memories.at(-1);
@@ -137,10 +148,16 @@ async function walkMemories(request, stderr) {
 async function mapPool(items, concurrency, fn) {
 	const results = new Array(items.length);
 	let next = 0;
+	let failed = false;
 	const worker = async () => {
-		while (next < items.length) {
+		while (!failed && next < items.length) {
 			const index = next++;
-			results[index] = await fn(items[index], index);
+			try {
+				results[index] = await fn(items[index], index);
+			} catch (error) {
+				failed = true;
+				throw error;
+			}
 		}
 	};
 	await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, worker));
@@ -148,34 +165,40 @@ async function mapPool(items, concurrency, fn) {
 }
 
 async function buildReport({ request, backend, target, model, concurrency, stderr }) {
-	const memories = await walkMemories(request, stderr);
-	const byId = new Map(memories.map((memory) => [memory.id, memory]));
+	const ids = await walkMemories(request, stderr);
+	const bodies = new Map();
 	const fetchMemory = async (id) => {
-		if (!byId.has(id)) {
-			const result = await request('GET', `Memory/${id}`);
+		let memory = bodies.get(id);
+		if (memory) {
+			bodies.delete(id);
+		} else {
+			const result = await readWithRetry(request, `Memory/${id}`);
 			if (result.status !== 200) throw requestError('reading a memory', result);
-			byId.set(id, result.json.memory);
+			const { title, content, createdAt } = result.json.memory;
+			memory = { id, title, content, createdAt };
 		}
-		return byId.get(id);
+		bodies.set(id, memory);
+		if (bodies.size > BODY_CACHE_ENTRIES) bodies.delete(bodies.keys().next().value);
+		return memory;
 	};
-	const proposals = [];
-	for (const [index, memory] of memories.entries()) {
-		const result = await request('GET', `Memory/${memory.id}/candidates`);
+	let listed = 0;
+	const candidateLists = await mapPool(ids, concurrency, async (id) => {
+		const result = await readWithRetry(request, `Memory/${id}/candidates`);
 		if (result.status !== 200 || !Array.isArray(result.json?.candidates)) {
 			throw requestError('listing candidates', result);
 		}
-		for (const candidate of result.json.candidates) proposals.push({ newer: memory, candidate });
-		if ((index + 1) % 50 === 0 || index + 1 === memories.length) {
-			stderr.write(`candidates for ${index + 1}/${memories.length} memories: ${proposals.length} pairs\n`);
-		}
-	}
+		if (++listed % 50 === 0 || listed === ids.length) stderr.write(`candidates for ${listed}/${ids.length} memories\n`);
+		return result.json.candidates;
+	});
+	const proposals = ids.flatMap((newId, index) => candidateLists[index].map((candidate) => ({ newId, candidate })));
 	let judged = 0;
-	const pairs = await mapPool(proposals, concurrency, async ({ newer, candidate }) => {
+	const pairs = await mapPool(proposals, concurrency, async ({ newId, candidate }) => {
+		const newer = await fetchMemory(newId);
 		const older = await fetchMemory(candidate.id);
 		const judgement = await judgePair(backend, newer, older);
 		if (++judged % 25 === 0 || judged === proposals.length) stderr.write(`judged ${judged}/${proposals.length}\n`);
 		return {
-			newId: newer.id,
+			newId,
 			newTitle: newer.title,
 			newCreatedAt: newer.createdAt,
 			newFingerprint: fingerprint(newer),
@@ -202,7 +225,7 @@ async function buildReport({ request, backend, target, model, concurrency, stder
 		judge: { backend: backend.name, model: model ?? null },
 		instructions:
 			'Set approve to true on each pair whose verdict is supersedes and that should be linked, then run with --apply <this file>. Only approved supersedes pairs are applied.',
-		summary: { memories: memories.length, pairs: pairs.length, verdicts },
+		summary: { memories: ids.length, pairs: pairs.length, verdicts },
 		pairs,
 	};
 }
@@ -281,7 +304,7 @@ async function applyDecisions({ request, pairs, stderr }) {
 			// 412 is a write between the reads and the link: read both again, and re-check what the judge saw.
 			const retryable = result.status === 412 || result.status === 503 || result.status === 0;
 			if (!retryable || attempt === LINK_ATTEMPTS) return { failed: result };
-			await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS * attempt));
+			await pause(attempt);
 		}
 	};
 	for (const [index, pair] of [...approved].sort(compareNewestFirst).entries()) {
@@ -351,7 +374,6 @@ export async function run(argv, env, { stdout = process.stdout, stderr = process
 		if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > MAX_CONCURRENCY) {
 			throw new UsageError(`--concurrency must be an integer from 1 to ${MAX_CONCURRENCY}`);
 		}
-		// Checked before the walk as well as at publication, so an existing report costs no judge calls.
 		if (
 			await access(values.report).then(
 				() => true,
@@ -360,9 +382,17 @@ export async function run(argv, env, { stdout = process.stdout, stderr = process
 		) {
 			throw new UsageError('--report names an existing file; reports are never overwritten');
 		}
-		const backend = createModelBackend(values.judge, { model: values.model, env, respond: stubVerdict });
-		const report = await buildReport({ request, backend, target, model: values.model, concurrency, stderr });
-		await publishPrivateFile(values.report, JSON.stringify(report, null, '\t') + '\n');
+		// Claimed before the walk, so a path that cannot be written fails before any judge call is spent.
+		const reservation = await reservePrivateFile(values.report);
+		let report;
+		try {
+			const backend = createModelBackend(values.judge, { model: values.model, env, respond: stubVerdict });
+			report = await buildReport({ request, backend, target, model: values.model, concurrency, stderr });
+		} catch (error) {
+			await reservation.release();
+			throw error;
+		}
+		await reservation.publish(JSON.stringify(report, null, '\t') + '\n');
 		stdout.write(JSON.stringify({ report: values.report, ...report.summary }, null, '\t') + '\n');
 		return 0;
 	} catch (error) {

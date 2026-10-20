@@ -236,13 +236,16 @@ first-class operation, and the write path proposes it.
   that already exist, typically imported history whose source never recorded the link. It runs the
   create-time code (`planSupersede` / `applySupersede`, shared with `PUT`): the same refusals per target
   (404 missing or unreadable, 409 withdrawn, 403 narrowing), the same pointer rule, and the same flags.
-  The caller owns the replacement or is `super_user`; a reader that is not the owner gets 403, a
-  non-reader the missing-id 404. `If-Match` names the replacement's revision; `revisions`, when sent,
+  The caller owns the replacement or is `super_user` (a reader that is not the owner gets 403, a
+  non-reader the missing-id 404) and, as on a create, can still write every label of the replacement
+  (403 `scope_not_writable`). `If-Match` names the replacement's revision; `revisions`, when sent,
   maps every id to the target revision the caller judged, checked under the target's lock (412). The
   replacement gains the new ids in `supersedes`, a `revision` bump and `lastEventKind: revised`; its
   `needsReview`, `lastEditor` and `autoSupersedes` are untouched (a link is neither the owner's review nor a
   judge's link). Ids it already supersedes are skipped, so a repeated link writes nothing. A memory
   supersedes at most 100 (409 `supersedes_too_many`, the import cap), bounding what a withdrawal re-derives.
+  The cap and the target checks, revisions included, run on the planning read too, so a refused link locks
+  only the replacement.
 - **The replacement may itself be superseded** (not withdrawn), so a chain found in history can be
   linked newest first: after C supersedes B, "B supersedes A" still lands, and A reads `supersededBy: B`.
   The freeze on superseded memories protects their scopes, which a link does not change. What it must
@@ -251,16 +254,19 @@ first-class operation, and the write path proposes it.
   superseder's links no longer count). The link walks those ancestors of R through the indexed
   `supersedes`, locks them with its plan, walks again under the locks, and answers 409 `supersede_cycle`.
   Any link that would make T reach R adds an edge into one of those rows, so it locks one of them and
-  serializes with this one. A create cannot close a cycle (nothing yet supersedes a new row); import
-  preserves source history as given and its client drops cycles.
+  serializes with this one. A create with targets runs the same check, because an import may list an id
+  before it exists (a link may name a row in a later batch), so a new row can already have ancestors. Import
+  itself preserves source history as given; its client drops cycles. A create of an id an import already
+  lists is still stored `active` (only import derives the new row's own status from the graph).
 - **Candidates for an existing memory** (`GET /Memory/<id>/candidates`, `memoryCandidates`): the write-time
   candidates (below) of a stored memory, from its stored vector, restricted to memories created before it
   (`createdAt`, then id), as `{ candidates: [{ id, title, similarity }] }`. Owner or `super_user`, with the
   same 403 / missing-id 404 split as a link, and 409 for a withdrawn memory. It neither judges nor applies,
-  ignores `supersession.mode` (which governs writes), and, unlike a write's advisory search, fails with the
-  search (503 / 500) instead of answering `[]`. The older-than rule is a condition in the query
-  (`createdAt < t or (createdAt = t and id < self)`), so same-millisecond rows with larger ids cannot fill
-  the nearest-k before the cut.
+  ignores `supersession.mode` (which governs writes), and, unlike a write's advisory search, waits for index
+  coverage (as a search does: about one index flush, 503 past 5 s) and fails with the search (503 / 500)
+  instead of answering `[]`, so a report run right after a bulk import misses nothing. The older-than rule is
+  in the query (`createdAt <= t`, then `createdAt < t or id < self` for the same instant), so same-millisecond
+  rows with larger ids cannot fill the nearest-k before the cut.
 - **Consequences of linking**: a create retried with its original `supersedes` after a link no longer
   matches the stored row (400 `supersedes_not_allowed`), like any retry after a later change; an import
   re-run reports a linked row as `conflict`.
@@ -444,12 +450,14 @@ lease, since a batch writes up to 100 rows and flags their citers inside one tra
   the default 1 h TTL) for every memory id returned in the result.
 - `GET /Memory/?order=created&after=<createdAt>,<id>&limit=` — without `q`, lists oldest first by `createdAt`, then
   id, under the same status, expiry, tag, scope and readable-set conditions as a search. `after` is the last
-  row of the previous page (`createdAt` as ISO, then id) and pushes `createdAt > t or (createdAt = t and id >
-id)` into the query, so every page holds exactly `limit` rows even when an import batch shares one
-  timestamp, and nothing is skipped or repeated. A memory created during a walk with an earlier `createdAt`
-  (an import preserving its source time) lands behind the cursor; walk again to see it. `order` with `q`, or
-  `after` without `order=created`, is 400. The tie is a closed range (`>= t and <= t`), not `equals`: Harper
-  5.3's count estimate for `equals` on a Date attribute throws.
+  row of the previous page (`createdAt` as ISO, then id). The query carries a plain `createdAt >= t`, which lets
+  Harper scan the `createdAt` index from the cursor (an `or` at the top of the conditions cannot drive the
+  scan, so each page would cost the rows before it), and the tie-break `createdAt > t or id > lastId` as a
+  filter. Every page holds exactly `limit` rows even when an import batch shares one timestamp, and nothing
+  is skipped or repeated. A memory created during a walk with an earlier `createdAt` (an import preserving
+  its source time) lands behind the cursor; walk again to see it. `order` with `q`, or `after` without
+  `order=created`, is 400. Neither condition uses `equals` on `createdAt`: Harper 5.3's count estimate for
+  `equals` on a Date attribute throws.
 - **Searchable at commit**: both indexes are Harper derived indexes maintained after commit (`audit:
 true` puts `@embed`'s HNSW index on the native plane). Each lane passes `waitForIndexMilliseconds`,
   so a search covers every write committed before it began; an index that is already current does not
@@ -703,14 +711,16 @@ An operator CLI, run as a `super_user` from the operator's own machine, that tur
 detection into a one-off, reviewed cleanup of history that arrived without its links.
 
 - **Report**: walks every non-withdrawn memory oldest first through the created-order cursor (superseded
-  ones too: an existing C → B can still gain B → A), asks the server for each one's candidates, and asks
-  a judge to classify each (newer, older) pair `supersedes | refines | unrelated` with a one-sentence
-  rationale. Judging runs client-side because the target need not have a generative model; candidates
+  ones too: an existing C → B can still gain B → A), asks the server for each one's candidates (as many
+  at once as `--concurrency`, a 503 retried), and asks a judge to classify each (newer, older) pair
+  `supersedes | refines | unrelated` with a one-sentence rationale. The walk keeps ids only; bodies are read
+  per judged pair through a 256-entry cache, so a large store does not have to fit in the operator's heap. Judging runs client-side because the target need not have a generative model; candidates
   come from the server so the threshold and scope rules stay in one place. The report holds ids, titles,
   `createdAt`, similarity, verdict, rationale, a content fingerprint per side (`sha256(title \n content)`,
-  16 hex) and `approve: false`. It never holds content; it is published 0600 through a temp file and an
-  exclusive hard link, so a crash leaves no truncated file and an existing report is never replaced. A
-  judge that fails on every pair writes no report.
+  16 hex) and `approve: false`. It never holds content. The report path is claimed before the walk (its temp
+  file opened and a hard link tried), so a path that cannot be written fails before any judge call; the
+  report is then published 0600 through that temp file and an exclusive hard link, so a crash leaves no
+  truncated file and an existing report is never replaced. A judge that fails on every pair writes no report.
 - **Apply** (`--apply <decisions file>`): only pairs with `verdict: supersedes` and `approve: true`, newest
   replacement first, so when several approved replacements cover one memory its pointer and its citers'
   flags name the latest. Before each link it re-reads both memories, skips the pair if either fingerprint
@@ -718,9 +728,10 @@ detection into a one-off, reviewed cleanup of history that arrived without its l
   revisions it just read (`If-Match` and `revisions`), re-reading on 412. The whole decisions file is
   validated before the first write; a refused pair is reported with the server's code and the run continues. Re-running links
   nothing new.
-- **Judges** (`scripts/lib/model-backend.mjs`, shared with the import classifier): `claude` (default) runs
-  the local Claude Code CLI with `--safe-mode` (no CLAUDE.md, hooks, plugins or MCP servers; managed policy
-  hooks still run), the prompt on stdin and JSON-schema output; `anthropic` calls the Messages API with
+- **Judges** (`scripts/lib/model-backend.mjs`, written for the import classifier too): `claude` (default)
+  runs the local Claude Code CLI with `--safe-mode` (no CLAUDE.md, hooks, plugins or MCP servers; managed
+  policy hooks still run), the prompt on stdin, JSON-schema output, and an environment without the scripts'
+  own `AGENT_MEMORY_*` and `FLAIR_*` credentials; `anthropic` calls the Messages API with
   structured output and server-side fallbacks, keyed only from `ANTHROPIC_API_KEY`; `stub` decides by a
   marker in the newer memory (tests). Failures surface as codes, never the prompt or reply.
 - **Output**: stdout and stderr carry ids, counts and codes only.

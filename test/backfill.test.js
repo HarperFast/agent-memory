@@ -259,6 +259,25 @@ describe('linkSupersedes', () => {
 		await rejection(link(replacement.id, [target.id], alice, 3), 409, 'memory_withdrawn');
 	});
 
+	it('requires write on the replacement labels, as a create would', async () => {
+		const target = await create('target', shared(`${GREBE} in spring`), bob);
+		const replacement = await create('replacement');
+		const revoked = grant('alice', ['global'], []);
+		await rejection(link(replacement.id, [target.id], revoked), 403, 'scope_not_writable');
+		assert.equal(stored(target.id).status, 'active');
+	});
+
+	it('refuses a create that would close a cycle through a link an import left pointing at a missing id', async () => {
+		await importRows([{ id: idFor('imported'), content: `${GREBE} imported`, supersedes: [idFor('later')] }]);
+		await rejection(
+			putMemory(idFor('later'), { ...shared(`${GREBE} later`), supersedes: [idFor('imported')] }, alice, context),
+			409,
+			'supersede_cycle',
+		);
+		assert.equal(stored(idFor('later')), undefined);
+		assert.equal(stored(idFor('imported')).status, 'active');
+	});
+
 	it('validates ids', async () => {
 		const replacement = await create('replacement');
 		for (const input of [{}, { ids: null }, { ids: [] }]) {
@@ -347,9 +366,14 @@ describe('linkSupersedes', () => {
 		__test.lockLog.length = 0;
 		await rejection(link(replacement.id, [wide.id], root), 403, 'supersede_scope_narrowing');
 		await rejection(link(replacement.id, [target.id], alice, 5), 412, 'precondition_failed');
+		await rejection(
+			link(replacement.id, [target.id], alice, 1, { revisions: { [target.id]: 9 } }),
+			412,
+			'precondition_failed',
+		);
 		assert.deepEqual(
 			__test.lockLog.map((entry) => entry.id),
-			[replacement.id, replacement.id],
+			[replacement.id, replacement.id, replacement.id],
 		);
 		__test.lockLog.length = 0;
 		await link(replacement.id, [target.id]);

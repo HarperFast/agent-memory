@@ -6,6 +6,7 @@ import { CLEARED_CONTENT_FLAG, contentFlagFields, decideContentFlag, scheduleMod
 import {
 	assertWritable,
 	canRead,
+	canWrite,
 	GLOBAL_SCOPE,
 	isCustomerScope,
 	isSuperset,
@@ -444,6 +445,10 @@ function staleWrite(ifMatch: string, revision: number): MemoryError {
 	);
 }
 
+function supersedeCycle(): MemoryError {
+	return memoryError('A memory cannot supersede a memory that supersedes it', 409, 'supersede_cycle');
+}
+
 /** The explicit-supersede rules. Returned rather than thrown so an auto candidate that fails one is only reported. */
 function supersedeRefusal(target: any, scopes: readonly string[], principal: Principal): MemoryError | undefined {
 	// Same 404 as a missing id, so supersedes is not a probe for another principal's memory.
@@ -804,12 +809,17 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 				const validUntil = parsedValidUntil ?? null;
 
 				await assertReadableEvidence(Memory, evidenceMemoryIds, principal, txn);
+				// An imported row can already list this id in `supersedes`, so a create can close a cycle as a link can.
+				const ancestors =
+					supersedes.length + planned.autoTargets.length > 0 ? await supersedingAncestors(Memory, id, txn) : [];
 				// Refusals are decided before anything joins the lock set, so a refused create locks nothing it names;
 				// rows read here are re-read under their locks on the attempt the require below restarts into.
 				const targets = [];
 				for (const targetId of supersedes) {
 					const target = await Memory.get(targetId, txn);
-					const refusal = supersedeRefusal(target, scopes, principal);
+					const refusal =
+						supersedeRefusal(target, scopes, principal) ??
+						(ancestors.includes(targetId) ? supersedeCycle() : undefined);
 					if (refusal) throw refusal;
 					targets.push(target);
 				}
@@ -817,13 +827,20 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 				for (const proposal of planned.autoTargets) {
 					const target = await Memory.get(proposal.id, txn);
 					// The judge compared this revision; a later one is content it never saw.
-					if (target?.revision !== proposal.revision || supersedeRefusal(target, scopes, principal)) continue;
+					if (
+						target?.revision !== proposal.revision ||
+						supersedeRefusal(target, scopes, principal) ||
+						ancestors.includes(target.id)
+					) {
+						continue;
+					}
 					targets.push(target);
 					applied.push(target.id);
 				}
-				const supersede = await planSupersede(Memory, { id, createdAt: now }, targets, txn);
+				const supersede =
+					targets.length > 0 ? await planSupersede(Memory, { id, createdAt: now }, targets, txn) : undefined;
 				if (planned.vector === undefined) throw new VectorNeeded();
-				locks.require([...evidenceMemoryIds, ...supersedes, ...supersede.citerIds]);
+				locks.require([...evidenceMemoryIds, ...supersedes, ...ancestors, ...(supersede?.citerIds ?? [])]);
 				const decision = decideContentFlag(
 					check,
 					undefined,
@@ -866,7 +883,7 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 					},
 					txn,
 				);
-				const changed = await applySupersede(Memory, supersede, txn, now);
+				const changed = supersede ? await applySupersede(Memory, supersede, txn, now) : [];
 				// Re-read inside the transaction: @updatedTime is applied by the database.
 				const created = await Memory.get(id, txn);
 				if (hasSinks()) {
@@ -986,7 +1003,6 @@ async function planSupersede(
 	return { pointers, citers, citerIds: [...citers.values()].flat() };
 }
 
-/** Returns the ids it changed: the targets, then the citers it flagged. */
 async function applySupersede(Memory: any, plan: SupersedePlan, context: object, now: Date): Promise<string[]> {
 	for (const { target, supersededBy } of plan.pointers) {
 		await Memory.patch(
@@ -1201,10 +1217,28 @@ function normalizeRevisions(value: unknown, ids: readonly string[]): Map<string,
 	return new Map(ids.map((id) => [id, (value as any)[id]]));
 }
 
+/** The create-time refusals plus the caller's revision precondition, so a planning read can skip the fan-out. */
+function linkRefusal(
+	target: any,
+	targetId: string,
+	scopes: readonly string[],
+	principal: Principal,
+	revisions: Map<string, number> | undefined,
+): MemoryError | undefined {
+	const refusal = supersedeRefusal(target, scopes, principal);
+	if (refusal) return refusal;
+	const expected = revisions?.get(targetId);
+	if (expected === undefined || expected === target.revision) return undefined;
+	return memoryError(
+		`Stale write: memory ${targetId} is at revision ${target.revision}, not ${expected}`,
+		412,
+		'precondition_failed',
+	);
+}
+
 /**
- * Links an existing memory as the replacement of existing memories, under the create-time supersede rules and with
- * the same effects. The replacement may itself be superseded, so a chain can be linked newest first; a link that
- * would close a cycle is refused instead.
+ * The replacement may itself be superseded, so a chain found in history can be linked newest first; that is why a
+ * link, unlike a create, has to refuse closing a cycle.
  */
 export async function linkSupersedes(id: unknown, input: unknown, principal: Principal, requestContext: object = {}) {
 	const payload = rejectUnknownFields(input, LINK_FIELDS, 'supersedes');
@@ -1219,19 +1253,25 @@ export async function linkSupersedes(id: unknown, input: unknown, principal: Pri
 	// Only a link the cheap checks allow plans the targets, their citers and the replacement's ancestors.
 	const planned = await Memory.get(id, requestContext);
 	const plan = [id];
+	const plannedNewIds = ids.filter((targetId) => !(planned?.supersedes ?? []).includes(targetId));
 	if (
 		planned &&
+		plannedNewIds.length > 0 &&
 		planned.status !== STATUS_WITHDRAWN &&
 		(planned.ownerId === principal.id || principal.superUser) &&
+		canWrite(planned.scopes ?? [], principal) &&
 		ifMatch !== undefined &&
-		matchesIfMatch(ifMatch, planned.revision)
+		matchesIfMatch(ifMatch, planned.revision) &&
+		(planned.supersedes ?? []).length + plannedNewIds.length <= SUPERSEDES_STORED_MAX_ITEMS
 	) {
-		const newIds = ids.filter((targetId) => !(planned.supersedes ?? []).includes(targetId));
-		const targets = await Promise.all(newIds.map((targetId) => Memory.get(targetId, requestContext)));
-		if (newIds.length > 0 && !targets.some((target) => supersedeRefusal(target, planned.scopes ?? [], principal))) {
+		const targets = await Promise.all(plannedNewIds.map((targetId) => Memory.get(targetId, requestContext)));
+		const allowed = targets.every(
+			(target, i) => !linkRefusal(target, plannedNewIds[i], planned.scopes ?? [], principal, revisions),
+		);
+		if (allowed) {
 			const transitioning = targets.filter((target) => target.status === STATUS_ACTIVE).map((target) => target.id);
 			plan.push(
-				...newIds,
+				...plannedNewIds,
 				...(await activeDependentIds(Memory, transitioning, requestContext)),
 				...(await supersedingAncestors(Memory, id, requestContext)),
 			);
@@ -1249,10 +1289,12 @@ export async function linkSupersedes(id: unknown, input: unknown, principal: Pri
 				throw memoryError('Only the owner can modify this memory', 403, 'not_memory_owner');
 			}
 			if (ifMatch === undefined) {
-				throw memoryError('If-Match header is required to link superseded memories', 428, 'if_match_required');
+				throw memoryError('If-Match header is required to change what a memory supersedes', 428, 'if_match_required');
 			}
 			if (existing.status === STATUS_WITHDRAWN) throw memoryError('Memory has been withdrawn', 409, 'memory_withdrawn');
 			if (!matchesIfMatch(ifMatch, existing.revision)) throw staleWrite(ifMatch, existing.revision);
+			// As on a create: the caller must still be allowed to publish under the replacement's labels.
+			assertWritable(existing.scopes ?? [], principal);
 			const linked: string[] = existing.supersedes ?? [];
 			const newIds = ids.filter((targetId) => !linked.includes(targetId));
 			if (newIds.length === 0) return (await forReader([toMemoryView(existing)], principal, txn))[0];
@@ -1263,33 +1305,20 @@ export async function linkSupersedes(id: unknown, input: unknown, principal: Pri
 					'supersedes_too_many',
 				);
 			}
-			// Refusals are decided before the targets join the lock set, so a refused link locks nothing it names.
+			// Refusals are decided before the targets join the lock set, so a refused link locks nothing it names; a
+			// target read without its lock is read again under it on the attempt the require below restarts into.
 			const targets = [];
 			for (const targetId of newIds) {
 				const target = await Memory.get(targetId, txn);
-				const refusal = supersedeRefusal(target, existing.scopes ?? [], principal);
+				const refusal = linkRefusal(target, targetId, existing.scopes ?? [], principal, revisions);
 				if (refusal) throw refusal;
 				targets.push(target);
 			}
-			locks.require(newIds);
-			for (const target of targets) {
-				const expected = revisions?.get(target.id);
-				if (expected !== undefined && expected !== target.revision) {
-					throw memoryError(
-						`Stale write: memory ${target.id} is at revision ${target.revision}, not ${expected}`,
-						412,
-						'precondition_failed',
-					);
-				}
-			}
 			// Any link that would make a target reach this memory enters its ancestors through a row held here.
 			const ancestors = await supersedingAncestors(Memory, id, txn);
-			locks.require(ancestors);
-			if (newIds.some((targetId) => ancestors.includes(targetId))) {
-				throw memoryError('A memory cannot supersede a memory that supersedes it', 409, 'supersede_cycle');
-			}
 			const supersede = await planSupersede(Memory, existing, targets, txn);
-			locks.require(supersede.citerIds);
+			locks.require([...newIds, ...ancestors, ...supersede.citerIds]);
+			if (newIds.some((targetId) => ancestors.includes(targetId))) throw supersedeCycle();
 
 			const now = new Date();
 			await Memory.patch(

@@ -33,30 +33,44 @@ export function basicAuth(env, userVar, passVar, defaultUser) {
 	return `Basic ${Buffer.from(`${user}:${pass}`).toString('base64')}`;
 }
 
-/** A short, content-free code for a failed request: a server's own `code`, or the network error's. */
 export function failureCode(value) {
 	const candidate = value?.cause?.code ?? value?.code ?? value?.name;
 	return typeof candidate === 'string' && ERROR_CODE.test(candidate) ? candidate : 'request_failed';
 }
 
 /**
- * Written aside, fsynced and linked into place with mode 0600, so an interrupted write never leaves a truncated
- * file under the final name, and an existing file is never replaced (EEXIST).
+ * Claims `path` for a file written at the end of a long run: an unwritable directory or a filesystem without hard
+ * links fails here, before the work. `publish` writes aside, fsyncs and links into place with mode 0600, so an
+ * interrupted write never leaves a truncated file under the final name and an existing file is never replaced.
  */
-export async function publishPrivateFile(path, text) {
+export async function reservePrivateFile(path) {
 	const partial = `${path}.${process.pid}.partial`;
-	let handle;
-	try {
-		handle = await open(partial, 'wx', 0o600);
-		await handle.writeFile(text);
-		await handle.sync();
-		await handle.close();
-		handle = null;
-		await link(partial, path);
-	} finally {
-		await handle?.close().catch(() => {});
+	const handle = await open(partial, 'wx', 0o600);
+	const release = async () => {
+		await handle.close().catch(() => {});
 		await unlink(partial).catch(() => {});
+	};
+	try {
+		const probe = `${path}.${process.pid}.probe`;
+		await link(partial, probe);
+		await unlink(probe);
+	} catch (error) {
+		await release();
+		throw error;
 	}
+	return {
+		release,
+		async publish(text) {
+			try {
+				await handle.writeFile(text);
+				await handle.sync();
+				await handle.close();
+				await link(partial, path);
+			} finally {
+				await release();
+			}
+		},
+	};
 }
 
 export function isEntryPoint(moduleFilename) {

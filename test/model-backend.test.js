@@ -23,7 +23,7 @@ async function fakeCli(name, body, { readStdin = true } = {}) {
 		path,
 		`#!${process.execPath}
 const { writeFileSync } = require('node:fs');
-writeFileSync(${JSON.stringify(`${path}.argv`)}, JSON.stringify({ argv: process.argv.slice(2), cwd: process.cwd() }));
+writeFileSync(${JSON.stringify(`${path}.argv`)}, JSON.stringify({ argv: process.argv.slice(2), cwd: process.cwd(), env: Object.keys(process.env) }));
 ${
 	readStdin
 		? `let input = '';
@@ -80,10 +80,13 @@ describe('claude backend', () => {
 			'ok',
 			`process.stdout.write(JSON.stringify({ type: 'result', is_error: false, result: 'x', structured_output: { verdict: 'supersedes' } }));`,
 		);
-		assert.deepEqual(await complete(cli, { model: 'haiku' }), { verdict: 'supersedes' });
+		const env = { ...process.env, AGENT_MEMORY_PASS: 'target-secret', FLAIR_ADMIN_PASS: 'source-secret', KEEP_ME: '1' };
+		assert.deepEqual(await complete(cli, { model: 'haiku', env }), { verdict: 'supersedes' });
 		assert.equal(await readFile(`${cli}.stdin`, 'utf8'), PROMPT);
-		const { argv, cwd } = JSON.parse(await readFile(`${cli}.argv`, 'utf8'));
+		const { argv, cwd, env: childEnv } = JSON.parse(await readFile(`${cli}.argv`, 'utf8'));
 		assert.equal(cwd, tmpdir());
+		assert.ok(childEnv.includes('KEEP_ME'));
+		assert.ok(!childEnv.some((name) => name.startsWith('AGENT_MEMORY_') || name.startsWith('FLAIR_')));
 		assert.ok(!argv.some((arg) => arg.includes('SECRET')), 'the prompt never appears in argv');
 		for (const flag of ['-p', '--safe-mode', '--strict-mcp-config', '--no-session-persistence']) {
 			assert.ok(argv.includes(flag), flag);

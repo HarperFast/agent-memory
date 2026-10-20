@@ -6,8 +6,9 @@ import { DEFAULT_EMBEDDING_MODEL, getSettings } from './settings.ts';
 import {
 	assertReadable,
 	collect,
-	createdOrderCondition,
+	createdOrderConditions,
 	type CreatedPosition,
+	INDEX_WAIT_MS,
 	isVectorDimensionMismatch,
 	reportVectorLaneRejected,
 	unexpiredCondition,
@@ -56,6 +57,7 @@ export interface CandidateQuery {
 	excludeIds: readonly string[];
 	/** Only memories created before this one, by `createdAt` and then id (`compareNewest`). */
 	olderThan?: CreatedPosition;
+	waitForIndexMilliseconds?: number;
 }
 
 const lastWarning = new Map<string, number>();
@@ -67,11 +69,8 @@ function warnRateLimited(key: string, message: string, error?: unknown): void {
 	logger.warn?.(`[agent-memory] ${message}`, error);
 }
 
-/**
- * Does not wait for index coverage, so a memory committed within the index lag can be missed. A failed search
- * throws; a query vector the index cannot compare (another dimension) has no candidates.
- */
-export async function searchCandidates(
+/** A failed search throws; a query vector the index cannot compare (another dimension) has no candidates. */
+async function searchCandidates(
 	query: CandidateQuery,
 	principal: Principal,
 	threshold: number,
@@ -89,10 +88,14 @@ export async function searchCandidates(
 						anyOf(query.scopes.map((label) => ({ attribute: 'scopes', comparator: 'equals', value: label }))),
 						// Only rows embedded by the written row's model share its vector space.
 						{ attribute: 'embeddingModel', comparator: 'equals', value: query.embeddingModel },
-						...(query.olderThan ? [createdOrderCondition('less_than', query.olderThan)] : []),
+						...(query.olderThan ? createdOrderConditions('less_than', query.olderThan) : []),
 						...readableConditions(principal),
 					],
-					sort: { attribute: 'embedding', target: Array.from(query.vector) },
+					sort: {
+						attribute: 'embedding',
+						target: Array.from(query.vector),
+						waitForIndexMilliseconds: query.waitForIndexMilliseconds,
+					},
 					select: ['id', 'title', 'content', 'revision', 'ownerId', 'scopes', 'status', 'contentFlag', '$distance'],
 					limit: CANDIDATE_LIMIT + query.excludeIds.length,
 				},
@@ -120,7 +123,10 @@ export async function searchCandidates(
 		.filter((match) => match.similarity >= threshold);
 }
 
-/** Advice on a write: a failed search yields no candidates rather than failing a committed write. */
+/**
+ * Advice on a write: it does not wait for index coverage, so a memory committed within the index lag can be missed,
+ * and a failed search yields no candidates rather than failing a committed write.
+ */
 export async function findCandidates(
 	query: CandidateQuery,
 	principal: Principal,
@@ -155,6 +161,8 @@ export async function memoryCandidates(id: string, principal: Principal, context
 			scopes: record.scopes ?? [],
 			excludeIds: [id, ...(record.supersedes ?? [])],
 			olderThan: { id, createdAt: record.createdAt },
+			// Unlike a write's advice, this read waits for the index, so a backfill right after an import misses nothing.
+			waitForIndexMilliseconds: INDEX_WAIT_MS,
 		},
 		principal,
 		getSettings().supersession.similarity,

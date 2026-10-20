@@ -22,7 +22,7 @@ const QUERY_MAX_CHARS = 1000;
 // Both derived indexes apply commits after the fact; waiting for coverage of writes committed before the
 // search keeps a memory searchable from the moment its create returns. An index that is already current
 // does not wait.
-const INDEX_WAIT_MS = 5000;
+export const INDEX_WAIT_MS = 5000;
 const BOOTSTRAP_DEFAULT_BUDGET = 8000;
 const BOOTSTRAP_MAX_BUDGET = 100_000;
 const BOOTSTRAP_RECENT_LIMIT = 50;
@@ -67,7 +67,6 @@ export interface SearchParams {
 	includeExpired: boolean;
 	flagged?: boolean;
 	watch?: boolean;
-	/** `created`: oldest first by `createdAt`, then id, paged with `after` (no `q`). */
 	order?: 'created';
 	after?: CreatedPosition;
 }
@@ -122,7 +121,7 @@ export function parseSearchParams(params: URLSearchParams): SearchParams {
 	}
 	const after = parseCursor(params.get('after'));
 	if (after && !order) throw badRequest('after requires order=created', 'invalid_after');
-	return {
+	const parsed: SearchParams = {
 		q,
 		tags: params.getAll('tag'),
 		scopes,
@@ -131,29 +130,29 @@ export function parseSearchParams(params: URLSearchParams): SearchParams {
 		includeExpired: booleanParam(params, 'includeExpired'),
 		flagged: booleanParam(params, 'flagged'),
 		watch: booleanParam(params, 'watch'),
-		...(order ? { order } : {}),
-		...(after ? { after } : {}),
 	};
+	if (order) parsed.order = order;
+	if (after) parsed.after = after;
+	return parsed;
 }
 
 /** Memories before (`less_than`) or after (`greater_than`) `position` in `createdAt`-then-id order. */
-export function createdOrderCondition(comparator: 'less_than' | 'greater_than', position: CreatedPosition): Condition {
+export function createdOrderConditions(
+	comparator: 'less_than' | 'greater_than',
+	position: CreatedPosition,
+): Condition[] {
 	const { createdAt, id } = position;
-	return {
-		operator: 'or',
-		conditions: [
-			{ attribute: 'createdAt', comparator, value: createdAt },
-			{
-				operator: 'and',
-				conditions: [
-					// The same instant as a closed range: Harper's count estimate for `equals` on a Date attribute throws.
-					{ attribute: 'createdAt', comparator: 'greater_than_equal', value: createdAt },
-					{ attribute: 'createdAt', comparator: 'less_than_equal', value: createdAt },
-					{ attribute: 'id', comparator, value: id },
-				],
-			},
-		],
-	};
+	return [
+		// A plain range on `createdAt`, so Harper scans the index from the cursor; an `or` at the top cannot drive it.
+		{ attribute: 'createdAt', comparator: `${comparator}_equal`, value: createdAt },
+		{
+			operator: 'or',
+			conditions: [
+				{ attribute: 'createdAt', comparator, value: createdAt },
+				{ attribute: 'id', comparator, value: id },
+			],
+		},
+	];
 }
 
 export function unexpiredCondition(now: Date): Condition {
@@ -249,13 +248,12 @@ export async function searchMemories(
 	const Memory = memoryTable();
 	const conditions = filterConditions(params, principal);
 	if (!params.q) {
-		// The cursor is a condition in the query, so a page is exactly `limit` rows however many share a timestamp.
 		const recent = await collect(
 			Memory.search(
 				params.order === 'created'
 					? {
 							conditions: params.after
-								? [...conditions, createdOrderCondition('greater_than', params.after)]
+								? [...conditions, ...createdOrderConditions('greater_than', params.after)]
 								: conditions,
 							sort: { attribute: 'createdAt', next: { attribute: 'id' } },
 							select: VIEW_FIELDS,

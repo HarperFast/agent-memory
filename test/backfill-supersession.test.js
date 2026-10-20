@@ -1,7 +1,7 @@
 import { after, before, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
-import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -201,6 +201,14 @@ describe('backfill-supersession report', () => {
 		assert.equal(requests.length, 0);
 	});
 
+	it('fails before reading anything when the report cannot be written there', async () => {
+		await seed();
+		const result = await cli(['--target', target, '--report', join(dir, 'missing-dir', 'r.json'), '--judge', 'stub']);
+		assert.equal(result.code, 1);
+		assert.match(result.stderr, /ENOENT/);
+		assert.equal(requests.length, 0);
+	});
+
 	it('writes no report when the judge fails on every pair', async () => {
 		await seed();
 		const path = reportPath('report-no-judge.json');
@@ -208,6 +216,11 @@ describe('backfill-supersession report', () => {
 		assert.equal(result.code, 1);
 		assert.match(result.stderr, /the judge failed on every pair \(anthropic_no_api_key\)/);
 		await assert.rejects(stat(path), { code: 'ENOENT' });
+		assert.deepEqual(
+			(await readdir(dir)).filter((name) => name.startsWith('report-no-judge')),
+			[],
+			'the reservation is released',
+		);
 	});
 
 	it('records a failed or malformed judgement as an unapproved pair with a code, never the reply', async () => {

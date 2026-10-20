@@ -4,13 +4,15 @@ import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 
 export const MODEL_BACKENDS = ['claude', 'anthropic', 'stub'];
-export const DEFAULT_ANTHROPIC_MODEL = 'claude-opus-5-5';
+const DEFAULT_ANTHROPIC_MODEL = 'claude-opus-5-5';
 const DEFAULT_TIMEOUT_MS = 120_000;
 const CLI_OUTPUT_MAX_BYTES = 1_000_000;
 const CLI_KILL_GRACE_MS = 5_000;
 // Thinking is always on for the default model and counts against max_tokens.
 const DEFAULT_ANTHROPIC_MAX_TOKENS = 16_000;
 const ANTHROPIC_MAX_RETRIES = 2;
+// The scripts' own service credentials: the judge needs none of them, and a managed policy hook would see its env.
+const WITHHELD_ENV_PREFIXES = ['AGENT_MEMORY_', 'FLAIR_'];
 
 export class ModelBackendError extends Error {
 	constructor(code) {
@@ -77,7 +79,10 @@ function completeWithCli({ system, prompt, schema }, { model, env, timeoutMs, co
 		let terminating = false;
 		let killTimer;
 		// The prompt goes over stdin, never argv, where other local users could read it.
-		const child = spawn(command, args, { cwd: tmpdir(), env, stdio: ['pipe', 'pipe', 'ignore'] });
+		const childEnv = Object.fromEntries(
+			Object.entries(env).filter(([name]) => !WITHHELD_ENV_PREFIXES.some((prefix) => name.startsWith(prefix))),
+		);
+		const child = spawn(command, args, { cwd: tmpdir(), env: childEnv, stdio: ['pipe', 'pipe', 'ignore'] });
 		// A descendant that inherited stdout would otherwise hold 'close' back after the CLI itself exits.
 		const release = () => {
 			child.stdout.destroy();
