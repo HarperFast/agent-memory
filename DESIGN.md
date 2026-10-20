@@ -510,7 +510,7 @@ as `global` only through an operator-reviewed decision, and every machine failur
 `customer:unclassified`, never on `global`.
 
 - **Two runs**: `--classify --report <file>` proposes, writes the report, and contacts no target; a run
-  whose classifier fails on every row (a missing CLI or key) writes nothing. The operator edits the
+  whose classifier errors on every row (a missing CLI or key) writes nothing. The operator edits the
   report; `--decisions <file>` imports with exactly what it says and makes no model calls, so a re-run
   with the same file sends identical rows.
 - **What is classified**: every row a plain import would send as `global`: `active`, `superseded` and
@@ -518,14 +518,14 @@ as `global` only through an operator-reviewed decision, and every machine failur
 - **Labels**: one `customer:<slug>` per organization the classifier names. Names go through
   `--org-map` (alias → slug); an alias found literally in the row adds its organization even when the
   model missed it. An unmapped name becomes `slugify(name)` and is listed for review. A classifier error,
-  an answer outside the schema, or more than 16 organizations make the row `customer:unclassified` alone.
+  an answer outside the schema, or more than 16 distinct labels make the row `customer:unclassified` alone.
   `customer:unclassified` replaces the label of a name with no usable slug, or of a generated slug shared
   by two different names or equal to a mapped slug (either would merge two customers' readers); the
   row keeps its other labels, because any one label grants read. It is also added when the model finds
   customer detail but names no organization, even if an alias matched.
 - **Before links**: decided scopes enter `mapFlairMemories` before `supersedes` is resolved, so the
-  reader rule above judges the labels actually sent: a customer successor of a `global` memory is
-  dropped as `narrowing`.
+  reader rule above judges the labels actually sent: the link from a customer successor to a `global`
+  memory is dropped as `narrowing`.
 - **Binding**: each decision carries a fingerprint over every Flair field the mapping reads plus the
   resolved owner. A source row that changed since classification (content, tags, archive, expiry, links,
   owner) refuses the whole apply, and the decisions must cover exactly the rows that would be classified.
