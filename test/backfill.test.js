@@ -1,5 +1,9 @@
 import { beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { after } from 'node:test';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { __test, databases } from 'harper';
 import { importMemories } from '../dist/import.js';
 import { getMemory, linkSupersedes, putMemory, withdrawMemory } from '../dist/lifecycle.js';
@@ -395,5 +399,39 @@ describe('linkSupersedes', () => {
 		await withdrawMemory(replacement.id, {}, bob, ifMatch(2));
 		assert.equal(stored(target.id).status, 'active');
 		assert.equal(stored(target.id).supersededBy, null);
+	});
+});
+
+describe('linking and the customer-content check', () => {
+	const scratch = mkdtempSync(join(tmpdir(), 'agent-memory-backfill-'));
+	const namesFile = join(scratch, 'names.json');
+	writeFileSync(namesFile, JSON.stringify({ zorblax: ['Zorblax'] }));
+	after(() => rmSync(scratch, { recursive: true, force: true }));
+	const check = () => applySettings(parseSettings({ customerContentCheck: { patterns: { namesFile } } }));
+
+	it('flags a global replacement that a link makes show an id naming a customer, as a create would', async () => {
+		const clean = await create('clean', shared(`${GREBE} in spring`));
+		const named = await create('zorblax-notes-0001', shared(`${GREBE} in summer`));
+		check();
+		const replacement = await create('replacement');
+		await link(replacement.id, [clean.id]);
+		assert.equal(stored(replacement.id).contentFlag ?? null, null, 'an id that names nobody flags nothing');
+		await link(replacement.id, [named.id], alice, stored(replacement.id).revision);
+		const flagged = stored(replacement.id);
+		assert.equal(flagged.contentFlagged, true);
+		assert.equal(flagged.contentFlag.source, 'pattern');
+		assert.deepEqual(flagged.contentFlag.labels, ['customer:zorblax']);
+		assert.equal(flagged.revision, 3);
+		assert.equal(stored(named.id).status, 'superseded');
+	});
+
+	it('leaves a replacement that is not global unflagged', async () => {
+		check();
+		const target = await create('private-target', shared(GREBE, { visibility: 'private' }));
+		await create('zorblax-notes-0002', shared(`${GREBE} in summer`, { visibility: 'private' }));
+		const replacement = await create('private-new', shared(`${GREBE} today`, { visibility: 'private' }));
+		await link(replacement.id, [idFor('zorblax-notes-0002')]);
+		assert.equal(stored(replacement.id).contentFlagged ?? null, null);
+		assert.equal(stored(target.id).status, 'active');
 	});
 });

@@ -242,7 +242,8 @@ first-class operation, and the write path proposes it.
   maps every id to the target revision the caller judged, checked under the target's lock (412). The
   replacement gains the new ids in `supersedes`, a `revision` bump and `lastEventKind: revised`; its
   `needsReview`, `lastEditor` and `autoSupersedes` are untouched (a link is neither the owner's review nor a
-  judge's link). Ids it already supersedes are skipped, so a repeated link writes nothing. A memory
+  judge's link; the customer-content check runs again over the new ids, as it does for the ids of a create).
+  Ids it already supersedes are skipped, so a repeated link writes nothing. A memory
   supersedes at most 100 (409 `supersedes_too_many`, the import cap), bounding what a withdrawal re-derives.
   The cap and the target checks, revisions included, run on the planning read too, so a refused link locks
   only the replacement.
@@ -288,8 +289,8 @@ first-class operation, and the write path proposes it.
   judge runs outside every transaction, and only for a `PUT` that wrote a new title or content (a
   retry or a tags-only revise gets its candidates unjudged).
 - **Auto** (`supersession.mode: auto`, requires `judge`; default `suggest`): on a create, the plugin
-  searches with the write's vector and judges before the transaction, because `supersedes` cannot
-  change after create. Each `supersedes` verdict joins the create's `supersedes` under the explicit rules and
+  searches with the write's vector and judges before the transaction, because a `PUT` cannot
+  change `supersedes` after create. Each `supersedes` verdict joins the create's `supersedes` under the explicit rules and
   only if the candidate's `revision` is still the one the judge compared; `applied: true | false` says
   whether it did. Applied links are also listed in `autoSupersedes`, so an identical retry compares only
   the links the author sent, and readers can tell the judge's links from the author's. Auto adds at most

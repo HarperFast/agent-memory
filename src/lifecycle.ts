@@ -1246,6 +1246,8 @@ export async function linkSupersedes(id: unknown, input: unknown, principal: Pri
 	const revisions = normalizeRevisions(payload.revisions, ids);
 	const ifMatch = getHeader(requestContext, 'if-match');
 	const Memory = memoryTable();
+	const check = getSettings().customerContentCheck;
+	let modelCheck: { memory: any } | undefined;
 
 	// Only a link the cheap checks allow plans the targets, their citers and the replacement's ancestors.
 	const planned = await Memory.get(id, requestContext);
@@ -1275,10 +1277,11 @@ export async function linkSupersedes(id: unknown, input: unknown, principal: Pri
 		}
 	}
 
-	return withLockPlan(
+	const linked = await withLockPlan(
 		requestContext,
 		plan,
 		async (txn, locks) => {
+			modelCheck = undefined;
 			const existing = await Memory.get(id, txn);
 			if (!existing) throw notFound();
 			if (existing.ownerId !== principal.id && !principal.superUser) {
@@ -1292,10 +1295,10 @@ export async function linkSupersedes(id: unknown, input: unknown, principal: Pri
 			if (!matchesIfMatch(ifMatch, existing.revision)) throw staleWrite(ifMatch, existing.revision);
 			// As on a create: the caller must still be allowed to publish under the replacement's labels.
 			assertWritable(existing.scopes ?? [], principal);
-			const linked: string[] = existing.supersedes ?? [];
-			const newIds = ids.filter((targetId) => !linked.includes(targetId));
+			const already: string[] = existing.supersedes ?? [];
+			const newIds = ids.filter((targetId) => !already.includes(targetId));
 			if (newIds.length === 0) return (await forReader([toMemoryView(existing)], principal, txn))[0];
-			if (linked.length + newIds.length > SUPERSEDES_STORED_MAX_ITEMS) {
+			if (already.length + newIds.length > SUPERSEDES_STORED_MAX_ITEMS) {
 				throw memoryError(
 					`A memory supersedes at most ${SUPERSEDES_STORED_MAX_ITEMS} memories`,
 					409,
@@ -1318,13 +1321,29 @@ export async function linkSupersedes(id: unknown, input: unknown, principal: Pri
 			if (newIds.some((targetId) => ancestors.includes(targetId))) throw supersedeCycle();
 
 			const now = new Date();
+			// A create checks the ids it supersedes with the rest of its text; a link adds ids the same way.
+			const finalSupersedes = [...already, ...newIds];
+			const decision = decideContentFlag(
+				check,
+				{ scopes: existing.scopes ?? [], textChanged: () => true, flag: existing.contentFlag ?? null },
+				existing.scopes ?? [],
+				() => matchCustomerContent(checkedText({ ...existing, supersedes: finalSupersedes }), check.matcher),
+				now,
+			);
 			await Memory.patch(
 				id,
-				{ supersedes: [...linked, ...newIds], lastEventKind: 'revised', revision: existing.revision + 1 },
+				{
+					supersedes: finalSupersedes,
+					...contentFlagFields(decision.flag),
+					...(decision.reviewLapsed && { scopeConfirmed: null }),
+					lastEventKind: 'revised',
+					revision: existing.revision + 1,
+				},
 				txn,
 			);
 			const changed = await applySupersede(Memory, supersede, txn, now);
 			const memory = toMemoryView(await Memory.get(id, txn));
+			if (decision.modelCheck) modelCheck = { memory: await Memory.get(id, txn) };
 			if (hasSinks()) {
 				await notifySinks('write', memory, txn);
 				for (const changedId of changed) {
@@ -1335,6 +1354,8 @@ export async function linkSupersedes(id: unknown, input: unknown, principal: Pri
 		},
 		LONG_LOCK_LEASE_MS,
 	);
+	if (modelCheck) scheduleModelCheck(id, modelCheck.memory, requestContext);
+	return linked;
 }
 
 export async function confirmMemory(
