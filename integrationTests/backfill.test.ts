@@ -69,8 +69,6 @@ suite('@harperfast/agent-memory supersession backfill over HTTP', (ctx: ContextW
 		});
 		strictEqual(response.status, 200, JSON.stringify(response.body));
 	};
-	// Candidate search does not wait for index coverage; a search does.
-	const settleIndex = () => call('admin', 'GET', '?q=grebe');
 
 	before(async () => {
 		scratch = mkdtempSync(join(tmpdir(), 'backfill-it-'));
@@ -147,7 +145,6 @@ suite('@harperfast/agent-memory supersession backfill over HTTP', (ctx: ContextW
 		await create('alice', 'cand-unrelated', shared('Kernel', 'kernel tuning guidance for disks'));
 		const source = await create('alice', 'cand-source', shared('Grebe v2', `${GREBE} this year`));
 		const newer = await create('alice', 'cand-newer', shared('Grebe v3', `${GREBE} next year`));
-		await settleIndex();
 
 		const found = await candidates('alice', source);
 		strictEqual(found.status, 200, JSON.stringify(found.body));
@@ -173,7 +170,6 @@ suite('@harperfast/agent-memory supersession backfill over HTTP', (ctx: ContextW
 			{ id: 'tie-aaa-oldest___', content: `${GREBE} oldest tie`, createdAt: '2024-02-01T00:00:00.000Z' },
 			...[...Array(8).keys()].map((n) => ({ id: peer(n), content: `${GREBE} tie ${n}`, createdAt: at })),
 		]);
-		await settleIndex();
 		const first = (await candidates('admin', peer(0))).body.candidates.map((candidate: any) => candidate.id);
 		ok(first.includes('tie-aaa-oldest___'), JSON.stringify(first));
 		ok(!first.some((id: string) => id.startsWith('tie-peer-')), 'no same-timestamp peer with a larger id');
@@ -279,7 +275,6 @@ suite('@harperfast/agent-memory supersession backfill over HTTP', (ctx: ContextW
 				shared('Heron v3', 'heron nests counted on the east marsh in the first survey REPLACES again'),
 			),
 		};
-		await settleIndex();
 		const env = { AGENT_MEMORY_USER: ctx.harper.admin.username, AGENT_MEMORY_PASS: ctx.harper.admin.password };
 		const io = () => {
 			let text = '';
