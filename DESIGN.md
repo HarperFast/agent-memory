@@ -36,6 +36,7 @@ allowlists, idempotent `PUT` create/revise with `If-Match` revision precondition
 | Live updates (Level 1 subscriptions, Level 2 `MemoryWatch` and `/MemoryEvents`)                                  | implemented (`src/events.ts`)       |
 | MCP tools and `memory:///{id}` resource (`mcp` option)                                                           | implemented (`src/mcp.ts`)          |
 | Customer-content flag and quarantine (`customerContentCheck` option)                                             | implemented (`src/quarantine.ts`)   |
+| Supersession backfill: candidates for an existing memory, links between existing memories, created-order cursor  | implemented (`src/lifecycle.ts`)    |
 
 ## Data model
 
@@ -161,6 +162,7 @@ Rules:
 | revise (`PUT`)      | `PUT /Memory/<id>` on an owned memory whose editable fields (`title`, `content`, `tags`, `scopes`, `evidence`, `validUntil`) differ from the stored ones requires `If-Match: "<revision>"` (or `*`; missing → 428, stale → 412), bumps `revision`, clears `needsReview`, and returns `200 { id, revision, candidates, contentFlag }`    |
 | confirm-scope       | `POST /Memory/<id>/confirm-scope` (a reviewer holding `customer:*` read and write, or `super_user`; 403 `customer_clearance_required` otherwise, the missing-id 404 for a non-reader) clears the content flag and records `scopeConfirmed: { by, at }`; `If-Match` honoured when sent; 409 `not_flagged`, 409 on a withdrawn memory     |
 | supersede           | create a memory via `PUT /Memory/<id>` with `supersedes: [ids]` (`supersedes` on a revise is 400 `supersedes_not_allowed`)                                                                                                                                                                                                              |
+| link                | `POST /Memory/<id>/supersedes { ids, revisions? }` with `If-Match: "<revision>"` (missing → 428, stale → 412) links an existing memory as the replacement of existing older ones, under the supersede rules (see Supersession); returns `{ memory }`                                                                                    |
 | withdraw (`DELETE`) | `DELETE /Memory/<id>?reason=` requires `If-Match: "<revision>"` (or `*`; missing → 428, stale → 412); sets `status = withdrawn`, keeps the row as a tombstone, never deletes it                                                                                                                                                         |
 | pin / unpin         | records or deletes the caller's `MemoryPin` row (`<principalId>:<memoryId>`, up to 50 pins per principal; withdrawn pins are pruned on pin, 409 `pin_limit_exceeded` past 50); `pin` requires read access (same 404 when missing or unreadable), while `unpin` always deletes the caller's pin and includes `memory` only when readable |
 | confirm             | `POST /Memory/<id>/confirm` (owner or `super_user`; 403 for another reader, the missing-id 404 for a non-reader) clears `needsReview`, records `confirmed: { by, at }` and bumps `revision`; `If-Match` is honoured when sent (412) but not required; 409 on a superseded or withdrawn memory                                           |
@@ -181,8 +183,9 @@ whatever was staged before an error the resource turns into a response) and take
 lock (`Memory.lock`) on every row it will change, in sorted id order, before reading it
 (`withLockPlan`, `src/lifecycle.ts`). An operation plans its whole lock set before the transaction:
 a `PUT` locks its id, its `supersedes`, the memories it newly cites, and the active citers of what it
-supersedes; a withdrawal locks its id, its `supersedes` (which never changes after create) and its
-active citers. Under the locks, before its first write, the operation re-reads every row it will
+supersedes; a link locks its id, the memories it newly supersedes, their active citers, and the
+memories that supersede it (directly or through others; see Supersession); a withdrawal locks its id,
+its `supersedes` (which only a link adds to, under the same lock) and its active citers. Under the locks, before its first write, the operation re-reads every row it will
 change; one the plan missed (a citer that appeared, a `supersedes` populated after the pre-read)
 aborts the attempt, and the next attempt locks the union in one sorted pass, so no operation waits
 for a lock while holding one out of order; after three attempts it answers 503 `unavailable`. The
@@ -210,7 +213,7 @@ Measured on the team's previous memory store: only 8% of updates used an explici
 and 32% of sessions read a stale memory without ever seeing its replacement. So supersession is a
 first-class operation, and the write path proposes it.
 
-- **Explicit**: `supersedes: [oldId]` (up to 10) on create (`PUT` to a new id). Requires that the caller can read `old`,
+- **Explicit**: `supersedes: [oldId]` (up to 10) on create (`PUT` to a new id), or later by a link (below). Requires that the caller can read `old`,
   that `old` is not withdrawn (409), and that the new memory's scopes are a superset of `old.scopes`
   (403), so every label reader of the old memory can read its replacement. In the same transaction
   `old.status = superseded`, `old.supersededBy = newId`. An already superseded memory may be
@@ -229,6 +232,38 @@ first-class operation, and the write path proposes it.
   memory it superseded under that rule, returning it to `active` when no superseder is left; import
   derives status by the same rule. The lookup reads non-withdrawn superseders newest first through
   the indexed `supersedes` and `createdAt`, so it is exact however many there are.
+- **Link after the fact** (`POST /Memory/<id>/supersedes { ids, revisions? }`, `linkSupersedes`): for memories
+  that already exist, typically imported history whose source never recorded the link. It runs the
+  create-time code (`planSupersede` / `applySupersede`, shared with `PUT`): the same refusals per target
+  (404 missing or unreadable, 409 withdrawn, 403 narrowing), the same pointer rule, and the same flags.
+  The caller owns the replacement or is `super_user`; a reader that is not the owner gets 403, a
+  non-reader the missing-id 404. `If-Match` names the replacement's revision; `revisions`, when sent,
+  maps every id to the target revision the caller judged, checked under the target's lock (412). The
+  replacement gains the new ids in `supersedes`, a `revision` bump and `lastEventKind: revised`; its
+  `needsReview`, `lastEditor` and `autoSupersedes` are untouched (a link is neither the owner's review nor a
+  judge's link). Ids it already supersedes are skipped, so a repeated link writes nothing. A memory
+  supersedes at most 100 (409 `supersedes_too_many`, the import cap), bounding what a withdrawal re-derives.
+- **The replacement may itself be superseded** (not withdrawn), so a chain found in history can be
+  linked newest first: after C supersedes B, "B supersedes A" still lands, and A reads `supersededBy: B`.
+  The freeze on superseded memories protects their scopes, which a link does not change. What it must
+  not do is close a cycle, where every member is superseded and none active. Adding R → T closes one exactly
+  when T already supersedes R directly or through others (non-withdrawn holders only; a withdrawn
+  superseder's links no longer count). The link walks those ancestors of R through the indexed
+  `supersedes`, locks them with its plan, walks again under the locks, and answers 409 `supersede_cycle`.
+  Any link that would make T reach R adds an edge into one of those rows, so it locks one of them and
+  serializes with this one. A create cannot close a cycle (nothing yet supersedes a new row); import
+  preserves source history as given and its client drops cycles.
+- **Candidates for an existing memory** (`GET /Memory/<id>/candidates`, `memoryCandidates`): the write-time
+  candidates (below) of a stored memory, from its stored vector, restricted to memories created before it
+  (`createdAt`, then id), as `{ candidates: [{ id, title, similarity }] }`. Owner or `super_user`, with the
+  same 403 / missing-id 404 split as a link, and 409 for a withdrawn memory. It neither judges nor applies,
+  ignores `supersession.mode` (which governs writes), and, unlike a write's advisory search, fails with the
+  search (503 / 500) instead of answering `[]`. The older-than rule is a condition in the query
+  (`createdAt < t or (createdAt = t and id < self)`), so same-millisecond rows with larger ids cannot fill
+  the nearest-k before the cut.
+- **Consequences of linking**: a create retried with its original `supersedes` after a link no longer
+  matches the stored row (400 `supersedes_not_allowed`), like any retry after a later change; an import
+  re-run reports a linked row as `conflict`.
 - **Write-time candidates**: every successful `PUT` (create, revise, identical retry) returns
   `candidates: [{ id, title, similarity, verdict?, applied? }]`: up to 5 of the nearest active,
   unexpired memories the writer can read that share at least one scope label with the written memory,
@@ -274,8 +309,8 @@ one of its supports changing.
   revises it or calls `confirm`. A review should therefore re-check all of its memory evidence.
 - **`confirmed` is an event, not a state**: it records the latest confirmation `{ by, at }` and survives
   later revisions; compare it with `lastEditor.revisedAt` to see which came last.
-- **Not its replacement**: a memory that lists X in `supersedes` (on create, or in the same import) is
-  never flagged for X.
+- **Not its replacement**: a memory that lists X in `supersedes` (on create, in the same import, or by a
+  link) is never flagged for X; a link patches the replacement before it flags.
 - **Citing serializes with the transition**: a create or revise locks the memories it newly cites, so a
   citer either commits first and is flagged, or reads X's new status. A citation the row already has is
   in the index, where the transition finds the citer and locks it. The lock is held for milliseconds, since
@@ -289,7 +324,7 @@ one of its supports changing.
   Keep sinks to a write in the `memory` database (an outbox) so a heavily cited memory can still be
   withdrawn.
 - **Prospective only**: flags start with the transition; memories that were already stale when this
-  shipped are not backfilled.
+  shipped are not flagged until a link supersedes their source (the supersession backfill does).
 
 ### Customer content
 
@@ -374,6 +409,9 @@ mounted with `hidden = false` only when the plugin option `mcp` is `true` (defau
 | `GET /Memory/<id>`                                                                      | read (`{ memory }` + `ETag: "<revision>"`)                                                                                          |
 | `DELETE /Memory/<id>?reason=`                                                           | withdraw with `If-Match: "<revision>"` (tombstone, returns `{ memory }`)                                                            |
 | `GET /Memory/?q=&tag=&scope=&limit=&includeSuperseded=&includeExpired=&flagged=&watch=` | search (no `q`: newest first; `flagged=true`: content-flagged memories the caller can read; `watch=true` watches every returned id) |
+| `GET /Memory/?order=created&after=<createdAt>,<id>&limit=`                              | list oldest first by `createdAt`, then id, one page after the cursor (no `q`)                                                       |
+| `GET /Memory/<id>/candidates`                                                           | older memories this one may replace (`{ candidates }`; owner or `super_user`)                                                       |
+| `POST /Memory/<id>/supersedes`                                                          | link existing memories as superseded by this one (`{ ids, revisions? }` + `If-Match`; `{ memory }`)                                 |
 | `GET /Memory/bootstrap?q=&budget=&watch=`                                               | session-start context (`watch=true` watches every returned id)                                                                      |
 | `POST /Memory/<id>/pin` · `/unpin`                                                      | per-reader pin / unpin (empty or `{}` body)                                                                                         |
 | `POST /Memory/<id>/confirm`                                                             | owner's review: clears `needsReview`, records `confirmed` (returns `{ memory }`)                                                    |
@@ -404,6 +442,14 @@ lease, since a batch writes up to 100 rows and flags their citers inside one tra
   and `needsReview` under the Provenance visibility rule; withdrawn memories never appear. The vector lane has no distance cutoff, so it contributes the
   nearest readable memories whatever their distance. Passing `watch=true` records a `MemoryWatch` (with
   the default 1 h TTL) for every memory id returned in the result.
+- `GET /Memory/?order=created&after=<createdAt>,<id>&limit=` — without `q`, lists oldest first by `createdAt`, then
+  id, under the same status, expiry, tag, scope and readable-set conditions as a search. `after` is the last
+  row of the previous page (`createdAt` as ISO, then id) and pushes `createdAt > t or (createdAt = t and id >
+id)` into the query, so every page holds exactly `limit` rows even when an import batch shares one
+  timestamp, and nothing is skipped or repeated. A memory created during a walk with an earlier `createdAt`
+  (an import preserving its source time) lands behind the cursor; walk again to see it. `order` with `q`, or
+  `after` without `order=created`, is 400. The tie is a closed range (`>= t and <= t`), not `equals`: Harper
+  5.3's count estimate for `equals` on a Date attribute throws.
 - **Searchable at commit**: both indexes are Harper derived indexes maintained after commit (`audit:
 true` puts `@embed`'s HNSW index on the native plane). Each lane passes `waitForIndexMilliseconds`,
   so a search covers every write committed before it began; an index that is already current does not
@@ -562,7 +608,7 @@ status, supersedes?, supersededBy?, createdAt?, validUntil?, withdrawnAt?, withd
   `ownerId`, editable fields (`title`, `content`, `tags`, `scopes`, `evidence`, `validUntil`), and
   `supersedes` (plus `withdrawnReason` when the import row is `withdrawn`) is `unchanged`; a row whose
   `id` exists with different fields is reported as `conflict` and is not overwritten, so a native
-  revision made after import survives. The response is `{ results: [{ id, result: created | unchanged |
+  revision made after import survives, and so does a link added since (its `supersedes` differs). The response is `{ results: [{ id, result: created | unchanged |
 conflict }] }`; an invalid row fails the batch with 400 and its `index`.
 
 ### Flair source (`scripts/import-flair.mjs`)
@@ -650,6 +696,34 @@ evidence: [{ kind: memory, ref: sourceId }], createdAt: source createdAt, validU
   `conflict` and are not relabeled.
 - **Customer data**: stdout and stderr carry ids, counts, scope labels and error codes only. The report
   (titles, organization names, rationales, lesson drafts) is written 0600 and never overwritten.
+
+### Supersession backfill (`scripts/backfill-supersession.mjs`)
+
+An operator CLI, run as a `super_user` from the operator's own machine, that turns the write-time
+detection into a one-off, reviewed cleanup of history that arrived without its links.
+
+- **Report**: walks every non-withdrawn memory oldest first through the created-order cursor (superseded
+  ones too: an existing C → B can still gain B → A), asks the server for each one's candidates, and asks
+  a judge to classify each (newer, older) pair `supersedes | refines | unrelated` with a one-sentence
+  rationale. Judging runs client-side because the target need not have a generative model; candidates
+  come from the server so the threshold and scope rules stay in one place. The report holds ids, titles,
+  `createdAt`, similarity, verdict, rationale, a content fingerprint per side (`sha256(title \n content)`,
+  16 hex) and `approve: false`. It never holds content; it is published 0600 through a temp file and an
+  exclusive hard link, so a crash leaves no truncated file and an existing report is never replaced. A
+  judge that fails on every pair writes no report.
+- **Apply** (`--apply <decisions file>`): only pairs with `verdict: supersedes` and `approve: true`, newest
+  replacement first, so when several approved replacements cover one memory its pointer and its citers'
+  flags name the latest. Before each link it re-reads both memories, skips the pair if either fingerprint
+  changed (content the judge never saw), is missing or withdrawn, or is already linked, and sends both
+  revisions it just read (`If-Match` and `revisions`), re-reading on 412. The whole decisions file is
+  validated before the first write; a refused pair is reported with the server's code and the run continues. Re-running links
+  nothing new.
+- **Judges** (`scripts/lib/model-backend.mjs`, shared with the import classifier): `claude` (default) runs
+  the local Claude Code CLI with `--safe-mode` (no CLAUDE.md, hooks, plugins or MCP servers; managed policy
+  hooks still run), the prompt on stdin and JSON-schema output; `anthropic` calls the Messages API with
+  structured output and server-side fallbacks, keyed only from `ANTHROPIC_API_KEY`; `stub` decides by a
+  marker in the newer memory (tests). Failures surface as codes, never the prompt or reply.
+- **Output**: stdout and stderr carry ids, counts and codes only.
 
 ## Claude Code plugin
 

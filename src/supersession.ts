@@ -1,9 +1,13 @@
 import { logger, models } from 'harper';
-import { memoryTable, STATUS_ACTIVE } from './lifecycle.ts';
-import { anyOf, readableConditions, type Principal } from './scopes.ts';
+import { memoryError, notFound } from './errors.ts';
+import { isMemoryId, memoryTable, STATUS_ACTIVE, STATUS_WITHDRAWN } from './lifecycle.ts';
+import { anyOf, canRead, readableConditions, type Principal } from './scopes.ts';
+import { DEFAULT_EMBEDDING_MODEL, getSettings } from './settings.ts';
 import {
 	assertReadable,
 	collect,
+	createdOrderCondition,
+	type CreatedPosition,
 	isVectorDimensionMismatch,
 	reportVectorLaneRejected,
 	unexpiredCondition,
@@ -50,6 +54,8 @@ export interface CandidateQuery {
 	embeddingModel: string;
 	scopes: readonly string[];
 	excludeIds: readonly string[];
+	/** Only memories created before this one, by `createdAt` and then id (`compareNewest`). */
+	olderThan?: CreatedPosition;
 }
 
 const lastWarning = new Map<string, number>();
@@ -62,10 +68,10 @@ function warnRateLimited(key: string, message: string, error?: unknown): void {
 }
 
 /**
- * Advisory: it does not wait for index coverage, so a memory committed within the index lag can be missed, and
- * a failed search yields no candidates rather than failing the write.
+ * Does not wait for index coverage, so a memory committed within the index lag can be missed. A failed search
+ * throws; a query vector the index cannot compare (another dimension) has no candidates.
  */
-export async function findCandidates(
+export async function searchCandidates(
 	query: CandidateQuery,
 	principal: Principal,
 	threshold: number,
@@ -83,6 +89,7 @@ export async function findCandidates(
 						anyOf(query.scopes.map((label) => ({ attribute: 'scopes', comparator: 'equals', value: label }))),
 						// Only rows embedded by the written row's model share its vector space.
 						{ attribute: 'embeddingModel', comparator: 'equals', value: query.embeddingModel },
+						...(query.olderThan ? [createdOrderCondition('less_than', query.olderThan)] : []),
 						...readableConditions(principal),
 					],
 					sort: { attribute: 'embedding', target: Array.from(query.vector) },
@@ -93,12 +100,8 @@ export async function findCandidates(
 			),
 		);
 	} catch (error: any) {
-		if (isVectorDimensionMismatch(error)) {
-			reportVectorLaneRejected(query.embeddingModel, error);
-			return [];
-		}
-		// Advice only: a failed search must not turn a committed write into an error.
-		warnRateLimited('candidates', 'supersession candidate search failed; returning none', error);
+		if (!isVectorDimensionMismatch(error)) throw error;
+		reportVectorLaneRejected(query.embeddingModel, error);
 		return [];
 	}
 	return assertReadable(hits, principal)
@@ -115,6 +118,49 @@ export async function findCandidates(
 			similarity: 1 - hit.$distance,
 		}))
 		.filter((match) => match.similarity >= threshold);
+}
+
+/** Advice on a write: a failed search yields no candidates rather than failing a committed write. */
+export async function findCandidates(
+	query: CandidateQuery,
+	principal: Principal,
+	threshold: number,
+	context: object,
+): Promise<CandidateMatch[]> {
+	try {
+		return await searchCandidates(query, principal, threshold, context);
+	} catch (error) {
+		warnRateLimited('candidates', 'supersession candidate search failed; returning none', error);
+		return [];
+	}
+}
+
+/**
+ * The older memories a write of this memory would propose, for a backfill of links between existing memories:
+ * the write-time rules (threshold, a shared scope label, readable by the caller) restricted to memories created
+ * before it. Neither judges nor applies; `supersession.mode` governs writes only.
+ */
+export async function memoryCandidates(id: string, principal: Principal, context: object): Promise<Candidate[]> {
+	const record = isMemoryId(id) ? await memoryTable().get(id, context) : undefined;
+	if (!record) throw notFound();
+	if (record.ownerId !== principal.id && !principal.superUser) {
+		if (!canRead(record, principal)) throw notFound();
+		throw memoryError('Only the owner can list candidates for this memory', 403, 'not_memory_owner');
+	}
+	if (record.status === STATUS_WITHDRAWN) throw memoryError('Memory has been withdrawn', 409, 'memory_withdrawn');
+	const matches = await searchCandidates(
+		{
+			vector: record.embedding,
+			embeddingModel: record.embeddingModel ?? DEFAULT_EMBEDDING_MODEL,
+			scopes: record.scopes ?? [],
+			excludeIds: [id, ...(record.supersedes ?? [])],
+			olderThan: { id, createdAt: record.createdAt },
+		},
+		principal,
+		getSettings().supersession.similarity,
+		context,
+	);
+	return toCandidates(matches);
 }
 
 /** Only a complete one-word answer counts; anything else (truncated, filtered, a tool call, prose) abstains. */

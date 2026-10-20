@@ -3,6 +3,7 @@ import { badRequest } from './errors.ts';
 import { recordWatches, WATCH_DEFAULT_TTL_SECONDS } from './events.ts';
 import {
 	BOOTSTRAP_PINNED_LIMIT,
+	isMemoryId,
 	memoryPinTable,
 	memoryTable,
 	STATUS_ACTIVE,
@@ -66,6 +67,25 @@ export interface SearchParams {
 	includeExpired: boolean;
 	flagged?: boolean;
 	watch?: boolean;
+	/** `created`: oldest first by `createdAt`, then id, paged with `after` (no `q`). */
+	order?: 'created';
+	after?: CreatedPosition;
+}
+
+export interface CreatedPosition {
+	createdAt: Date;
+	id: string;
+}
+
+// `<createdAt ISO>,<id>`: neither part can contain a comma.
+function parseCursor(value: string | null): CreatedPosition | undefined {
+	if (value === null || value === '') return undefined;
+	const [at, id, ...rest] = value.split(',');
+	const createdAt = new Date(at);
+	if (rest.length > 0 || !isMemoryId(id) || !at || Number.isNaN(createdAt.getTime())) {
+		throw badRequest('after must be "<createdAt>,<id>" from the last memory of the previous page', 'invalid_after');
+	}
+	return { createdAt, id };
 }
 
 function boundedInteger(value: string | null, field: string, fallback: number, max: number): number {
@@ -95,8 +115,15 @@ function booleanParam(params: URLSearchParams, name: string): boolean {
 export function parseSearchParams(params: URLSearchParams): SearchParams {
 	const scopes = params.getAll('scope');
 	if (!scopes.every(isScopeLabel)) throw badRequest('scope must be a scope label', 'invalid_scope_label');
+	const q = optionalQuery(params.get('q'));
+	const order = params.get('order');
+	if (order !== null && (order !== 'created' || q)) {
+		throw badRequest('order must be created, and applies only without q', 'invalid_order');
+	}
+	const after = parseCursor(params.get('after'));
+	if (after && !order) throw badRequest('after requires order=created', 'invalid_after');
 	return {
-		q: optionalQuery(params.get('q')),
+		q,
 		tags: params.getAll('tag'),
 		scopes,
 		limit: boundedInteger(params.get('limit'), 'limit', SEARCH_DEFAULT_LIMIT, SEARCH_MAX_LIMIT),
@@ -104,6 +131,28 @@ export function parseSearchParams(params: URLSearchParams): SearchParams {
 		includeExpired: booleanParam(params, 'includeExpired'),
 		flagged: booleanParam(params, 'flagged'),
 		watch: booleanParam(params, 'watch'),
+		...(order ? { order } : {}),
+		...(after ? { after } : {}),
+	};
+}
+
+/** Memories before (`less_than`) or after (`greater_than`) `position` in `createdAt`-then-id order. */
+export function createdOrderCondition(comparator: 'less_than' | 'greater_than', position: CreatedPosition): Condition {
+	const { createdAt, id } = position;
+	return {
+		operator: 'or',
+		conditions: [
+			{ attribute: 'createdAt', comparator, value: createdAt },
+			{
+				operator: 'and',
+				conditions: [
+					// The same instant as a closed range: Harper's count estimate for `equals` on a Date attribute throws.
+					{ attribute: 'createdAt', comparator: 'greater_than_equal', value: createdAt },
+					{ attribute: 'createdAt', comparator: 'less_than_equal', value: createdAt },
+					{ attribute: 'id', comparator, value: id },
+				],
+			},
+		],
 	};
 }
 
@@ -200,9 +249,24 @@ export async function searchMemories(
 	const Memory = memoryTable();
 	const conditions = filterConditions(params, principal);
 	if (!params.q) {
+		// The cursor is a condition in the query, so a page is exactly `limit` rows however many share a timestamp.
 		const recent = await collect(
 			Memory.search(
-				{ conditions, sort: { attribute: 'updatedAt', descending: true }, select: VIEW_FIELDS, limit: params.limit },
+				params.order === 'created'
+					? {
+							conditions: params.after
+								? [...conditions, createdOrderCondition('greater_than', params.after)]
+								: conditions,
+							sort: { attribute: 'createdAt', next: { attribute: 'id' } },
+							select: VIEW_FIELDS,
+							limit: params.limit,
+						}
+					: {
+							conditions,
+							sort: { attribute: 'updatedAt', descending: true },
+							select: VIEW_FIELDS,
+							limit: params.limit,
+						},
 				context,
 			),
 		);
