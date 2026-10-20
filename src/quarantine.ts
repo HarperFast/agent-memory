@@ -36,7 +36,7 @@ interface FlagDecision {
  */
 export function decideContentFlag(
 	check: ContentCheckSettings,
-	previous: { scopes: readonly string[]; textChanged: boolean; flag: ContentFlag | null } | undefined,
+	previous: { scopes: readonly string[]; textChanged: () => boolean; flag: ContentFlag | null } | undefined,
 	scopes: readonly string[],
 	labels: () => string[],
 	now: Date,
@@ -45,7 +45,7 @@ export function decideContentFlag(
 	if (!scopes.includes(GLOBAL_SCOPE)) return { flag: null, modelCheck: false, reviewLapsed: true };
 	const unchanged = { flag: current, modelCheck: false, reviewLapsed: false };
 	if (check.mode === 'off') return unchanged;
-	if (previous?.scopes.includes(GLOBAL_SCOPE) && !previous.textChanged) return unchanged;
+	if (previous?.scopes.includes(GLOBAL_SCOPE) && !previous.textChanged()) return unchanged;
 	const matched = labels();
 	if (matched.length > 0) {
 		return {

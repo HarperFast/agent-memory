@@ -355,7 +355,8 @@ since, source: 'pattern', labels }` (keeping `since` while the memory stays flag
 - **Cost**, measured on Harper 5.3.2 (one node, local, a loaded host, 2,000 `global` memories): the quarantine
   group added about 0.4 ms to a 3 ms search without `q` and stayed within run-to-run noise for a hybrid search;
   a `PUT` with the check on (2,000 organizations) was within noise of the check off; the replacement read that
-  lets an uncleared reader see a superseded memory added about 0.4 ms to its 0.5 ms `GET`. The matcher alone took
+  lets an uncleared reader see a superseded memory added about 0.4 ms to its 0.5 ms `GET`, and an
+  `includeSuperseded=true` search of 10 results stayed within noise (2.1 against 1.9 ms). The matcher alone took
   0.85 ms p50 for 20,000 characters against 5,000 organizations × 3 names and 64 host rules, 4.2 ms for 100,000,
   and 1 ms for 20,000 characters of a word that starts 50,000 names.
 

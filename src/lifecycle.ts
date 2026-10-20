@@ -95,8 +95,20 @@ function matchesIfNoneMatch(header: string, revision: number): boolean {
 		.some((part) => part === '*' || part === expected || part === `W/${expected}`);
 }
 
-function evidenceText(evidence: readonly EvidenceItem[]): string[] {
-	return evidence.flatMap((item) => [item.ref, item.note ?? '']);
+function sameCheckedEvidence(a: readonly EvidenceItem[], b: readonly EvidenceItem[]): boolean {
+	return (
+		a.length === b.length && a.every((item, i) => item.ref === b[i].ref && (item.note ?? '') === (b[i].note ?? ''))
+	);
+}
+
+function sameCheckedFields(a: any, b: any): boolean {
+	return (
+		(a.title ?? null) === (b.title ?? null) &&
+		a.content === b.content &&
+		sameStringArray(a.tags ?? [], b.tags ?? []) &&
+		sameCheckedEvidence(a.evidence ?? [], b.evidence ?? []) &&
+		sameStringArray(a.supersedes ?? [], b.supersedes ?? [])
+	);
 }
 
 export function sameStringArray(a: readonly string[], b: readonly string[]): boolean {
@@ -526,8 +538,7 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 		(parsedTitle !== undefined && parsedTitle !== (record.title ?? null)) ||
 		(parsedContent !== undefined && parsedContent !== record.content) ||
 		(parsedTags !== undefined && !sameStringArray(parsedTags, record.tags ?? [])) ||
-		(parsedEvidence !== undefined &&
-			!sameStringArray(evidenceText(parsedEvidence), evidenceText(record.evidence ?? [])));
+		(parsedEvidence !== undefined && !sameCheckedEvidence(parsedEvidence, record.evidence ?? []));
 
 	// Planning runs again when the transaction finds the pre-read overtaken; `reembed` then guarantees a vector.
 	const newCitations = (record: any): string[] =>
@@ -588,8 +599,7 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 			(match) => match.verdict === 'supersedes' && !supersedes.includes(match.id),
 		);
 		// Matched here, outside the locks; the transaction reuses it while the row is the one it was matched against.
-		let matched:
-			{ revision: number | undefined; updatedAt: unknown; supersedes: string[]; labels: string[] } | undefined;
+		let matched: { basis: any; supersedes: string[]; labels: string[] } | undefined;
 		const scopesAfter = planningCreate ? createScopes : revisedScopes;
 		if (
 			check.mode === 'flag' &&
@@ -608,8 +618,7 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 				supersedes: plannedSupersedes,
 			});
 			matched = {
-				revision: preExisting?.revision,
-				updatedAt: iso(preExisting?.updatedAt),
+				basis: preExisting,
 				supersedes: plannedSupersedes,
 				labels: matchCustomerContent(text, check.matcher),
 			};
@@ -632,9 +641,8 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 	const write = (planned: Awaited<ReturnType<typeof plan>>) => {
 		const labelsFor = (existing: any, finalSupersedes: string[], text: () => string) =>
 			planned.matched &&
-			// Revision numbers can repeat across nodes; with the write time they name one version of the row.
-			planned.matched.revision === existing?.revision &&
-			planned.matched.updatedAt === iso(existing?.updatedAt) &&
+			// The fields themselves, not the revision: revision numbers can repeat across nodes.
+			(planned.matched.basis ? existing && sameCheckedFields(planned.matched.basis, existing) : !existing) &&
 			sameStringArray(planned.matched.supersedes, finalSupersedes)
 				? planned.matched.labels
 				: matchCustomerContent(text(), check.matcher);
@@ -738,7 +746,7 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 						check,
 						{
 							scopes: existing.scopes ?? [],
-							textChanged: checkedFieldsChange(existing),
+							textChanged: () => checkedFieldsChange(existing),
 							flag: existing.contentFlag ?? null,
 						},
 						candidate.scopes,
