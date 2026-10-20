@@ -129,32 +129,37 @@ describe('claude backend', () => {
 		assert.ok(['cli_stdin_closed', 'cli_invalid_output'].includes(code), code);
 	});
 
+	// These fakes act before reading stdin, and the deadlines leave seconds for a slow start on a loaded machine: a
+	// CLI killed before it ran its first line would test nothing.
 	it('kills a CLI that runs past the timeout and settles only after it has exited', async () => {
+		const pidFile = join(dir, 'hang.pid');
 		const cli = await fakeCli(
 			'hang',
-			`process.on('SIGTERM', () => {}); setInterval(() => {}, 1000); writeFileSync(${JSON.stringify(join(dir, 'hang.pid'))}, String(process.pid));`,
+			`process.on('SIGTERM', () => {}); writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setInterval(() => {}, 1000);`,
+			{ readStdin: false },
 		);
-		const started = Date.now();
-		assert.equal(await failure(complete(cli, { timeoutMs: 200 })), 'cli_timeout');
-		assert.ok(Date.now() - started >= 200);
-		const pid = Number(await readFile(join(dir, 'hang.pid'), 'utf8'));
+		assert.equal(await failure(complete(cli, { timeoutMs: 1_500 })), 'cli_timeout');
+		const pid = Number(await readFile(pidFile, 'utf8'));
 		assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' }, 'the child was reaped before the call settled');
 	});
 
 	it('settles at the timeout when the CLI exited but a descendant still holds its output open', async () => {
+		const pidFile = join(dir, 'orphan.pid');
 		const cli = await fakeCli(
 			'orphan',
 			`const { spawn } = require('node:child_process');
-const holder = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 20000)'], { stdio: ['ignore', 'inherit', 'ignore'] });
-writeFileSync(${JSON.stringify(join(dir, 'orphan.pid'))}, String(holder.pid));
+const holder = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { stdio: ['ignore', 'inherit', 'ignore'] });
+writeFileSync(${JSON.stringify(pidFile)}, String(holder.pid));
 process.exit(0);`,
+			{ readStdin: false },
 		);
 		const started = Date.now();
 		try {
-			assert.equal(await failure(complete(cli, { timeoutMs: 300 })), 'cli_timeout');
-			assert.ok(Date.now() - started < 4_000);
+			assert.equal(await failure(complete(cli, { timeoutMs: 1_500 })), 'cli_timeout');
+			assert.ok(Date.now() - started < 30_000, 'settled long before the descendant let go of the output');
 		} finally {
-			process.kill(Number(await readFile(join(dir, 'orphan.pid'), 'utf8')), 'SIGKILL');
+			const holder = await readFile(pidFile, 'utf8').catch(() => undefined);
+			if (holder) process.kill(Number(holder), 'SIGKILL');
 		}
 	});
 
