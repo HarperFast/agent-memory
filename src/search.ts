@@ -11,7 +11,7 @@ import {
 	type MemoryView,
 } from './lifecycle.ts';
 import { forReader } from './provenance.ts';
-import { anyOf, canRead, isScopeLabel, readableCondition, type Condition, type Principal } from './scopes.ts';
+import { anyOf, canRead, isScopeLabel, readableConditions, type Condition, type Principal } from './scopes.ts';
 import { getSettings } from './settings.ts';
 
 const RRF_K = 60;
@@ -46,6 +46,8 @@ const VIEW_FIELDS = [
 	'supersededBy',
 	'needsReview',
 	'confirmed',
+	'contentFlag',
+	'scopeConfirmed',
 	'author',
 	'lastEditor',
 	'validUntil',
@@ -62,6 +64,7 @@ export interface SearchParams {
 	limit: number;
 	includeSuperseded: boolean;
 	includeExpired: boolean;
+	flagged?: boolean;
 	watch?: boolean;
 }
 
@@ -99,6 +102,7 @@ export function parseSearchParams(params: URLSearchParams): SearchParams {
 		limit: boundedInteger(params.get('limit'), 'limit', SEARCH_DEFAULT_LIMIT, SEARCH_MAX_LIMIT),
 		includeSuperseded: booleanParam(params, 'includeSuperseded'),
 		includeExpired: booleanParam(params, 'includeExpired'),
+		flagged: booleanParam(params, 'flagged'),
 		watch: booleanParam(params, 'watch'),
 	};
 }
@@ -122,11 +126,11 @@ function filterConditions(params: SearchParams, principal: Principal, now = new 
 	];
 	if (!params.includeExpired) conditions.push(unexpiredCondition(now));
 	for (const tag of params.tags) conditions.push({ attribute: 'tags', comparator: 'equals', value: tag });
+	if (params.flagged) conditions.push({ attribute: 'contentFlagged', comparator: 'equals', value: true });
 	if (params.scopes.length > 0) {
 		conditions.push(anyOf(params.scopes.map((label) => ({ attribute: 'scopes', comparator: 'equals', value: label }))));
 	}
-	const readable = readableCondition(principal);
-	if (readable) conditions.push(readable);
+	conditions.push(...readableConditions(principal));
 	return conditions;
 }
 
@@ -300,7 +304,7 @@ export async function bootstrapMemories(params: BootstrapParams, principal: Prin
 	const MemoryPin = memoryPinTable();
 	const active = { attribute: 'status', comparator: 'equals', value: STATUS_ACTIVE };
 	const unexpired = unexpiredCondition(new Date());
-	const readable = readableCondition(principal);
+	const readable = readableConditions(principal);
 	const recentFirst = { attribute: 'updatedAt', descending: true };
 	// One lookup per flag source across every section.
 	const access = new Map<string, Promise<any>>();
@@ -321,7 +325,7 @@ export async function bootstrapMemories(params: BootstrapParams, principal: Prin
 		const records = await collect(
 			Memory.search(
 				{
-					conditions: [active, unexpired, pinIds, ...(readable ? [readable] : [])],
+					conditions: [active, unexpired, pinIds, ...readable],
 					select: VIEW_FIELDS,
 					limit: BOOTSTRAP_PINNED_LIMIT,
 				},

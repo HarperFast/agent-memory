@@ -52,7 +52,7 @@ describe('MEMORY_RESOURCES static surface', () => {
 		assert.equal(MemoryMcpResource.hidden, false);
 		assert.deepEqual(
 			MemoryMcpResource.mcpTools.map((t) => t.name),
-			['remember', 'revise', 'recall', 'get', 'withdraw', 'pin', 'unpin', 'confirm', 'watch'],
+			['remember', 'revise', 'recall', 'get', 'withdraw', 'pin', 'unpin', 'confirm', 'confirm-scope', 'watch'],
 		);
 		assert.deepEqual(
 			MemoryMcpResource.mcpResources.map((r) => [r.name, r.uriTemplate, r.method, 'read' in r]),
@@ -71,7 +71,7 @@ describe('MEMORY_RESOURCES static surface', () => {
 			await MemoryItemResource.put(queryTarget('', { id }), { title: 't1', content: 'alpha content' }, context),
 		);
 		assert.equal(created.status, 201);
-		assert.deepEqual(created.body, { id, revision: 1, candidates: [] });
+		assert.deepEqual(created.body, { id, revision: 1, candidates: [], contentFlag: null });
 
 		const fetched = await parse(await MemoryItemResource.get(queryTarget('', { id }), context));
 		assert.equal(fetched.status, 200);
@@ -111,7 +111,7 @@ describe('MEMORY_RESOURCES static surface', () => {
 			),
 		);
 		assert.equal(revised.status, 200);
-		assert.deepEqual(revised.body, { id, revision: 2, candidates: [] });
+		assert.deepEqual(revised.body, { id, revision: 2, candidates: [], contentFlag: null });
 
 		const afterRevise = await parse(await MemoryItemResource.get(queryTarget('', { id }), context));
 		assert.equal(afterRevise.headers.get('etag'), '"2"');

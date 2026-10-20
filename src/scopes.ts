@@ -1,6 +1,7 @@
 import { badRequest, memoryError } from './errors.ts';
 
-const GLOBAL_SCOPE = 'global';
+export const GLOBAL_SCOPE = 'global';
+const CUSTOMER_NAMESPACE = 'customer';
 const SCOPE_LABEL_MAX_CHARS = 128;
 // `user:` plus the id must fit a 128-character label.
 const PRINCIPAL_ID_MAX_CHARS = 122;
@@ -45,6 +46,7 @@ export interface ScopedRecord {
 	ownerId?: string;
 	scopes?: readonly string[];
 	status?: string;
+	contentFlag?: unknown;
 }
 
 const USER_PREFIX = 'user:';
@@ -128,10 +130,27 @@ export function createPrincipal(input: PrincipalInput, onRejectedPattern?: (patt
 	});
 }
 
-/** Rule 1 of DESIGN.md. Withdrawn memories stay readable to their owner so the tombstone can be inspected; everyone else sees them as gone. */
+/** Cleared for customer content: an exact `customer:<org>` grant does not clear, since a flag can name any customer. */
+export function readsCustomerContent(principal: Principal): boolean {
+	return principal.superUser || principal.read.namespaces.has(CUSTOMER_NAMESPACE);
+}
+
+export function reviewsCustomerContent(principal: Principal): boolean {
+	return principal.superUser || principal.write.namespaces.has(CUSTOMER_NAMESPACE);
+}
+
+export function isCustomerScope(label: string): boolean {
+	return label.startsWith(`${CUSTOMER_NAMESPACE}:`);
+}
+
+/**
+ * Rule 1 of DESIGN.md. Withdrawn memories stay readable to their owner so the tombstone can be inspected; everyone
+ * else sees them as gone. A content flag only removes access, never grants it.
+ */
 export function canRead(record: ScopedRecord, principal: Principal): boolean {
 	if (principal.superUser || record.ownerId === principal.id) return true;
 	if (record.status === 'withdrawn') return false;
+	if (record.contentFlag && !readsCustomerContent(principal)) return false;
 	return (record.scopes ?? []).some((label) => matches(principal.read, label));
 }
 
@@ -193,19 +212,23 @@ export function anyOf(conditions: Condition[]): Condition {
 }
 
 /**
- * Rule 5: the readable set as one query condition, pushed into every search lane before its limit. Harper
- * indexes each element of the `scopes` array and matches an array when any element matches. A namespace
- * wildcard is the half-open range [`ns:`, `ns;`) — exactly the labels with that prefix, since `;` follows `:`
- * — because Harper plans `gelt` from the index where it would scan for `starts_with`. Undefined for
- * super_user, who reads everything.
+ * Rule 5: `canRead` as query conditions, pushed into every search lane before its limit. Harper indexes each
+ * element of the `scopes` array and matches an array when any element matches. A namespace wildcard is the
+ * half-open range [`ns:`, `ns;`) — exactly the labels with that prefix, since `;` follows `:` — because Harper
+ * plans `gelt` from the index where it would scan for `starts_with`. Empty for super_user, who reads everything.
+ *
+ * The quarantine is a second group rather than a branch of the first, so the label group keeps the finite
+ * estimate that lets its index drive a narrow principal's search. `not_equals` is filter-only in Harper and is
+ * true for rows written before `contentFlagged` existed, where `equals null` would drop them.
  */
-export function readableCondition(principal: Principal): Condition | undefined {
-	if (principal.superUser) return undefined;
-	const conditions: Condition[] = [{ attribute: 'ownerId', comparator: 'equals', value: principal.id }];
-	for (const label of principal.read.exact)
-		conditions.push({ attribute: 'scopes', comparator: 'equals', value: label });
+export function readableConditions(principal: Principal): Condition[] {
+	if (principal.superUser) return [];
+	const owned: Condition = { attribute: 'ownerId', comparator: 'equals', value: principal.id };
+	const labels: Condition[] = [owned];
+	for (const label of principal.read.exact) labels.push({ attribute: 'scopes', comparator: 'equals', value: label });
 	for (const namespace of principal.read.namespaces) {
-		conditions.push({ attribute: 'scopes', comparator: 'gelt', value: [`${namespace}:`, `${namespace};`] });
+		labels.push({ attribute: 'scopes', comparator: 'gelt', value: [`${namespace}:`, `${namespace};`] });
 	}
-	return anyOf(conditions);
+	if (readsCustomerContent(principal)) return [anyOf(labels)];
+	return [anyOf(labels), anyOf([owned, { attribute: 'contentFlagged', comparator: 'not_equals', value: true }])];
 }

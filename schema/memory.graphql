@@ -22,6 +22,10 @@ type Memory @table(database: "memory", audit: true) {
 	# The transition kind of the latest write, read from the audit entry by live subscriptions; never in a view.
 	lastEventKind: String
 	confirmed: Any # { by, at }
+	contentFlag: Any # { kind: possible-customer-detail, since, source: pattern | model, labels? }
+	# true while contentFlag is set, indexed because Harper does not index object values; never in a view.
+	contentFlagged: Boolean @indexed
+	scopeConfirmed: Any # { by, at }
 	author: Any
 	lastEditor: Any
 	validUntil: Date

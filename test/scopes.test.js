@@ -10,8 +10,10 @@ import {
 	MAX_GRANT_PATTERNS,
 	MAX_SCOPES_PER_MEMORY,
 	normalizeScopes,
-	readableCondition,
+	readableConditions,
+	readsCustomerContent,
 	requirePrincipalId,
+	reviewsCustomerContent,
 } from '../dist/scopes.js';
 
 const principal = (id, read = [], write = [], superUser = false) =>
@@ -23,14 +25,18 @@ function evaluate(condition, record) {
 		const results = condition.conditions.map((child) => evaluate(child, record));
 		return condition.operator === 'or' ? results.some(Boolean) : results.every(Boolean);
 	}
+	const value = record[condition.attribute];
+	// Negated comparators are evaluated on the whole value, and an absent attribute is not equal to anything.
+	if (condition.comparator === 'not_equals') return value !== condition.value;
 	const test = (value) => {
 		if (condition.comparator === 'equals') return value === condition.value;
 		if (condition.comparator === 'gelt') return value >= condition.value[0] && value < condition.value[1];
 		throw new Error(`unexpected comparator ${condition.comparator}`);
 	};
-	const value = record[condition.attribute];
 	return Array.isArray(value) ? value.some(test) : test(value);
 }
+
+const evaluateAll = (conditions, record) => conditions.every((condition) => evaluate(condition, record));
 
 function rejects(fn, statusCode, code) {
 	assert.throws(fn, (error) => error.statusCode === statusCode && error.code === code);
@@ -178,13 +184,14 @@ describe('normalizeScopes', () => {
 	});
 });
 
-describe('readableCondition', () => {
-	it('is undefined for super_user, who reads everything', () => {
-		assert.equal(readableCondition(principal('root', [], [], true)), undefined);
+describe('readableConditions', () => {
+	it('is empty for super_user, who reads everything', () => {
+		assert.deepEqual(readableConditions(principal('root', [], [], true)), []);
 	});
 
 	it('expresses a wildcard as the exact prefix range, which Harper can plan from the index', () => {
-		const condition = readableCondition(principal('dave', ['customer:*', 'global']));
+		const [condition, ...rest] = readableConditions(principal('dave', ['customer:*', 'global']));
+		assert.deepEqual(rest, []);
 		assert.equal(condition.operator, 'or');
 		assert.deepEqual(condition.conditions, [
 			{ attribute: 'ownerId', comparator: 'equals', value: 'dave' },
@@ -194,13 +201,27 @@ describe('readableCondition', () => {
 		]);
 	});
 
-	it('agrees with canRead on every non-withdrawn record', () => {
+	it('adds the quarantine as its own group for a principal not cleared for customer content', () => {
+		const conditions = readableConditions(principal('carol', ['customer:x', 'global']));
+		assert.equal(conditions.length, 2);
+		assert.deepEqual(conditions[1], {
+			operator: 'or',
+			conditions: [
+				{ attribute: 'ownerId', comparator: 'equals', value: 'carol' },
+				{ attribute: 'contentFlagged', comparator: 'not_equals', value: true },
+			],
+		});
+	});
+
+	it('agrees with canRead on every non-withdrawn record, flagged or not, including rows written before the flag', () => {
 		const readers = [
 			principal('alice'),
 			principal('carol', ['customer:x']),
 			principal('dave', ['customer:*', 'global']),
 			principal('erin', ['team:a', 'team:*']),
+			principal('fleet', ['global']),
 		];
+		const flag = { kind: 'possible-customer-detail', since: '2026-10-20T00:00:00.000Z', source: 'pattern' };
 		const records = [
 			{ ownerId: 'alice', scopes: ['user:alice'] },
 			{ ownerId: 'bob', scopes: ['customer:x'] },
@@ -210,15 +231,55 @@ describe('readableCondition', () => {
 			{ ownerId: 'bob', scopes: ['global', 'team:a'] },
 			{ ownerId: 'alice', scopes: ['team:z'] },
 			{ ownerId: 'bob', scopes: ['user:bob'] },
+			{ ownerId: 'bob', scopes: ['global'], contentFlagged: null, contentFlag: null },
+			{ ownerId: 'bob', scopes: ['global'], contentFlagged: true, contentFlag: flag },
+			{ ownerId: 'bob', scopes: ['customer:x', 'global'], contentFlagged: true, contentFlag: flag },
+			{ ownerId: 'bob', scopes: ['global', 'team:a'], contentFlagged: true, contentFlag: flag },
+			{ ownerId: 'alice', scopes: ['global'], contentFlagged: true, contentFlag: flag },
+			{ ownerId: 'fleet', scopes: ['global'], contentFlagged: true, contentFlag: flag },
 		].map((record) => ({ ...record, status: 'active' }));
 		for (const reader of readers) {
 			for (const record of records) {
 				assert.equal(
-					evaluate(readableCondition(reader), record),
+					evaluateAll(readableConditions(reader), record),
 					canRead(record, reader),
 					`${reader.id} on ${JSON.stringify(record)}`,
 				);
 			}
 		}
+	});
+});
+
+describe('the customer-content quarantine', () => {
+	const flagged = {
+		ownerId: 'bob',
+		scopes: ['global'],
+		status: 'active',
+		contentFlag: { kind: 'possible-customer-detail', since: '2026-10-20T00:00:00.000Z', source: 'pattern' },
+	};
+
+	it('hides a flagged memory from a global reader, an exact customer grant and a write-only wildcard', () => {
+		for (const reader of [
+			principal('fleet', ['global']),
+			principal('carol', ['customer:x', 'global']),
+			principal('wanda', ['global'], ['customer:*']),
+		]) {
+			assert.equal(canRead(flagged, reader), false, reader.id);
+		}
+	});
+
+	it('lets the owner, super_user and a customer:* reader read it, and grants nothing beyond the labels', () => {
+		assert.equal(canRead(flagged, principal('bob')), true);
+		assert.equal(canRead(flagged, principal('root', [], [], true)), true);
+		assert.equal(canRead(flagged, principal('dave', ['customer:*', 'global'])), true);
+		assert.equal(canRead(flagged, principal('dora', ['customer:*'])), false);
+	});
+
+	it('names clearance by wildcard grants only', () => {
+		assert.equal(readsCustomerContent(principal('dave', ['customer:*'])), true);
+		assert.equal(readsCustomerContent(principal('carol', ['customer:x'])), false);
+		assert.equal(reviewsCustomerContent(principal('dave', ['customer:*'])), false);
+		assert.equal(reviewsCustomerContent(principal('dave', [], ['customer:*'])), true);
+		assert.equal(reviewsCustomerContent(principal('root', [], [], true)), true);
 	});
 });

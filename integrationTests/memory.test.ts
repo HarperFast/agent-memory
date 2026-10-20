@@ -423,9 +423,9 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 		const first = await call('alice', 'PUT', id, input);
 		const retry = await call('alice', 'PUT', id, input);
 		strictEqual(first.status, 201);
-		deepStrictEqual(first.body, { id, revision: 1, candidates: [] });
+		deepStrictEqual(first.body, { id, revision: 1, candidates: [], contentFlag: null });
 		strictEqual(retry.status, 200);
-		deepStrictEqual(retry.body, { id, revision: 1, candidates: [] });
+		deepStrictEqual(retry.body, { id, revision: 1, candidates: [], contentFlag: null });
 
 		const createOnly = await call('alice', 'PUT', id, input, { 'If-None-Match': '*' });
 		strictEqual(createOnly.status, 412);
@@ -441,7 +441,7 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 
 		const revised = await call('alice', 'PUT', id, { ...input, content: 'other' }, { 'If-Match': '"1"' });
 		strictEqual(revised.status, 200);
-		deepStrictEqual(revised.body, { id, revision: 2, candidates: [] });
+		deepStrictEqual(revised.body, { id, revision: 2, candidates: [], contentFlag: null });
 
 		const reviseWithSupersedes = await call(
 			'alice',
@@ -1320,7 +1320,7 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 		return init.sessionId!;
 	}
 
-	test('MCP endpoint exposes the 9 memory tools and memory:///{id} resource template, and enforces lifecycle rules', async () => {
+	test('MCP endpoint exposes the 10 memory tools and memory:///{id} resource template, and enforces lifecycle rules', async () => {
 		const aliceSession = await initMcpSession('alice');
 		const bobSession = await initMcpSession('bob');
 
@@ -1334,7 +1334,7 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 		const toolNames = allToolNames.filter((n) => n !== 'get_MismatchProbe');
 		deepStrictEqual(
 			toolNames,
-			['confirm', 'get', 'pin', 'recall', 'remember', 'revise', 'unpin', 'watch', 'withdraw'],
+			['confirm', 'confirm-scope', 'get', 'pin', 'recall', 'remember', 'revise', 'unpin', 'watch', 'withdraw'],
 			`unexpected MCP tools: ${JSON.stringify(toolNames)}`,
 		);
 

@@ -317,7 +317,7 @@ describe('who sees a flag', () => {
 		const search = Memory.search.bind(Memory);
 		Memory.search = (query, ctx) => {
 			const results = search(query, ctx);
-			if (query.select?.join() !== 'id,ownerId,scopes,status') return results;
+			if (query.select?.join() !== 'id,ownerId,scopes,status,contentFlag') return results;
 			return (async function* () {
 				await new Promise((resolve) => setTimeout(resolve, 10));
 				yield* results;
@@ -342,7 +342,7 @@ describe('who sees a flag', () => {
 		const Memory = databases.memory.Memory;
 		const search = Memory.search.bind(Memory);
 		Memory.search = (query, ctx) => {
-			if (query.select?.join() !== 'id,ownerId,scopes,status') return search(query, ctx);
+			if (query.select?.join() !== 'id,ownerId,scopes,status,contentFlag') return search(query, ctx);
 			return (async function* () {
 				throw Object.assign(new Error('index rebuilding'), { statusCode: 503 });
 			})();
@@ -417,7 +417,9 @@ describe('bootstrap', () => {
 		const { memories } = await bootstrapMemories({ budget: 100_000 }, revoked, context);
 		const section = memories.filter((memory) => memory.section === 'needsReview').map((memory) => memory.id);
 		assert.deepEqual(section, [visible.id]);
-		const lookups = __test.searchLog.filter((entry) => entry.query.select?.join() === 'id,ownerId,scopes,status');
+		const lookups = __test.searchLog.filter(
+			(entry) => entry.query.select?.join() === 'id,ownerId,scopes,status,contentFlag',
+		);
 		const scan = __test.searchLog.find((entry) =>
 			entry.query.conditions?.some((condition) => condition.attribute === 'needsReviewSince'),
 		);

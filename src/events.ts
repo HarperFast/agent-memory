@@ -433,11 +433,12 @@ async function resolveDeliverableEvent(
 	// ignoring `status: 'withdrawn'`, so watchers and label readers learn a shared memory was withdrawn.
 	const readable =
 		kind === 'withdrawn'
-			? canRead({ ownerId: record.ownerId, scopes: record.scopes }, currentPrincipal)
+			? canRead({ ownerId: record.ownerId, scopes: record.scopes, contentFlag: record.contentFlag }, currentPrincipal)
 			: canRead(record, currentPrincipal);
 	if (!readable) return undefined;
 
-	if (kind === 'flagged' && !(await hasVisibleFlag(record, currentPrincipal))) {
+	// Whoever can read a content-flagged memory can see its flag.
+	if (kind === 'flagged' && !record.contentFlag && !(await hasVisibleFlag(record, currentPrincipal))) {
 		return undefined;
 	}
 	const updatedStamp =
@@ -733,14 +734,20 @@ export async function subscribeMemoryEvents(
 		throw notFound();
 	}
 
+	// A write that leaves the owner's memory flagged: `flagged`, a review flag folded into a restore or create, or
+	// a create or revise the customer-content check flagged.
+	const isFlagEvent = (kind: MemoryEventKind, record: any): boolean =>
+		kind === 'flagged' ||
+		((kind === 'restored' || kind === 'created') && Boolean(record?.needsReview)) ||
+		((kind === 'created' || kind === 'revised') && Boolean(record?.contentFlag));
+
 	const matchesWatchOrOwnFlag = (raw: any): { maybeOwnFlagged: boolean; watchConfirmed: boolean } | undefined => {
 		const eventRecord = raw?.value;
 		const id = String(raw?.id ?? eventRecord?.id ?? '');
 		const kind = eventRecord?.lastEventKind;
 		if (!id || !isEventKind(kind)) return undefined;
-		const hasFoldedOrDirectFlag =
-			kind === 'flagged' || ((kind === 'restored' || kind === 'created') && Boolean(eventRecord?.needsReview));
-		const maybeOwnFlagged = hasFoldedOrDirectFlag && (!eventRecord?.ownerId || eventRecord.ownerId === principal.id);
+		const maybeOwnFlagged =
+			isFlagEvent(kind, eventRecord) && (!eventRecord?.ownerId || eventRecord.ownerId === principal.id);
 		if (maybeOwnFlagged) return { maybeOwnFlagged: true, watchConfirmed: false };
 		if (!hasActiveWatch(principal.id, id)) return undefined;
 		return { maybeOwnFlagged: false, watchConfirmed: true };
@@ -760,12 +767,8 @@ export async function subscribeMemoryEvents(
 			if (!deliverable) return undefined;
 			const { event, record, currentPrincipal, dedupToken } = deliverable;
 
-			if (
-				(event.kind === 'flagged' ||
-					((event.kind === 'restored' || event.kind === 'created') && Boolean(record.needsReview))) &&
-				record.ownerId === currentPrincipal.id
-			) {
-				if (event.kind === 'flagged' || (await hasVisibleFlag(record, currentPrincipal))) {
+			if (isFlagEvent(event.kind, record) && record.ownerId === currentPrincipal.id) {
+				if (event.kind === 'flagged' || record.contentFlag || (await hasVisibleFlag(record, currentPrincipal))) {
 					return { event, dedupToken };
 				}
 			}

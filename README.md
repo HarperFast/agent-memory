@@ -7,8 +7,9 @@ Shared, permissioned, live memory for agents and people, as a Harper plugin.
 - First-class supersession: replacing a memory hides the old one from default search, and withdrawing the replacement restores it
 - Write-time supersession candidates: every `PUT` returns the similar memories it may replace, optionally classified by a judge model, which `auto` mode can act on
 - Provenance flags: when a memory is superseded or withdrawn, the memories citing it as evidence get `needsReview` until their owner revises or confirms them
+- Customer-content flag: a `global` write that names a configured customer, or matches a configured host pattern, is committed but readable only by its owner and `customer:*` readers until a reviewer rescopes or confirms it; an optional model check runs after commit
 - Live updates: Level 1 real-time subscriptions on `/Memory` and `/Memory/<id>` (SSE, WebSocket) with delivery-time read checks, and Level 2 watches (`POST /Memory/watch`, `watch=true` on search/bootstrap) delivered with own `needsReview` flags on `/MemoryEvents`
-- MCP surface (`mcp: true`): `remember`, `revise`, `recall`, `get`, `withdraw`, `pin`, `unpin`, `confirm`, `watch` tools and `memory:///{id}` resource
+- MCP surface (`mcp: true`): `remember`, `revise`, `recall`, `get`, `withdraw`, `pin`, `unpin`, `confirm`, `confirm-scope`, `watch` tools and `memory:///{id}` resource
 - Extension points: `registerMemorySink` runs inside the lifecycle transaction for apps that mirror memories elsewhere, `setPrincipalResolver` maps app-defined identities
 
 Status: pre-release (v0). Design and contracts: [DESIGN.md](DESIGN.md).
@@ -32,6 +33,14 @@ Requires Harper 5.3.1 or later on RocksDB (the default).
      #   similarity: 0.82         # candidates returned on PUT at or above this cosine similarity
      #   judge: 'judge'           # a generative model that classifies each candidate
      #   mode: 'suggest'          # 'off', or 'auto' (needs judge): apply "supersedes" verdicts on create
+     # customerContentCheck:      # absent = off
+     #   mode: 'flag'             # or 'off': stop checking (existing flags stay enforced)
+     #   model: 'content-check'   # optional generative model, asked after commit
+     #   patterns:
+     #     namesFile: '/etc/agent-memory/customer-names.json'  # absolute path, never in a repo; or:
+     #     namesSecret: 'AGENT_MEMORY_CUSTOMER_NAMES'          # a component secret: { "<org>": ["Name", "Alias"] }
+     #     hosts:
+     #       - { label: 'cloud-host', regex: '[a-z0-9-]+\.example-cloud\.com' }
    ```
 
    ```yaml
@@ -86,6 +95,12 @@ Requires Harper 5.3.1 or later on RocksDB (the default).
 
    # a memory whose cited evidence was superseded or withdrawn carries needsReview; the owner clears it
    curl -u carol:pass -X POST localhost:9926/Memory/<id>/confirm -H 'Content-Type: application/json' -d '{}'
+
+   # a global memory flagged for possible customer detail: a customer:* writer rescopes or confirms it
+   curl -u dave:pass 'localhost:9926/Memory/?flagged=true'               # the review queue
+   curl -u dave:pass -X PUT localhost:9926/Memory/<id> -H 'Content-Type: application/json' -H 'If-Match: "1"' \
+     -d '{ "scopes": ["customer:acme"] }'
+   curl -u dave:pass -X POST localhost:9926/Memory/<id>/confirm-scope -H 'Content-Type: application/json' -d '{}'
 
    # replace a memory: everyone who reads the old one through its labels must be able to read the replacement
    curl -u carol:pass -X PUT localhost:9926/Memory/<new-id> -H 'Content-Type: application/json' -d '{
@@ -160,7 +175,7 @@ The bundled `memory-routing` skill enforces a single-home rule:
 
 - **Route to `agent-memory` (MCP tools)**: team-relevant findings, architectural decisions, domain
   invariants, and cross-session lessons (`remember`, `revise`, `recall`, `get`, `withdraw`, `pin`,
-  `unpin`, `confirm`, `watch`).
+  `unpin`, `confirm`, `confirm-scope`, `watch`).
 - **Keep in Claude's native file memory (`~/.claude/projects/.../memory/`)**: machine-specific paths,
   local worktree/harness state, and personal workflow preferences.
 - **Never duplicate**: never write the same fact to both stores.

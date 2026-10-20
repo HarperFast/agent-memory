@@ -35,6 +35,7 @@ allowlists, idempotent `PUT` create/revise with `If-Match` revision precondition
 | Provenance review flags (`needsReview`, `confirm`)                                                               | implemented (`src/provenance.ts`)   |
 | Live updates (Level 1 subscriptions, Level 2 `MemoryWatch` and `/MemoryEvents`)                                  | implemented (`src/events.ts`)       |
 | MCP tools and `memory:///{id}` resource (`mcp` option)                                                           | implemented (`src/mcp.ts`)          |
+| Customer-content flag and quarantine (`customerContentCheck` option)                                             | implemented (`src/quarantine.ts`)   |
 
 ## Data model
 
@@ -53,13 +54,15 @@ See `schema/memory.graphql`. The table is not `@export`ed: every read and write 
 `Memory` resource so the rules below have exactly one enforcement point.
 
 Server-owned fields: `ownerId`, `status`, `revision`, `author`, `lastEditor`, `supersededBy`,
-`autoSupersedes`, `evidenceMemoryIds`, `needsReview`, `needsReviewSince`, `confirmed`, `createdAt`,
-`embeddingModel`, `lastEventKind`. `createdAt` is set by the lifecycle rather than `@createdTime`, because Harper's
+`autoSupersedes`, `evidenceMemoryIds`, `needsReview`, `needsReviewSince`, `confirmed`, `contentFlag`,
+`contentFlagged`, `scopeConfirmed`, `createdAt`, `embeddingModel`, `lastEventKind`. `createdAt` is set by the lifecycle rather than `@createdTime`, because Harper's
 `@createdTime` overwrites a supplied value on insert and import must preserve it. `updatedAt` stays
 `@updatedTime`. `needsReviewSince` mirrors `needsReview.since` because Harper does not index object
 values; `lastEventKind` records the lifecycle event kind (`created`, `revised`, `superseded`, `withdrawn`,
-`restored`, `flagged`) on each write so real-time subscribers receive the exact transition. Neither
-`needsReviewSince` nor `lastEventKind` is ever in a view. Rows written before a field existed read it as
+`restored`, `flagged`) on each write so real-time subscribers receive the exact transition.
+`contentFlagged` is `true` exactly while `contentFlag` is set (the two are always written together), for the
+same reason as `needsReviewSince`. None of `needsReviewSince`, `contentFlagged` and `lastEventKind` is ever in a
+view. Rows written before a field existed read it as
 absent, which every reader treats as null.
 
 ## Identity
@@ -119,7 +122,8 @@ most 256 patterns per principal count, which bounds the condition every search c
 Rules:
 
 1. **Read**: `scopes ∩ readable(caller) ≠ ∅`, or the caller is the owner. A withdrawn memory is
-   readable by its owner and `super_user` only. A memory the caller cannot read is indistinguishable
+   readable by its owner and `super_user` only. A memory carrying a content flag is readable by its owner,
+   `super_user`, and label readers whose read grants include `customer:*` only (see Customer content). A memory the caller cannot read is indistinguishable
    from one that does not exist (same 404 body on `GET`, `DELETE`, `pin` and `supersedes` references,
    and `{ pinned: false, memoryId }` with no `memory` field on `unpin`);
    on `PUT /Memory/<id>`, an existing unreadable id returns `409 id_unavailable` (see Identity). One
@@ -132,21 +136,28 @@ Rules:
 3. **Edit**: only the owner (or `super_user`) revises or withdraws. Read access never grants edit; a
    reader that is not the owner gets 403 (`not_memory_owner`), and a non-reader gets 404 on `DELETE`
    or 409 `id_unavailable` on `PUT`.
-4. **Supersede and review flags**: see below. They are the only writes that touch another principal's
-   memory: a supersede changes only status fields (`status`, `supersededBy`, `revision`), a flag only
-   `needsReview`, `needsReviewSince` and `revision`.
+4. **Supersede, review flags and customer-content review**: see below. They are the only writes that touch
+   another principal's memory: a supersede changes only status fields (`status`, `supersededBy`, `revision`),
+   a flag only `needsReview`, `needsReviewSince` and `revision`, a customer reviewer's rescope only `scopes`
+   (into `customer:` labels) and its consequences, and a confirm-scope only the content flag, `scopeConfirmed`
+   and `revision`.
 5. **Search pushes the readable set into the query**, applied before the limit in every lane, never
-   as a post-filter on a top-k. The set compiles to one condition (`src/scopes.ts`
-   `readableCondition`): an `or` of `ownerId = self`, `scopes = <label>` per exact grant, and
-   `scopes gelt [ns:, ns;)` per wildcard — the exact prefix range, which Harper plans from the index
-   where `starts_with` would scan. Harper matches an array attribute when any element matches.
+   as a post-filter on a top-k. The set compiles to conditions (`src/scopes.ts` `readableConditions`):
+   an `or` of `ownerId = self`, `scopes = <label>` per exact grant, and `scopes gelt [ns:, ns;)` per
+   wildcard — the exact prefix range, which Harper plans from the index where `starts_with` would scan.
+   Harper matches an array attribute when any element matches. For a caller not cleared for customer
+   content, a second group `or(ownerId = self, contentFlagged not_equals true)` adds the quarantine: kept
+   apart from the label group so that group's estimate stays finite and its index can still drive a narrow
+   caller's search, and `not_equals` (filter-only in Harper) because it is true for rows written before
+   `contentFlagged` existed, where `equals null` would drop them (Harper does not index an absent attribute).
 
 ## Lifecycle
 
 | Operation           | Effect                                                                                                                                                                                                                                                                                                                                  |
 | ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| create (`PUT`)      | client chooses `id` (`^[A-Za-z0-9_-]{16,64}$`); absent id creates at `revision: 1` and returns `201 { id, revision, candidates }`; `If-None-Match: *` makes `PUT` create-only (`412` if the id exists); an identical retry returns `200 { id, revision, candidates }`                                                                   |
+| create (`PUT`)      | client chooses `id` (`^[A-Za-z0-9_-]{16,64}$`); absent id creates at `revision: 1` and returns `201 { id, revision, candidates, contentFlag }`; `If-None-Match: *` makes `PUT` create-only (`412` if the id exists); an identical retry returns `200 { id, revision, candidates }`                                                      |
 | revise (`PUT`)      | `PUT /Memory/<id>` on an owned memory whose editable fields (`title`, `content`, `tags`, `scopes`, `evidence`, `validUntil`) differ from the stored ones requires `If-Match: "<revision>"` (or `*`; missing → 428, stale → 412), bumps `revision`, clears `needsReview`, and returns `200 { id, revision, candidates }`                 |
+| confirm-scope       | `POST /Memory/<id>/confirm-scope` (a reader holding `customer:*` write or `super_user`; 403 `customer_clearance_required` otherwise, the missing-id 404 for a non-reader) clears the content flag and records `scopeConfirmed: { by, at }`; `If-Match` honoured when sent; 409 `not_flagged`, 409 on a withdrawn memory                 |
 | supersede           | create a memory via `PUT /Memory/<id>` with `supersedes: [ids]` (`supersedes` on a revise is 400 `supersedes_not_allowed`)                                                                                                                                                                                                              |
 | withdraw (`DELETE`) | `DELETE /Memory/<id>?reason=` requires `If-Match: "<revision>"` (or `*`; missing → 428, stale → 412); sets `status = withdrawn`, keeps the row as a tombstone, never deletes it                                                                                                                                                         |
 | pin / unpin         | records or deletes the caller's `MemoryPin` row (`<principalId>:<memoryId>`, up to 50 pins per principal; withdrawn pins are pruned on pin, 409 `pin_limit_exceeded` past 50); `pin` requires read access (same 404 when missing or unreadable), while `unpin` always deletes the caller's pin and includes `memory` only when readable |
@@ -277,6 +288,54 @@ one of its supports changing.
 - **Prospective only**: flags start with the transition; memories that were already stale when this
   shipped are not backfilled.
 
+### Customer content
+
+`global` is read by everyone, fleet workers included; customer-identifying detail (names, hosts, clusters,
+data) belongs under `customer:<org>`, read only by roles granted `customer:*`. A write that puts likely customer
+detail in a `global` memory is never rejected — a false positive must not lose an agent's write — but it is
+flagged and quarantined until a cleared reviewer rules on it, so a true positive never reaches a reader that
+reads `global` only (`src/patterns.ts`, `src/quarantine.ts`).
+
+- **Configuration** (`customerContentCheck`, absent = off): `mode: off | flag` (default `flag` when the block
+  is present), `model` (optional `models.generate` name), `patterns.namesFile` (absolute path) or
+  `patterns.namesSecret` (a name in the application's `scope.secrets`: a scoped secret, or a declared env name),
+  and `patterns.hosts: [{ label, regex }]` (at most 64, regex ≤ 512 characters, matched with flags `iu`). The
+  names source is JSON `{ "<org>": ["Name", "Alias", ...] }`. It is read when the plugin configures (startup and
+  every option change), never from the repository, and no message about it echoes its content, keys or the
+  regexes. Host regexes run synchronously: they are operator configuration, and a pathological one blocks the
+  worker with or without a lock held.
+- **The check** reads every author-written field: title, content, tags, evidence refs and notes. A name matches
+  as a whole token sequence (NFKC, lowercased, letter and digit runs), so `Acme` matches `acme-prod.example.com`
+  and not `Acmeville`. Labels: `customer:<org>` per matched name, the configured label per matched host regex.
+- **When**: on a create, and on a revise whose resulting scopes include `global` and that changes the checked
+  text or newly includes `global`; import checks its created rows by pattern only (a batch would otherwise
+  start a model call per row). A match sets `contentFlag: { kind: 'possible-customer-detail', since, source:
+'pattern', labels }` (keeping `since` while the memory stays flagged). Leaving `global` clears the flag; so does
+  a re-check that matches nothing, except that a flag is kept while a configured model re-checks the text. A
+  revise that changes neither the checked text nor `global` keeps whatever state the memory is in. `mode: off`
+  checks nothing and keeps existing flags enforced. Status-only writes never touch the flag. Flags are
+  prospective: changing the names list re-checks nothing already stored.
+- **The model** (optional) runs after the write commits and never holds up its response or a lock: a strict
+  one-word answer `customer | clean` (30 s), at most 8 in flight (more are skipped with a rate-limited warning),
+  failures logged with fixed text only. Its verdict applies in its own locked transaction only if the row's
+  checked text, `contentFlag`, `scopeConfirmed`, `mode` and `model` are unchanged since it started and the row is
+  still `global`: `customer` sets a `source: 'model'` flag (`lastEventKind: 'flagged'`), `clean` clears a kept
+  flag. Between commit and verdict a model-only true positive is readable by `global` readers, and a check lost
+  to a restart leaves it so: the patterns are the synchronous guarantee.
+- **Quarantine**: see rule 1 and rule 5. Clearance is the `customer:*` read wildcard; an exact `customer:<org>`
+  grant does not clear, since a flag can name any customer. The flag only removes access, never grants it.
+  `contentFlag.labels` is shown only to a cleared reader: an owner without clearance sees the flag but not which
+  customer it matched (the flag's existence still tells a writer that a name is on the list; that is inherent
+  in telling the owner at all). A flagged memory cannot be cited, pinned, watched or superseded by an uncleared
+  reader (same 404 or 400 as missing), and a review flag whose source is quarantined is hidden from them. A
+  flagged replacement hides its superseded `global` predecessor from uncleared readers until review.
+- **Review**: the owner clears a flag by revising the detail out or rescoping out of `global` (its own write
+  grants apply). A reader holding `customer:*` write may revise someone else's flagged memory when the payload
+  is only `scopes` and every resulting label is a `customer:` label, or call confirm-scope. An owner without
+  clearance cannot confirm-scope: that would publish exactly what the flag withheld. A confirmation holds for the
+  text it reviewed: a revise that changes the checked text runs the full check again, so a later mention of
+  the same customer is flagged too.
+
 ## HTTP surface
 
 Mounted at `urlPath` (default `Memory`, with the per-caller watch stream at `<urlPath>Events`, default
@@ -285,19 +344,20 @@ Mounted at `urlPath` (default `Memory`, with the per-caller watch stream at `<ur
 verb and `connect` overrides so direct HTTP, SSE, or WebSocket requests to `/MemoryMcp` return `405`) is
 mounted with `hidden = false` only when the plugin option `mcp` is `true` (default `false`).
 
-| Route                                                                          | Purpose                                                                                                  |
-| ------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------- |
-| `PUT /Memory/<id>`                                                             | create (`201 { id, revision, candidates }`), idempotent retry (`200`), or revise with `If-Match` (`200`) |
-| `GET /Memory/<id>`                                                             | read (`{ memory }` + `ETag: "<revision>"`)                                                               |
-| `DELETE /Memory/<id>?reason=`                                                  | withdraw with `If-Match: "<revision>"` (tombstone, returns `{ memory }`)                                 |
-| `GET /Memory/?q=&tag=&scope=&limit=&includeSuperseded=&includeExpired=&watch=` | search (no `q`: newest first; `watch=true` watches every returned id)                                    |
-| `GET /Memory/bootstrap?q=&budget=&watch=`                                      | session-start context (`watch=true` watches every returned id)                                           |
-| `POST /Memory/<id>/pin` · `/unpin`                                             | per-reader pin / unpin (empty or `{}` body)                                                              |
-| `POST /Memory/<id>/confirm`                                                    | owner's review: clears `needsReview`, records `confirmed` (returns `{ memory }`)                         |
-| `POST /Memory/watch`                                                           | watch readable memories (`{ ids, ttlSeconds? }` → `{ watched, expiresAt }`)                              |
-| `GET /Memory` · `/Memory/<id>` (SSE / WebSocket)                               | Level 1 record-change subscription (`{ id, kind, revision }`)                                            |
-| `GET /MemoryEvents` (SSE / WebSocket)                                          | Level 2 per-caller watch and `needsReview` event stream (`{ id, kind, revision }`)                       |
-| `POST /Memory/import`                                                          | bulk import (`super_user`)                                                                               |
+| Route                                                                                   | Purpose                                                                                                                             |
+| --------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `PUT /Memory/<id>`                                                                      | create (`201 { id, revision, candidates, contentFlag }`), idempotent retry (`200`), or revise with `If-Match` (`200`)               |
+| `GET /Memory/<id>`                                                                      | read (`{ memory }` + `ETag: "<revision>"`)                                                                                          |
+| `DELETE /Memory/<id>?reason=`                                                           | withdraw with `If-Match: "<revision>"` (tombstone, returns `{ memory }`)                                                            |
+| `GET /Memory/?q=&tag=&scope=&limit=&includeSuperseded=&includeExpired=&flagged=&watch=` | search (no `q`: newest first; `flagged=true`: content-flagged memories the caller can read; `watch=true` watches every returned id) |
+| `GET /Memory/bootstrap?q=&budget=&watch=`                                               | session-start context (`watch=true` watches every returned id)                                                                      |
+| `POST /Memory/<id>/pin` · `/unpin`                                                      | per-reader pin / unpin (empty or `{}` body)                                                                                         |
+| `POST /Memory/<id>/confirm`                                                             | owner's review: clears `needsReview`, records `confirmed` (returns `{ memory }`)                                                    |
+| `POST /Memory/<id>/confirm-scope`                                                       | customer reviewer's ruling: clears the content flag, records `scopeConfirmed` (returns `{ memory }`)                                |
+| `POST /Memory/watch`                                                                    | watch readable memories (`{ ids, ttlSeconds? }` → `{ watched, expiresAt }`)                                                         |
+| `GET /Memory` · `/Memory/<id>` (SSE / WebSocket)                                        | Level 1 record-change subscription (`{ id, kind, revision }`)                                                                       |
+| `GET /MemoryEvents` (SSE / WebSocket)                                                   | Level 2 per-caller watch and `needsReview` event stream (`{ id, kind, revision }`)                                                  |
+| `POST /Memory/import`                                                                   | bulk import (`super_user`)                                                                                                          |
 
 Errors are `{ error, code }` (plus `index` for an import row). Only errors the plugin creates carry
 their own message; anything else is a 500 `internal_error`. Harper's retryable failures — 503 (an index
@@ -314,8 +374,9 @@ lease, since a batch writes up to 100 rows and flags their citers inside one tra
   `embedding` (query embedded with the same model) and the `@fullText` index, fused with reciprocal
   rank fusion (k = 60, `2 × limit` per lane). If embedding the query string fails, search and bootstrap
   fall back to the full-text lane and log a rate-limited warning. Both lanes carry the status, expiry (`validUntil` null
-  or `> now` unless `includeExpired=true`) and readable-scope conditions. `scope=` narrows within the
-  readable set; it never widens it. Results include `supersededBy` when `includeSuperseded` is set,
+  or `> now` unless `includeExpired=true`) and readable-scope conditions, including the customer-content
+  quarantine. `scope=` narrows within the readable set; it never widens it. `flagged=true` adds the indexed
+  `contentFlagged = true`, the review queue of a cleared reviewer (an uncleared caller sees only its own). Results include `supersededBy` when `includeSuperseded` is set,
   and `needsReview` under the Provenance visibility rule; withdrawn memories never appear. The vector lane has no distance cutoff, so it contributes the
   nearest readable memories whatever their distance. Passing `watch=true` records a `MemoryWatch` (with
   the default 1 h TTL) for every memory id returned in the result.
@@ -358,8 +419,9 @@ Three levels, built in order:
    `context.user` are captured when the connection opens and take effect on reconnect. For `withdrawn`,
    read access checks the memory's scope labels ignoring `status = withdrawn` (matching Provenance), so
    label readers and watchers learn that a shared memory they could read was withdrawn (`GET /Memory/<id>`
-   still returns 404 to non-owners). Events carry `{ id, kind, revision }` — never content — with `kind`
-   one of `created`, `revised`, `superseded`, `withdrawn`, `restored`, or `flagged` (`needsReview` set),
+   still returns 404 to non-owners; a content-flagged memory's withdrawal reaches cleared readers only). Events
+   carry `{ id, kind, revision }` — never content — with `kind` one of `created`, `revised`, `superseded`,
+   `withdrawn`, `restored`, or `flagged` (`needsReview` set, or a model's content flag),
    so a reader re-reads through the guarded `GET`. Subscriptions are live-only (`omitCurrent: true`) with
    at-most-once delivery and no replay across disconnects; if Harper core re-emits existing rows on a
    table reload (`copyApply`, `harper-pro#495`) beyond the per-connection 1,024-entry deduplication
@@ -383,8 +445,10 @@ Three levels, built in order:
      read check, or
    - one of the caller's own memories (`ownerId === principal.id`) is flagged `needsReview`
      (`kind: 'flagged'`, or `restored` / `created` with a newly folded `needsReview` flag visible to the
-     caller). The notification fires when "a memory you relied on changed, or your own memory needs
-     review", not on every write.
+     caller), or a create or revise leaves it content-flagged (`created` / `revised` carrying `contentFlag`).
+     The notification fires when "a memory you relied on changed, or your own memory needs review", not on
+     every write. A watcher that cannot read a memory once it is content-flagged hears nothing more about it,
+     as after a scope narrowing.
    - **MCP resource subscriptions (`resources/subscribe`)**: Harper core's `resources/subscribe` handler
      (`subscribeToResource` in `components/mcp/resources.ts`) only accepts `harper+rest://` and `http(s)://`
      URIs and rejects custom `mcpResources` URI schemes such as `memory:///{id}` with
@@ -405,22 +469,23 @@ as REST:
 
 - **`static mcpTools`**:
   - `remember` — create a memory (`PUT`; generates a UUID when `id` is omitted, or idempotently retries an
-    identical create).
+    identical create). `remember` and `revise` return `contentFlag` beside `{ id, revision, created, candidates }`.
   - `revise` — revise an existing memory (`PUT` with required `revision` mapped to `If-Match: "<revision>"`).
   - `recall` — hybrid search (`q`, `tags`/`tag`, `scopes`/`scope`, `limit`, `includeSuperseded`,
-    `includeExpired`, and optional `watch: true` to watch every returned id).
+    `includeExpired`, `flagged`, and optional `watch: true` to watch every returned id).
   - `get` — fetch a single memory by `id` (`{ memory }`, or 404 if missing/unreadable).
   - `withdraw` — withdraw an owned memory (`DELETE` with required `revision` and optional `reason`).
   - `pin` / `unpin` — pin or unpin a memory for session bootstrap.
   - `confirm` — clear `needsReview` on an owned memory and record `confirmed` (optional `revision` mapped
     to `If-Match`).
+  - `confirm-scope` — a customer reviewer's confirm-scope (optional `revision` mapped to `If-Match`).
   - `watch` — watch `1..100` readable memory ids (`{ ids, ttlSeconds? }` → `{ watched, expiresAt }`).
 - **`static mcpResources`**: `uriTemplate: 'memory:///{id}'` (`mimeType: 'application/json'`,
   `method: 'mcpReadMemory'`), whose read calls `getMemory` and returns the guarded memory view (or
   `undefined` when missing/unreadable, which Harper's MCP layer surfaces as a JSON-RPC read error).
 - Tool and resource handlers are bound on `MemoryMcpResource.prototype` under `mcp*` method names
   (`mcpRemember`, `mcpRevise`, `mcpRecall`, `mcpGet`, `mcpWithdraw`, `mcpPin`, `mcpUnpin`, `mcpConfirm`,
-  `mcpWatch`, `mcpReadMemory`), while every HTTP route class stays `hidden = true`, so neither Harper's
+  `mcpConfirmScope`, `mcpWatch`, `mcpReadMemory`), while every HTTP route class stays `hidden = true`, so neither Harper's
   MCP discovery nor OpenAPI export auto-generates generic REST verb tools or unguarded `harper+rest://`
   templates alongside the explicit surface.
 
@@ -442,7 +507,8 @@ as REST:
 - Options (`config.yaml` under the plugin's key): `urlPath`, `mcp` (default `false`), `embeddingModel`
   (default `default`), `limits.{contentChars, titleChars}` (default 20000 / 200), and
   `supersession.{mode, similarity, judge}` (`off | suggest | auto`, default `suggest`; 0.82; none; `auto`
-  without `judge` is rejected as malformed). The plugin's table embedder embeds with the model recorded on
+  without `judge` is rejected as malformed), and `customerContentCheck.{mode, model, patterns}` (see Customer
+  content; absent = off). The plugin's table embedder embeds with the model recorded on
   the row. A changed option is checked for well-formedness before it applies; a malformed change is logged
   and the previous configuration keeps serving (model compatibility is not checked — see "One vector
   space"). Changing `urlPath` mounts the new path and removes the old one if the plugin still owns it.
@@ -461,6 +527,7 @@ status, supersedes?, supersededBy?, createdAt?, validUntil?, withdrawnAt?, withd
   as it stands (stored rows plus this batch), and a stored row that a new row supersedes is marked
   superseded. So whatever the batch order, and however a run is interrupted or replayed, no memory is
   hidden behind a missing or withdrawn replacement. The client still sends successors first.
+- A created row whose scopes include `global` gets the customer-content pattern check (Customer content).
 - A stored row the batch turns superseded flags its active citers, stored or created in the same batch,
   except the rows that supersede it (Provenance). Rows created superseded or withdrawn are history, not
   transitions, and flag nothing.
@@ -508,7 +575,7 @@ sends identical rows.
   `"headersHelper": "node \"${CLAUDE_PLUGIN_ROOT}/bin/headers.mjs\""`) rather than wrapping REST calls in a
   local `stdio` proxy.
   - _Trade-off_: pointing directly at `/mcp` keeps a single tool schema source of truth on the server
-    (`remember`, `revise`, `recall`, `get`, `withdraw`, `pin`, `unpin`, `confirm`, `watch`) and authenticates
+    (`remember`, `revise`, `recall`, `get`, `withdraw`, `pin`, `unpin`, `confirm`, `confirm-scope`, `watch`) and authenticates
     each request with the caller's Harper-user-bound credential (`Bearer` or `Basic`) read by `headersHelper`
     from `process.env` or `~/.config/agent-memory/env`, so `AGENT_MEMORY_TOKEN` is never exported to
     `CLAUDE_ENV_FILE` where model `Bash` commands could read it. In exchange, the host Harper app must enable

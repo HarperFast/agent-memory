@@ -55,10 +55,13 @@ describe('parseSearchParams', () => {
 			limit: 10,
 			includeSuperseded: false,
 			includeExpired: false,
+			flagged: false,
 			watch: false,
 		});
 		assert.deepEqual(
-			params('q=%20disk%20&tag=a&tag=b&scope=team:x&limit=5&includeSuperseded=true&includeExpired=true&watch=true'),
+			params(
+				'q=%20disk%20&tag=a&tag=b&scope=team:x&limit=5&includeSuperseded=true&includeExpired=true&flagged=true&watch=true',
+			),
 			{
 				q: 'disk',
 				tags: ['a', 'b'],
@@ -66,6 +69,7 @@ describe('parseSearchParams', () => {
 				limit: 5,
 				includeSuperseded: true,
 				includeExpired: true,
+				flagged: true,
 				watch: true,
 			},
 		);

@@ -89,6 +89,7 @@ describe('parseSettings', () => {
 			titleChars: 200,
 			contentChars: 20000,
 			supersession: { mode: 'suggest', similarity: 0.82 },
+			customerContentCheck: { mode: 'off', matcher: { names: new Map(), hosts: [] } },
 			mcp: false,
 		});
 		assert.equal(parseSettings({ mcp: true }).mcp, true);

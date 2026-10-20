@@ -52,6 +52,9 @@ function matchesCondition(record, condition) {
 				return value === condition.value;
 			case 'not_equal':
 				return value !== condition.value;
+			// Harper's negated comparator: filter-only, and true for a row that lacks the attribute.
+			case 'not_equals':
+				return value !== condition.value;
 			case 'greater_than':
 				return value instanceof Date && condition.value instanceof Date
 					? value.getTime() > condition.value.getTime()
@@ -199,6 +202,10 @@ class StubTable {
 			results.sort((a, b) => (a[sort.attribute] > b[sort.attribute] ? direction : -direction));
 		}
 		results = results.slice(query.offset ?? 0, (query.offset ?? 0) + (query.limit ?? Infinity));
+		// Projected as Harper does, so a reader that needs a field the query did not select sees it missing.
+		if (query.select) {
+			results = results.map((record) => Object.fromEntries(query.select.map((field) => [field, record[field]])));
+		}
 		return (async function* () {
 			for (const record of results) yield Object.freeze(structuredClone(record));
 		})();
