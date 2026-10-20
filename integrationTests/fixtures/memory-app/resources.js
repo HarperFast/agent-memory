@@ -25,10 +25,26 @@ models.registerBackend(
 			if (texts.some((text) => String(text).includes('EMBED-FAIL'))) {
 				throw Object.assign(new Error('embedding backend rate limited'), { upstreamStatus: 429 });
 			}
-			// Holds a write open between its revision check and its commit, so concurrent writers overlap.
-			if (texts.some((text) => String(text).includes('slowly')))
-				await new Promise((resolve) => setTimeout(resolve, 50));
 			return { status: 'completed', output: texts.map((text) => embedText(text)) };
+		},
+	}),
+);
+
+// Deterministic supersession judge: decides by a marker in the new memory, which the prompt puts first.
+models.registerBackend(
+	'generative',
+	'judge-stub',
+	models.defineBackend({
+		name: 'test-judge',
+		async generate(input) {
+			const prompt = input.messages.at(-1).content;
+			const written = prompt.slice(0, prompt.indexOf('<existing_memory>'));
+			const content = written.includes('REPLACES')
+				? 'supersedes'
+				: written.includes('EXTENDS')
+					? 'refines'
+					: 'unrelated';
+			return { status: 'completed', output: { content, finishReason: 'stop' } };
 		},
 	}),
 );
@@ -46,6 +62,9 @@ const record = (kind) => async (memory, context) => {
 		context,
 	);
 	if (String(memory.content).includes('SINK-FAIL')) throw new Error('sink rejected the memory');
+	// Holds a write open between its checks and its commit, so concurrent writers overlap. The plugin embeds
+	// before the transaction, so only a sink can hold one open.
+	if (String(memory.content).includes('slowly')) await new Promise((resolve) => setTimeout(resolve, 50));
 };
 registerMemorySink({ write: record('write'), withdraw: record('withdraw') });
 
@@ -75,3 +94,22 @@ export class MismatchProbe extends Resource {
 		}
 	}
 }
+
+// Reproduces the exact request mutations performed by `@harperfast/oauth` `mcp` mode (`withMCPAuth` and
+// `OAuthResource` with `optional: true`) to verify whether they populate `context.user` on Harper core's
+// native `/mcp` endpoint (HarperFast/oauth#279).
+server.http(
+	(request, nextHandler) => {
+		const mode = request.headers?.get?.('x-simulate-oauth-mcp') ?? request.headers?.['x-simulate-oauth-mcp'];
+		if (mode === 'with-mcp-auth') {
+			request._oauthAuth = { valid: true, userId: 'alice', scopes: ['mcp:read', 'mcp:write'] };
+		} else if (mode === 'oauth-resource-string-user') {
+			request._oauthAuth = { valid: true, userId: 'alice', scopes: ['mcp:read', 'mcp:write'] };
+			request.user = 'alice';
+		} else if (mode === 'oauth-hydrated-user') {
+			request.user = { username: 'alice' };
+		}
+		return nextHandler(request);
+	},
+	{ urlPath: '/mcp', runFirst: true },
+);

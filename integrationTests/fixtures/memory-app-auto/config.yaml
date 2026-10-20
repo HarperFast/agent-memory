@@ -1,0 +1,10 @@
+rest: true
+
+jsResource:
+  files: 'resources.js'
+
+'@harperfast/agent-memory':
+  package: '@harperfast/agent-memory'
+  supersession:
+    mode: auto
+    judge: judge-stub

@@ -1,0 +1,39 @@
+{
+	"description": "Bootstrap, per-prompt recall, and live change notification hooks for Harper agent-memory",
+	"hooks": {
+		"SessionStart": [
+			{
+				"matcher": "startup|resume|compact",
+				"hooks": [
+					{
+						"type": "command",
+						"command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/hook.mjs\"",
+						"timeout": 5
+					}
+				]
+			}
+		],
+		"UserPromptSubmit": [
+			{
+				"hooks": [
+					{
+						"type": "command",
+						"command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/hook.mjs\"",
+						"timeout": 3
+					}
+				]
+			}
+		],
+		"SessionEnd": [
+			{
+				"hooks": [
+					{
+						"type": "command",
+						"command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/hook.mjs\"",
+						"timeout": 2
+					}
+				]
+			}
+		]
+	}
+}

@@ -1,12 +1,13 @@
 import { beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { __test, databases } from 'harper';
+import { __test, databases, models } from 'harper';
 import {
 	MEMORY_RESOURCES,
 	MemoryActionResource,
 	MemoryBootstrapResource,
 	MemoryImportResource,
 	MemoryItemResource,
+	MemoryMcpResource,
 	MemoryResource,
 } from '../dist/resource.js';
 import { applySettings, parseSettings } from '../dist/settings.js';
@@ -25,10 +26,18 @@ beforeEach(() => {
 });
 
 describe('MEMORY_RESOURCES static surface', () => {
-	it('declares static path, static hidden = true, and static REST verbs without loadAsInstance or instance verbs', () => {
+	it('declares static path, static hidden = true on all HTTP resources, and isolates MCP declarations on verb-less MemoryMcpResource', () => {
 		assert.deepEqual(
 			MEMORY_RESOURCES.map((ResourceClass) => ResourceClass.path),
-			['/Memory/*rest', '/Memory/bootstrap', '/Memory/import', '/Memory/:id', '/Memory/:id/:action'],
+			[
+				'/Memory/*rest',
+				'/Memory/bootstrap',
+				'/Memory/import',
+				'/Memory/watch',
+				'/Memory/:id',
+				'/Memory/:id/:action',
+				'/MemoryEvents',
+			],
 		);
 		for (const ResourceClass of MEMORY_RESOURCES) {
 			assert.equal(ResourceClass.hidden, true);
@@ -39,16 +48,30 @@ describe('MEMORY_RESOURCES static surface', () => {
 			assert.equal(Object.hasOwn(ResourceClass.prototype, 'delete'), false);
 			assert.equal(Object.hasOwn(ResourceClass.prototype, 'segments'), false);
 		}
+		assert.equal(MemoryMcpResource.path, '/MemoryMcp');
+		assert.equal(MemoryMcpResource.hidden, false);
+		assert.deepEqual(
+			MemoryMcpResource.mcpTools.map((t) => t.name),
+			['remember', 'revise', 'recall', 'get', 'withdraw', 'pin', 'unpin', 'confirm', 'watch'],
+		);
+		assert.deepEqual(
+			MemoryMcpResource.mcpResources.map((r) => [r.name, r.uriTemplate, r.method, 'read' in r]),
+			[['memory', 'memory:///{id}', 'mcpReadMemory', false]],
+		);
+		for (const verb of ['get', 'post', 'put', 'delete', 'patch', 'subscribe', 'connect']) {
+			assert.equal(Object.hasOwn(MemoryMcpResource, verb), false);
+			assert.equal(Object.hasOwn(MemoryMcpResource.prototype, verb), false);
+		}
 	});
 
-	it('routes put (create/revise), get (with ETag), delete (withdraw), search, bootstrap, pin, unpin, and import via static verbs, and rejects removed POST routes with 404/405', async () => {
+	it('routes put (create/revise), get (with ETag), delete (withdraw), search, bootstrap, pin, unpin, confirm, and import via static verbs, and rejects removed POST routes with 404/405', async () => {
 		const context = { user: superUser };
 		const id = 'mem-item-00000001';
 		const created = await parse(
 			await MemoryItemResource.put(queryTarget('', { id }), { title: 't1', content: 'alpha content' }, context),
 		);
 		assert.equal(created.status, 201);
-		assert.deepEqual(created.body, { id, revision: 1 });
+		assert.deepEqual(created.body, { id, revision: 1, candidates: [] });
 
 		const fetched = await parse(await MemoryItemResource.get(queryTarget('', { id }), context));
 		assert.equal(fetched.status, 200);
@@ -88,16 +111,23 @@ describe('MEMORY_RESOURCES static surface', () => {
 			),
 		);
 		assert.equal(revised.status, 200);
-		assert.deepEqual(revised.body, { id, revision: 2 });
+		assert.deepEqual(revised.body, { id, revision: 2, candidates: [] });
 
 		const afterRevise = await parse(await MemoryItemResource.get(queryTarget('', { id }), context));
 		assert.equal(afterRevise.headers.get('etag'), '"2"');
 		assert.deepEqual(afterRevise.body.memory.scopes, ['global']);
 
+		const confirmed = await parse(
+			await MemoryActionResource.post(queryTarget('', { id, action: 'confirm' }), {}, context),
+		);
+		assert.equal(confirmed.status, 200);
+		assert.equal(confirmed.body.memory.revision, 3);
+		assert.equal(confirmed.body.memory.confirmed.by, 'root');
+
 		const withdrawn = await parse(
 			await MemoryItemResource.delete(queryTarget('reason=done', { id }), {
 				...context,
-				headers: { 'if-match': '"2"' },
+				headers: { 'if-match': '"3"' },
 			}),
 		);
 		assert.equal(withdrawn.status, 200);
@@ -215,6 +245,18 @@ describe('MemoryResource errors', () => {
 				);
 			};
 			assert.equal((await create('mem-embed-400-id1')).status, 500);
+			Memory.put = put;
+			const embed = models.embed;
+			models.embed = async () => {
+				throw new TypeError('fetch failed', {
+					cause: Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' }),
+				});
+			};
+			try {
+				assert.equal((await create('mem-embed-reset-1')).status, 503);
+			} finally {
+				models.embed = embed;
+			}
 			Memory.put = async () => {
 				throw Object.assign(new Error('Record already exists'), { statusCode: 409 });
 			};

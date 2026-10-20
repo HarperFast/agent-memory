@@ -1,0 +1,12 @@
+{
+	"name": "agent-memory",
+	"version": "0.1.0",
+	"description": "Shared, permissioned, live memory for Claude Code backed by Harper agent-memory",
+	"author": {
+		"name": "Harper",
+		"url": "https://github.com/HarperFast"
+	},
+	"repository": "https://github.com/HarperFast/agent-memory",
+	"license": "Apache-2.0",
+	"keywords": ["memory", "harper", "mcp", "hooks", "agents"]
+}
