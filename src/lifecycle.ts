@@ -95,6 +95,10 @@ function matchesIfNoneMatch(header: string, revision: number): boolean {
 		.some((part) => part === '*' || part === expected || part === `W/${expected}`);
 }
 
+function evidenceText(evidence: readonly EvidenceItem[]): string[] {
+	return evidence.flatMap((item) => [item.ref, item.note ?? '']);
+}
+
 export function sameStringArray(a: readonly string[], b: readonly string[]): boolean {
 	return a.length === b.length && a.every((value, i) => value === b[i]);
 }
@@ -522,7 +526,8 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 		(parsedTitle !== undefined && parsedTitle !== (record.title ?? null)) ||
 		(parsedContent !== undefined && parsedContent !== record.content) ||
 		(parsedTags !== undefined && !sameStringArray(parsedTags, record.tags ?? [])) ||
-		(parsedEvidence !== undefined && !sameEvidence(parsedEvidence, record.evidence ?? []));
+		(parsedEvidence !== undefined &&
+			!sameStringArray(evidenceText(parsedEvidence), evidenceText(record.evidence ?? [])));
 
 	// Planning runs again when the transaction finds the pre-read overtaken; `reembed` then guarantees a vector.
 	const newCitations = (record: any): string[] =>
@@ -554,20 +559,6 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 				? plannedScopes(payload, principal, preExisting.ownerId, preExisting.scopes)
 				: undefined;
 		const mayRevise = revisedScopes !== undefined;
-		// Matched here, outside the locks; the transaction reuses it while the row is the one it was matched against.
-		let matched: { revision: number | undefined; labels: string[] } | undefined;
-		if (check.mode === 'flag' && (planningCreate ? createScopes : revisedScopes)?.includes(GLOBAL_SCOPE)) {
-			const text = checkedText({
-				id,
-				title: parsedTitle ?? (planningCreate ? null : preExisting.title),
-				content: parsedContent ?? (planningCreate ? null : preExisting.content),
-				tags: parsedTags ?? (planningCreate ? [] : preExisting.tags),
-				evidence: parsedEvidence ?? (planningCreate ? [] : preExisting.evidence),
-			});
-			if (planningCreate || !(preExisting.scopes ?? []).includes(GLOBAL_SCOPE) || checkedFieldsChange(preExisting)) {
-				matched = { revision: preExisting?.revision, labels: matchCustomerContent(text, check.matcher) };
-			}
-		}
 		const writesContent =
 			parsedContent !== undefined &&
 			(planningCreate ||
@@ -596,6 +587,33 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 		const autoTargets = (proposals ?? []).filter(
 			(match) => match.verdict === 'supersedes' && !supersedes.includes(match.id),
 		);
+		// Matched here, outside the locks; the transaction reuses it while the row is the one it was matched against.
+		let matched:
+			{ revision: number | undefined; updatedAt: unknown; supersedes: string[]; labels: string[] } | undefined;
+		const scopesAfter = planningCreate ? createScopes : revisedScopes;
+		if (
+			check.mode === 'flag' &&
+			scopesAfter?.includes(GLOBAL_SCOPE) &&
+			(planningCreate || !(preExisting.scopes ?? []).includes(GLOBAL_SCOPE) || checkedFieldsChange(preExisting))
+		) {
+			const plannedSupersedes = planningCreate
+				? [...supersedes, ...autoTargets.map((match) => match.id)]
+				: (preExisting.supersedes ?? []);
+			const text = checkedText({
+				id,
+				title: parsedTitle ?? (planningCreate ? null : preExisting.title),
+				content: parsedContent ?? (planningCreate ? null : preExisting.content),
+				tags: parsedTags ?? (planningCreate ? [] : preExisting.tags),
+				evidence: parsedEvidence ?? (planningCreate ? [] : preExisting.evidence),
+				supersedes: plannedSupersedes,
+			});
+			matched = {
+				revision: preExisting?.revision,
+				updatedAt: iso(preExisting?.updatedAt),
+				supersedes: plannedSupersedes,
+				labels: matchCustomerContent(text, check.matcher),
+			};
+		}
 		let plannedDependents: string[] = [];
 		if (planningCreate && supersedes.length + autoTargets.length > 0) {
 			const transitioning = [...explicitTargets, ...autoTargets].filter(
@@ -612,8 +630,12 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 	};
 
 	const write = (planned: Awaited<ReturnType<typeof plan>>) => {
-		const labelsFor = (existing: any, text: () => string) =>
-			planned.matched && planned.matched.revision === existing?.revision
+		const labelsFor = (existing: any, finalSupersedes: string[], text: () => string) =>
+			planned.matched &&
+			// Revision numbers can repeat across nodes; with the write time they name one version of the row.
+			planned.matched.revision === existing?.revision &&
+			planned.matched.updatedAt === iso(existing?.updatedAt) &&
+			sameStringArray(planned.matched.supersedes, finalSupersedes)
 				? planned.matched.labels
 				: matchCustomerContent(text(), check.matcher);
 		return withLockPlan(
@@ -720,7 +742,10 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 							flag: existing.contentFlag ?? null,
 						},
 						candidate.scopes,
-						() => labelsFor(existing, () => checkedText({ id, ...candidate })),
+						() =>
+							labelsFor(existing, existing.supersedes ?? [], () =>
+								checkedText({ id, ...candidate, supersedes: existing.supersedes }),
+							),
 						now,
 					);
 					const changes: Record<string, any> = {
@@ -805,7 +830,10 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 					check,
 					undefined,
 					scopes,
-					() => labelsFor(undefined, () => checkedText({ id, title, content, tags, evidence })),
+					() =>
+						labelsFor(undefined, [...supersedes, ...applied], () =>
+							checkedText({ id, title, content, tags, evidence, supersedes: [...supersedes, ...applied] }),
+						),
 					now,
 				);
 

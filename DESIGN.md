@@ -308,8 +308,9 @@ reads `global` only (`src/patterns.ts`, `src/quarantine.ts`).
   and no message about it echoes its content or keys. There is deliberately no regular-expression option: the
   text is the writer's, so matching must stay linear in it (one split into words, a token trie whose cost is
   the longest name rather than the list's size, map lookups, `net.BlockList`).
-- **The check** reads the chosen `id` and every author-written field: title, content, tags, evidence refs and
-  notes. A name matches as a whole token sequence (NFKC, lowercased, letter and digit runs), so `Acme` matches
+- **The check** reads every author-written field and every id the memory shows a reader: its chosen `id`, title,
+  content, tags, evidence refs and notes, and the ids it supersedes (an evidence `kind` is not read, so changing
+  one alone is not a text change). A name matches as a whole token sequence (NFKC, lowercased, letter and digit runs), so `Acme` matches
   `acme-prod.example.com` and not `Acmeville` (in a script written without spaces, a name matches only a whole
   run). Labels: `customer:<org>` per matched name, the configured label per matched host or range.
 - **When**: on a create, and on a revise whose resulting scopes include `global` and that changes the checked
@@ -353,7 +354,8 @@ since, source: 'pattern', labels }` (keeping `since` while the memory stays flag
   revise's text with the other write's cleared flag.
 - **Cost**, measured on Harper 5.3.2 (one node, local, a loaded host, 2,000 `global` memories): the quarantine
   group added about 0.4 ms to a 3 ms search without `q` and stayed within run-to-run noise for a hybrid search;
-  a `PUT` with the check on (2,000 organizations) was within noise of the check off. The matcher alone took
+  a `PUT` with the check on (2,000 organizations) was within noise of the check off; the replacement read that
+  lets an uncleared reader see a superseded memory added about 0.4 ms to its 0.5 ms `GET`. The matcher alone took
   0.85 ms p50 for 20,000 characters against 5,000 organizations × 3 names and 64 host rules, 4.2 ms for 100,000,
   and 1 ms for 20,000 characters of a word that starts 50,000 names.
 

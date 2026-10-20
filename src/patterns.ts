@@ -5,7 +5,7 @@ import { isScopeLabel } from './scopes.ts';
 
 /** A trie over name tokens: matching costs the length of the longest name, not the size of the list. */
 interface NameNode {
-	labels?: string[];
+	labels?: Set<string>;
 	next?: Map<string, NameNode>;
 }
 
@@ -103,8 +103,7 @@ function compileNames(source: string): Map<string, NameNode> {
 				if (!node) level.set(word, (node = {}));
 				level = node.next ??= new Map();
 			}
-			node!.labels ??= [];
-			if (!node!.labels.includes(label)) node!.labels.push(label);
+			(node!.labels ??= new Set()).add(label);
 		}
 	}
 	return root;
@@ -225,13 +224,17 @@ export function parseContentCheck(options: unknown, secrets: SecretsSource): Con
 	});
 }
 
-/** The text the check reads: every author-written field, the chosen id and evidence refs (a URL names its host). */
+/**
+ * The text the check reads: every author-written field, and every id the memory shows a reader (its own, the ids it
+ * supersedes, evidence refs): a chosen id can name a customer, and a URL names its host.
+ */
 export function checkedText(fields: {
 	id: string;
 	title?: string | null;
 	content?: string | null;
 	tags?: readonly string[] | null;
 	evidence?: ReadonlyArray<{ ref: string; note?: string | null }> | null;
+	supersedes?: readonly string[] | null;
 }): string {
 	return [
 		fields.id,
@@ -239,16 +242,25 @@ export function checkedText(fields: {
 		fields.content ?? '',
 		...(fields.tags ?? []),
 		...(fields.evidence ?? []).flatMap((item) => [item.ref, item.note ?? '']),
+		...(fields.supersedes ?? []),
 	].join('\n');
 }
 
-/** Strips `.` and `-` from both ends, and says whether a dot was stripped from the front. */
-function trimEdges(word: string): [string, boolean] {
+const EDGE = new Set(['.', '-', '_']);
+
+function trimEdges(word: string): [trimmed: string, leadingDot: boolean] {
 	let start = 0;
 	let end = word.length;
-	while (start < end && (word[start] === '.' || word[start] === '-')) start++;
-	while (end > start && (word[end - 1] === '.' || word[end - 1] === '-')) end--;
-	return [word.slice(start, end), start > 0 && word[start - 1] === '.'];
+	while (start < end && EDGE.has(word[start])) start++;
+	while (end > start && EDGE.has(word[end - 1])) end--;
+	return [word.slice(start, end), word.slice(0, start).includes('.')];
+}
+
+// Prose puts a colon after an address (`2001:db8::1: refused`); `::` at either end is part of the address.
+function asIPv6(word: string): string | undefined {
+	if (isIPv6(word)) return word;
+	const unwrapped = word.replace(/^:(?!:)/, '').replace(/(?<!:):$/, '');
+	return unwrapped !== word && isIPv6(unwrapped) ? unwrapped : undefined;
 }
 
 function matchHosts(text: string, rules: HostRules, labels: Set<string>): void {
@@ -261,8 +273,9 @@ function matchHosts(text: string, rules: HostRules, labels: Set<string>): void {
 		const [word] = trimEdges(raw);
 		const colon = word.includes(':');
 		if (!colon && !word.includes('.')) continue;
-		if (colon && isIPv6(word)) {
-			matchAddress(word, 'ipv6');
+		const ipv6 = colon ? asIPv6(word) : undefined;
+		if (ipv6) {
+			matchAddress(ipv6, 'ipv6');
 			continue;
 		}
 		// A port or a scheme rides on a host after a colon.
@@ -287,10 +300,14 @@ export function matchCustomerContent(text: string, matcher: CustomerMatcher): st
 	const labels = new Set<string>();
 	if (matcher.names.size > 0) {
 		const words = tokens(text);
+		const reached = new Set<NameNode>();
 		for (let i = 0; i < words.length; i++) {
 			let node = matcher.names.get(words[i]);
 			for (let j = i + 1; node; j++) {
-				node.labels?.forEach((label) => labels.add(label));
+				if (node.labels && !reached.has(node)) {
+					reached.add(node);
+					node.labels.forEach((label) => labels.add(label));
+				}
 				node = j < words.length ? node.next?.get(words[j]) : undefined;
 			}
 		}

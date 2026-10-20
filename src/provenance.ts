@@ -125,8 +125,15 @@ export async function forReader<T extends MemoryView>(
 	const missing = new Set<string>();
 	for (const view of views) {
 		const flag = view.needsReview as ReviewFlag | null;
-		const ids = [flag?.sourceId, flag?.replacementId, checksReplacement(view) ? (view.supersededBy as string) : null];
-		for (const id of ids) if (id && !access.has(id)) missing.add(id);
+		for (const id of [flag?.sourceId, flag?.replacementId]) if (id && !access.has(id)) missing.add(id);
+	}
+	for (const view of views) {
+		const id = view.supersededBy as string;
+		if (!checksReplacement(view) || access.has(id) || missing.has(id)) continue;
+		// A primary-key read: a search costs about 6 ms more on a single GET of a superseded memory.
+		const record = Promise.resolve(memoryTable().get(id, context));
+		record.catch(() => {});
+		access.set(id, record);
 	}
 	if (missing.size > 0) {
 		// Cached as a promise, so a concurrent caller waits for this lookup rather than reading an unfinished one.

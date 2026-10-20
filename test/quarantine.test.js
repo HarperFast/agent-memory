@@ -105,6 +105,8 @@ describe('patterns', () => {
 			['mapped as ::ffff:10.77.4.2', ['lab-ip']],
 			['each <db>.zorbcloud.test, ${env}.zorbcloud.test or *.zorbcloud.test', ['zorb-host']],
 			['prod_db.zorbcloud.test', ['zorb-host']],
+			['See _db.zorb.test_, _10.77.4.2_ and _2001:db8:77::9_', ['lab-ip', 'lab-ip6', 'zorb-db']],
+			['2001:db8:77::9: connection refused', ['lab-ip6']],
 		]) {
 			assert.deepEqual(matchCustomerContent(text, matcher), labels, text);
 		}
@@ -125,6 +127,14 @@ describe('patterns', () => {
 		assert.deepEqual(matchCustomerContent('The '.repeat(5000), check.matcher), []);
 		assert.deepEqual(matchCustomerContent('see the company 49999 runbook', check.matcher), ['customer:company']);
 		assert.ok(performance.now() - started < 500, `${performance.now() - started} ms`);
+	});
+
+	it('emits a name shared by many organizations once per text, and compiles them in linear time', () => {
+		const names = Object.fromEntries(Array.from({ length: 50_000 }, (_, i) => [`bank${i}`, ['Bank']]));
+		const started = performance.now();
+		const check = parseContentCheck({ patterns: { namesSecret: 'N' } }, () => ({ N: JSON.stringify(names) }));
+		assert.equal(matchCustomerContent('Bank '.repeat(4000), check.matcher).length, 50_000);
+		assert.ok(performance.now() - started < 1000, `${performance.now() - started} ms`);
 	});
 
 	it('reads every author-written field and the chosen id', () => {
@@ -205,9 +215,16 @@ describe('flagging on write', () => {
 		assert.equal(memory.contentFlag.source, 'pattern');
 	});
 
-	it('flags a global write whose chosen id names a customer', async () => {
+	it('flags a global write whose chosen id, or an id it supersedes, names a customer', async () => {
 		await putMemory('zorblax-failover-runbook', shared('failover steps'), fleet, context);
 		assert.deepEqual(stored('zorblax-failover-runbook').contentFlag.labels, ['customer:zorblax']);
+		await putMemory(
+			idFor('clean-v2'),
+			shared('failover steps v2', { supersedes: ['zorblax-failover-runbook'] }),
+			fleet,
+			context,
+		);
+		assert.deepEqual(stored(idFor('clean-v2')).contentFlag.labels, ['customer:zorblax']);
 	});
 
 	it('leaves private, customer-scoped and clean global writes unflagged', async () => {
@@ -451,6 +468,15 @@ describe('review', () => {
 		await confirmScopeMemory(id, {}, dave, context);
 		await putMemory(id, { content: 'Zorblax and db1.zorbcloud.test' }, fleet, ifMatch(5));
 		assert.deepEqual(stored(id).contentFlag.labels, ['customer:zorblax', 'zorb-host']);
+	});
+
+	it('keeps a confirmation across an evidence change the check does not read', async () => {
+		const id = idFor('confirm-kind');
+		await putMemory(id, shared('Zorblax', { evidence: [{ kind: 'doc', ref: 'runbook.md' }] }), fleet, context);
+		await confirmScopeMemory(id, {}, dave, context);
+		await putMemory(id, { evidence: [{ kind: 'url', ref: 'runbook.md' }] }, fleet, ifMatch(2));
+		assert.equal(stored(id).contentFlag, null);
+		assert.equal(stored(id).scopeConfirmed.by, 'dave');
 	});
 
 	it('leaves the flag alone on status-only writes', async () => {
