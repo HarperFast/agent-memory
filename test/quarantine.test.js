@@ -1,4 +1,4 @@
-import { after, beforeEach, describe, it } from 'node:test';
+import { after, beforeEach, describe, it, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -23,8 +23,10 @@ import { registerMemorySink } from '../dist/sinks.js';
 // Synthetic names only: the real list is server-side configuration and never enters the repository.
 const NAMES = { zorblax: ['Zorblax Industries', 'Zorblax'], quintessa: ['Quintessa Bank', 'QB Holdings'] };
 const HOSTS = [
-	{ label: 'zorb-host', regex: '[a-z0-9-]+\\.zorbcloud\\.test' },
-	{ label: 'lab-ip', regex: '\\b10\\.77\\.\\d{1,3}\\.\\d{1,3}\\b' },
+	{ label: 'zorb-host', host: '*.zorbcloud.test' },
+	{ label: 'zorb-db', host: 'db.zorb.test' },
+	{ label: 'lab-ip', cidr: '10.77.0.0/16' },
+	{ label: 'lab-ip6', cidr: '2001:db8:77::/48' },
 ];
 const scratch = mkdtempSync(join(tmpdir(), 'agent-memory-quarantine-'));
 const namesFile = join(scratch, 'names.json');
@@ -84,17 +86,36 @@ describe('patterns', () => {
 		assert.deepEqual(matchCustomerContent('ｚｏｒｂｌａｘ fullwidth', matcher), ['customer:zorblax']);
 	});
 
-	it('labels host pattern matches and finds names inside host names', () => {
+	it('labels host and address matches, and finds names inside host names', () => {
 		assert.deepEqual(matchCustomerContent('see zorblax-prod.zorbcloud.test and 10.77.4.2', matcher), [
 			'customer:zorblax',
 			'lab-ip',
 			'zorb-host',
 		]);
-		assert.deepEqual(matchCustomerContent('localhost 127.0.0.1 example.com', matcher), []);
+		assert.deepEqual(
+			matchCustomerContent('https://DB.zorb.test:8443/x, [2001:db8:77::9]:443 and A.B.ZorbCloud.Test.', matcher),
+			['lab-ip6', 'zorb-db', 'zorb-host'],
+		);
+		assert.deepEqual(
+			matchCustomerContent('localhost 127.0.0.1 10.78.0.1 zorbcloud.test db.zorb.test.example 2001:db8:78::1', matcher),
+			[],
+		);
 	});
 
-	it('reads every author-written field', () => {
+	it('matches in time linear in the text, whatever the text', () => {
+		const started = performance.now();
+		for (const filler of ['.', '-', ':', 'a.', '1.', 'f:', '[', 'Zorblax ']) {
+			matchCustomerContent(filler.repeat(100_000 / filler.length), matcher);
+		}
+		assert.ok(performance.now() - started < 2000, `${performance.now() - started} ms`);
+	});
+
+	it('reads every author-written field and the chosen id', () => {
+		assert.deepEqual(matchCustomerContent(checkedText({ id: 'zorblax-failover-runbook' }), matcher), [
+			'customer:zorblax',
+		]);
 		const text = checkedText({
+			id: 'mem-plain-0000001',
 			title: 'title',
 			content: 'content',
 			tags: ['tag-a'],
@@ -113,7 +134,7 @@ describe('patterns', () => {
 		assert.equal(parseContentCheck({ mode: 'off', patterns: { namesFile: '/missing' } }, () => undefined).mode, 'off');
 	});
 
-	it('refuses malformed configuration without echoing the list, its keys or its regexes', () => {
+	it('refuses malformed configuration without echoing the list or its keys', () => {
 		const secret = (value) => () => ({ NAMES: value });
 		const cases = [
 			[{ patterns: { namesFile: 'relative/names.json' } }],
@@ -125,9 +146,14 @@ describe('patterns', () => {
 			[{ patterns: { namesSecret: 'NAMES' } }, secret('{"zorblax inc": ["Zorblax"]}')],
 			[{ patterns: { namesSecret: 'NAMES' } }, secret('{"zorblax": []}')],
 			[{ patterns: { namesSecret: 'NAMES' } }, secret('{"zorblax": ["!!!"]}')],
-			[{ patterns: { hosts: [{ label: 'x', regex: '(zorbcloud' }] } }],
-			[{ patterns: { hosts: [{ label: 'bad label', regex: 'zorbcloud' }] } }],
-			[{ patterns: { hosts: [{ label: 'x', regex: 'zorbcloud', flags: 'g' }] } }],
+			[{ patterns: { hosts: [{ label: 'x', regex: 'zorbcloud' }] } }],
+			[{ patterns: { hosts: [{ label: 'x', host: 'zorbcloud.test', cidr: '10.0.0.0/8' }] } }],
+			[{ patterns: { hosts: [{ label: 'x', host: 'zorbcloud' }] } }],
+			[{ patterns: { hosts: [{ label: 'x', host: '*.zorb_cloud.test' }] } }],
+			[{ patterns: { hosts: [{ label: 'x', host: 'db.*.zorbcloud.test' }] } }],
+			[{ patterns: { hosts: [{ label: 'x', cidr: '10.77.0.0/33' }] } }],
+			[{ patterns: { hosts: [{ label: 'x', cidr: '10.77.0/16' }] } }],
+			[{ patterns: { hosts: [{ label: 'bad label', host: 'zorbcloud.test' }] } }],
 			[{ mode: 'block' }],
 			[{ model: '' }],
 			[{ patterns: { names: 'zorblax' } }],
@@ -158,9 +184,13 @@ describe('flagging on write', () => {
 		assert.equal(created, true);
 		assert.deepEqual(stored(idFor('flag-1')).contentFlag.labels, ['customer:zorblax']);
 		assert.equal(stored(idFor('flag-1')).contentFlagged, true);
-		// The uncleared owner sees the flag, but not which customer matched.
 		assert.deepEqual(Object.keys(memory.contentFlag).sort(), ['kind', 'since', 'source']);
 		assert.equal(memory.contentFlag.source, 'pattern');
+	});
+
+	it('flags a global write whose chosen id names a customer', async () => {
+		await putMemory('zorblax-failover-runbook', shared('failover steps'), fleet, context);
+		assert.deepEqual(stored('zorblax-failover-runbook').contentFlag.labels, ['customer:zorblax']);
 	});
 
 	it('leaves private, customer-scoped and clean global writes unflagged', async () => {
@@ -326,6 +356,18 @@ describe('review', () => {
 		await rejection(putMemory(id, { scopes: ['customer:quintessa'] }, dave, ifMatch(2)), 403, 'not_memory_owner');
 	});
 
+	it("leaves the owner's review flag for the owner", async () => {
+		const source = idFor('rescope-source');
+		const id = idFor('rescope-citer');
+		await putMemory(source, shared('runbook'), fleet2, context);
+		await putMemory(id, shared('Zorblax lesson', { evidence: [{ kind: 'memory', ref: source }] }), fleet, context);
+		await withdrawMemory(source, {}, fleet2, ifMatch(1));
+		assert.ok(stored(id).needsReview);
+		await putMemory(id, { scopes: ['customer:zorblax'] }, dave, ifMatch(2));
+		assert.ok(stored(id).needsReview);
+		assert.equal(stored(id).contentFlag, null);
+	});
+
 	it('confirm-scope: a customer:* writer clears it; an uncleared owner cannot', async () => {
 		const id = idFor('confirm');
 		await putMemory(id, shared('Zorblax'), fleet, context);
@@ -342,15 +384,24 @@ describe('review', () => {
 		await rejection(confirmScopeMemory(id, {}, dave, context), 409, 'not_flagged');
 	});
 
+	it('confirm-scope needs customer:* read as well as write, even from the owner', async () => {
+		const id = idFor('confirm-own');
+		await putMemory(id, shared('Zorblax'), wanda, context);
+		await rejection(confirmScopeMemory(id, {}, wanda, context), 403, 'customer_clearance_required');
+		assert.ok(stored(id).contentFlag);
+	});
+
 	it('binds a confirmation to the text it reviewed', async () => {
 		const id = idFor('confirm-bind');
 		await putMemory(id, shared('Zorblax'), fleet, context);
 		await confirmScopeMemory(id, {}, dave, context);
 		await putMemory(id, { validUntil: '2999-01-01T00:00:00Z' }, fleet, ifMatch(2));
 		assert.equal(stored(id).contentFlag, null);
-		// Same customer, new detail: a stored label set would have let this through.
+		assert.equal(stored(id).scopeConfirmed.by, 'dave');
+		// A confirmation covers the text it reviewed, not the customer it names.
 		await putMemory(id, { content: 'Zorblax production password rotation' }, fleet, ifMatch(3));
 		assert.deepEqual(stored(id).contentFlag.labels, ['customer:zorblax']);
+		assert.equal(stored(id).scopeConfirmed, null);
 		await confirmScopeMemory(id, {}, dave, context);
 		await putMemory(id, { content: 'Zorblax and db1.zorbcloud.test' }, fleet, ifMatch(5));
 		assert.deepEqual(stored(id).contentFlag.labels, ['customer:zorblax', 'zorb-host']);
@@ -361,8 +412,9 @@ describe('review', () => {
 		await putMemory(id, shared('Zorblax'), fleet, context);
 		await confirmMemory(id, {}, fleet, context);
 		assert.ok(stored(id).contentFlag);
-		await withdrawMemory(id, {}, fleet, ifMatch(2));
+		const tombstone = await withdrawMemory(id, {}, fleet, ifMatch(2));
 		assert.ok(stored(id).contentFlag);
+		assert.equal(tombstone.contentFlag.labels, undefined);
 		await rejection(confirmScopeMemory(id, {}, dave, context), 404, 'memory_not_found');
 	});
 });
@@ -417,6 +469,31 @@ describe('the model check', () => {
 		assert.ok(await getMemory(id, fleet2, context));
 	});
 
+	it('takes over a kept pattern flag when it answers customer', async () => {
+		configure({ model: 'content-stub' });
+		const id = idFor('model-takeover');
+		await putMemory(id, shared('Zorblax'), fleet, context);
+		const pending = deferred();
+		models.generator = () => pending.promise;
+		await putMemory(id, { content: 'the frankfurt cluster of a bank' }, fleet, ifMatch(1));
+		const since = stored(id).contentFlag.since;
+		pending.resolve('customer');
+		await eventually(() => stored(id).contentFlag.source === 'model');
+		assert.deepEqual(stored(id).contentFlag, { kind: 'possible-customer-detail', since, source: 'model' });
+	});
+
+	it('drops a verdict given under configuration that has since been reloaded', async () => {
+		configure({ model: 'content-stub' });
+		const pending = deferred();
+		models.generator = () => pending.promise;
+		const id = idFor('model-reloaded');
+		await putMemory(id, shared('plain text'), fleet, context);
+		configure({ model: 'content-stub' });
+		pending.resolve('customer');
+		await settle();
+		assert.equal(stored(id).contentFlag, null);
+	});
+
 	it('drops a verdict about text or a review state that has since changed', async () => {
 		configure({ model: 'content-stub' });
 		const first = deferred();
@@ -440,6 +517,32 @@ describe('the model check', () => {
 		await settle();
 		assert.equal(stored(reviewed).contentFlag, null);
 		assert.equal(stored(reviewed).scopeConfirmed.by, 'dave');
+	});
+
+	it('holds its slot until the provider call ends, even after the deadline', async () => {
+		configure({ model: 'content-stub' });
+		mock.timers.enable({ apis: ['setTimeout'] });
+		const pendings = [];
+		models.generator = () => {
+			const pending = deferred();
+			pendings.push(pending);
+			return pending.promise;
+		};
+		try {
+			for (let i = 0; i < 8; i++) await putMemory(idFor(`deadline-${i}`), shared(`text ${i}`), fleet, context);
+			mock.timers.tick(30_000);
+			await new Promise(setImmediate);
+			await putMemory(idFor('deadline-9'), shared('text 9'), fleet, context);
+			assert.equal(models.generateCalls.length, 8);
+			assert.ok(models.generateCalls.every(({ options }) => options.signal.aborted));
+			for (const pending of pendings) pending.resolve('clean');
+			await new Promise(setImmediate);
+			await putMemory(idFor('deadline-10'), shared('text 10'), fleet, context);
+			assert.equal(models.generateCalls.length, 9);
+			pendings.at(-1).resolve('clean');
+		} finally {
+			mock.timers.reset();
+		}
 	});
 
 	it('skips checks past the in-flight cap, and survives a failing backend and a failing sink', async () => {
@@ -527,6 +630,33 @@ describe('events', () => {
 		assert.deepEqual(
 			fleetRecords.received.map(({ id, kind }) => [id, kind]),
 			[[byModel, 'created']],
+		);
+	});
+
+	it('tells the owner when a revise newly flags a memory, not about every edit of a flagged one', async () => {
+		const ownerEvents = collect(await MemoryEventsResource.subscribe(target(), { user: ownerUser }));
+		const id = idFor('event-revise');
+		const put = (input, revision) =>
+			MemoryItemResource.put(target({ id }), input, {
+				user: ownerUser,
+				...(revision && { headers: { 'if-match': `"${revision}"` } }),
+			});
+		// Apart by more than a millisecond: `since` and the revise's own timestamp share that resolution.
+		for (const [input, revision] of [
+			[shared('clean text')],
+			[{ content: 'QB Holdings text' }, 1],
+			[{ validUntil: '2999-01-01T00:00:00Z' }, 2],
+			[{ content: 'QB Holdings text, edited' }, 3],
+		]) {
+			await put(input, revision);
+			await new Promise((resolve) => setTimeout(resolve, 2));
+		}
+		await eventually(() => ownerEvents.received.length >= 1);
+		await settle();
+		await ownerEvents.close();
+		assert.deepEqual(
+			ownerEvents.received.map(({ id: eventId, kind, revision }) => [eventId, kind, revision]),
+			[[id, 'revised', 2]],
 		);
 	});
 });

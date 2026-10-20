@@ -511,8 +511,9 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 	ensureEmbedder(Memory);
 	const { supersession, customerContentCheck: check } = settings;
 	// Matched while planning, outside the locks; the transaction matches again only if the row changed since.
-	const matched = new Map<string, string[]>();
+	let matched: Map<string, string[]> | undefined;
 	const labelsFor = (text: string) => {
+		matched ??= new Map();
 		let labels = matched.get(text);
 		if (!labels) matched.set(text, (labels = matchCustomerContent(text, check.matcher)));
 		return labels;
@@ -549,14 +550,16 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 				: undefined;
 		const mayRevise = revisedScopes !== undefined;
 		if (check.mode === 'flag' && (planningCreate ? createScopes : revisedScopes)?.includes(GLOBAL_SCOPE)) {
-			labelsFor(
-				checkedText({
-					title: parsedTitle ?? (planningCreate ? null : preExisting.title),
-					content: parsedContent ?? (planningCreate ? null : preExisting.content),
-					tags: parsedTags ?? (planningCreate ? [] : preExisting.tags),
-					evidence: parsedEvidence ?? (planningCreate ? [] : preExisting.evidence),
-				}),
-			);
+			const text = checkedText({
+				id,
+				title: parsedTitle ?? (planningCreate ? null : preExisting.title),
+				content: parsedContent ?? (planningCreate ? null : preExisting.content),
+				tags: parsedTags ?? (planningCreate ? [] : preExisting.tags),
+				evidence: parsedEvidence ?? (planningCreate ? [] : preExisting.evidence),
+			});
+			if (planningCreate || !(preExisting.scopes ?? []).includes(GLOBAL_SCOPE) || text !== checkedText(preExisting)) {
+				labelsFor(text);
+			}
 		}
 		const writesContent =
 			parsedContent !== undefined &&
@@ -618,7 +621,8 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 				const existing = await Memory.get(id, txn);
 				const now = new Date();
 				if (existing) {
-					if (existing.ownerId !== principal.id && !principal.superUser) {
+					const reviewing = existing.ownerId !== principal.id && !principal.superUser;
+					if (reviewing) {
 						if (!canRead(existing, principal)) {
 							throw memoryError('Memory id is not available', 409, 'id_unavailable');
 						}
@@ -698,9 +702,9 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 					locks.require(newCitations(existing));
 					const decision = decideContentFlag(
 						check,
-						{ scopes: existing.scopes ?? [], text: checkedText(existing), flag: existing.contentFlag ?? null },
+						{ scopes: existing.scopes ?? [], text: () => checkedText(existing), flag: existing.contentFlag ?? null },
 						candidate.scopes,
-						checkedText(candidate),
+						() => checkedText({ id, ...candidate }),
 						labelsFor,
 						now,
 					);
@@ -719,8 +723,9 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 						}),
 						...(parsedValidUntil !== undefined && { validUntil: parsedValidUntil }),
 						// A revision is the owner's review: it clears a flag without re-flagging this memory's own citers.
-						...(existing.needsReview && CLEARED_REVIEW),
+						...(existing.needsReview && !reviewing && CLEARED_REVIEW),
 						...contentFlagFields(decision.flag),
+						...(decision.reviewLapsed && { scopeConfirmed: null }),
 						lastEventKind: 'revised',
 						revision: existing.revision + 1,
 						lastEditor: { principalId: principal.id, source: principal.source, revisedAt: now.toISOString() },
@@ -785,7 +790,7 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 					check,
 					undefined,
 					scopes,
-					checkedText({ title, content, tags, evidence }),
+					() => checkedText({ id, title, content, tags, evidence }),
 					labelsFor,
 					now,
 				);

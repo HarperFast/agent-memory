@@ -437,8 +437,12 @@ async function resolveDeliverableEvent(
 			: canRead(record, currentPrincipal);
 	if (!readable) return undefined;
 
-	// Whoever can read a content-flagged memory can see its flag.
-	if (kind === 'flagged' && !record.contentFlag && !(await hasVisibleFlag(record, currentPrincipal))) {
+	// A content flag names nothing beyond the memory itself, so a reader of the memory may learn of it; a review
+	// flag names its source, so it stays subject to the source's visibility.
+	if (
+		kind === 'flagged' &&
+		(record.needsReview ? !(await hasVisibleFlag(record, currentPrincipal)) : !record.contentFlag)
+	) {
 		return undefined;
 	}
 	const updatedStamp =
@@ -734,12 +738,20 @@ export async function subscribeMemoryEvents(
 		throw notFound();
 	}
 
-	// A write that leaves the owner's memory flagged: `flagged`, a review flag folded into a restore or create, or
-	// a create or revise the customer-content check flagged.
+	// A create or revise sets a new content flag's `since` from the same clock reading as its own timestamp; a flag
+	// kept from before does not match, so an edit to an already flagged memory is not news (unless it lands in the
+	// same millisecond as the write that flagged it, which costs one repeated notice).
+	const isNewContentFlag = (kind: MemoryEventKind, record: any): boolean => {
+		const since = record?.contentFlag?.since;
+		if (since === undefined) return false;
+		return kind === 'created'
+			? since === record.author?.authoredAt
+			: kind === 'revised' && since === record.lastEditor?.revisedAt;
+	};
 	const isFlagEvent = (kind: MemoryEventKind, record: any): boolean =>
 		kind === 'flagged' ||
 		((kind === 'restored' || kind === 'created') && Boolean(record?.needsReview)) ||
-		((kind === 'created' || kind === 'revised') && Boolean(record?.contentFlag));
+		isNewContentFlag(kind, record);
 
 	const matchesWatchOrOwnFlag = (raw: any): { maybeOwnFlagged: boolean; watchConfirmed: boolean } | undefined => {
 		const eventRecord = raw?.value;
@@ -768,7 +780,11 @@ export async function subscribeMemoryEvents(
 			const { event, record, currentPrincipal, dedupToken } = deliverable;
 
 			if (isFlagEvent(event.kind, record) && record.ownerId === currentPrincipal.id) {
-				if (event.kind === 'flagged' || record.contentFlag || (await hasVisibleFlag(record, currentPrincipal))) {
+				if (
+					event.kind === 'flagged' ||
+					isNewContentFlag(event.kind, record) ||
+					(await hasVisibleFlag(record, currentPrincipal))
+				) {
 					return { event, dedupToken };
 				}
 			}

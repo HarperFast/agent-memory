@@ -113,7 +113,10 @@ export async function forReader<T extends MemoryView>(
 	context?: object,
 	access = new Map<string, Promise<any>>(),
 ): Promise<T[]> {
-	const views = readsCustomerContent(principal) ? unredacted : unredacted.map(withoutFlagLabels);
+	const views =
+		readsCustomerContent(principal) || !unredacted.some((view) => (view.contentFlag as any)?.labels)
+			? unredacted
+			: unredacted.map(withoutFlagLabels);
 	if (principal.superUser || !views.some((view) => view.needsReview)) return [...views];
 	const missing = new Set<string>();
 	for (const view of views) {

@@ -135,8 +135,9 @@ export function readsCustomerContent(principal: Principal): boolean {
 	return principal.superUser || principal.read.namespaces.has(CUSTOMER_NAMESPACE);
 }
 
+/** Ownership alone never qualifies: an owner can read its own flagged memory without customer clearance. */
 export function reviewsCustomerContent(principal: Principal): boolean {
-	return principal.superUser || principal.write.namespaces.has(CUSTOMER_NAMESPACE);
+	return readsCustomerContent(principal) && (principal.superUser || principal.write.namespaces.has(CUSTOMER_NAMESPACE));
 }
 
 export function isCustomerScope(label: string): boolean {

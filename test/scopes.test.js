@@ -279,7 +279,8 @@ describe('the customer-content quarantine', () => {
 		assert.equal(readsCustomerContent(principal('dave', ['customer:*'])), true);
 		assert.equal(readsCustomerContent(principal('carol', ['customer:x'])), false);
 		assert.equal(reviewsCustomerContent(principal('dave', ['customer:*'])), false);
-		assert.equal(reviewsCustomerContent(principal('dave', [], ['customer:*'])), true);
+		assert.equal(reviewsCustomerContent(principal('dave', [], ['customer:*'])), false);
+		assert.equal(reviewsCustomerContent(principal('dave', ['customer:*'], ['customer:*'])), true);
 		assert.equal(reviewsCustomerContent(principal('root', [], [], true)), true);
 	});
 });

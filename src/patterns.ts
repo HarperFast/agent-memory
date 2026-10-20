@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs';
+import { BlockList, isIPv4, isIPv6 } from 'node:net';
 import { isAbsolute } from 'node:path';
 import { isScopeLabel } from './scopes.ts';
 
@@ -9,10 +10,26 @@ interface NameEntry {
 	readonly label: string;
 }
 
+interface AddressRange {
+	readonly label: string;
+	readonly list: BlockList;
+	readonly family: 'ipv4' | 'ipv6';
+}
+
+interface HostRules {
+	/** Exact host name → labels. */
+	readonly exact: ReadonlyMap<string, readonly string[]>;
+	/** `.example.com` (from `*.example.com`) → labels. */
+	readonly suffixes: ReadonlyMap<string, readonly string[]>;
+	readonly ranges: readonly AddressRange[];
+	/** Every range in one list, so an address outside all of them costs one check. */
+	readonly anyRange: BlockList;
+}
+
 export interface CustomerMatcher {
 	/** First token of a name → the remaining tokens and the `customer:<org>` label. */
 	readonly names: ReadonlyMap<string, readonly NameEntry[]>;
-	readonly hosts: ReadonlyArray<{ readonly label: string; readonly regex: RegExp }>;
+	readonly hosts: HostRules;
 }
 
 export interface ContentCheckSettings {
@@ -23,22 +40,26 @@ export interface ContentCheckSettings {
 
 export type SecretsSource = () => Readonly<Record<string, string | undefined>> | undefined;
 
-const MAX_HOST_PATTERNS = 64;
-const MAX_HOST_PATTERN_CHARS = 512;
+const MAX_HOST_PATTERNS = 256;
 const MAX_NAMES = 50_000;
 const MAX_NAME_CHARS = 200;
+const MAX_HOST_NAME_CHARS = 253;
 const HOST_LABEL = /^[A-Za-z0-9_.-]{1,64}$/;
+const DNS_LABEL = /^[a-z0-9-]{1,63}$/;
 const CHECK_FIELDS = ['mode', 'model', 'patterns'];
 const PATTERN_FIELDS = ['namesFile', 'namesSecret', 'hosts'];
-const HOST_FIELDS = ['label', 'regex'];
+const HOST_FIELDS = ['label', 'host', 'cidr'];
 
 export const CONTENT_CHECK_OFF: ContentCheckSettings = Object.freeze({
 	mode: 'off',
-	matcher: Object.freeze({ names: new Map(), hosts: [] }),
+	matcher: Object.freeze({
+		names: new Map(),
+		hosts: { exact: new Map(), suffixes: new Map(), ranges: [], anyRange: new BlockList() },
+	}),
 });
 
-// Every message names the option and nothing it holds: the names list is sensitive, and JSON.parse and RegExp
-// errors quote their input, so neither is chained as a cause.
+// Every message names the option and nothing it holds: the names list is sensitive, and JSON.parse errors quote
+// their input, so none is chained as a cause.
 function fail(message: string): never {
 	throw new Error(`@harperfast/agent-memory: customerContentCheck${message}`);
 }
@@ -47,7 +68,7 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 	return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
-export function tokens(text: string): string[] {
+function tokens(text: string): string[] {
 	return (
 		text
 			.normalize('NFKC')
@@ -87,28 +108,75 @@ function compileNames(source: string): Map<string, NameEntry[]> {
 	return index;
 }
 
-function compileHosts(value: unknown): Array<{ label: string; regex: RegExp }> {
-	if (value === undefined || value === null) return [];
+function isHostName(name: string): boolean {
+	const labels = name.split('.');
+	return (
+		name.length <= MAX_HOST_NAME_CHARS &&
+		labels.length > 1 &&
+		labels.every((label) => DNS_LABEL.test(label) && !label.startsWith('-') && !label.endsWith('-'))
+	);
+}
+
+function addLabel(index: Map<string, string[]>, key: string, label: string): void {
+	let labels = index.get(key);
+	if (!labels) index.set(key, (labels = []));
+	labels.push(label);
+}
+
+// No operator-supplied regular expression: a host rule is an exact name or a `*.` suffix and an address rule a CIDR
+// range, so matching stays linear in the text whatever is configured.
+function compileHosts(value: unknown): HostRules {
+	const rules = {
+		exact: new Map<string, string[]>(),
+		suffixes: new Map<string, string[]>(),
+		ranges: [] as AddressRange[],
+		anyRange: new BlockList(),
+	};
+	if (value === undefined || value === null) return rules;
 	if (!Array.isArray(value) || value.length > MAX_HOST_PATTERNS) {
-		fail(`.patterns.hosts must be an array of at most ${MAX_HOST_PATTERNS} { label, regex } entries`);
+		fail(`.patterns.hosts must be an array of at most ${MAX_HOST_PATTERNS} { label, host | cidr } entries`);
 	}
-	return value.map((entry, i) => {
-		if (!isPlainObject(entry) || Object.keys(entry).some((key) => !HOST_FIELDS.includes(key))) {
-			fail(`.patterns.hosts[${i}] must be { label, regex }`);
+	value.forEach((entry, i) => {
+		if (
+			!isPlainObject(entry) ||
+			Object.keys(entry).some((key) => !HOST_FIELDS.includes(key)) ||
+			(entry.host === undefined) === (entry.cidr === undefined)
+		) {
+			fail(`.patterns.hosts[${i}] must be { label, host } or { label, cidr }`);
 		}
-		const { label, regex } = entry;
+		const { label, host, cidr } = entry;
 		if (typeof label !== 'string' || !HOST_LABEL.test(label)) {
 			fail(`.patterns.hosts[${i}].label must be 1-64 characters of A-Z, a-z, 0-9, _, . or -`);
 		}
-		if (typeof regex !== 'string' || !regex || regex.length > MAX_HOST_PATTERN_CHARS) {
-			fail(`.patterns.hosts[${i}].regex must be a non-empty string of at most ${MAX_HOST_PATTERN_CHARS} characters`);
+		if (host !== undefined) {
+			const name = typeof host === 'string' ? host.toLowerCase() : '';
+			const wildcard = name.startsWith('*.');
+			if (!isHostName(wildcard ? name.slice(2) : name)) {
+				fail(`.patterns.hosts[${i}].host must be a host name, optionally starting with "*."`);
+			}
+			if (wildcard) addLabel(rules.suffixes, name.slice(1), label);
+			else addLabel(rules.exact, name, label);
+			return;
 		}
-		try {
-			return { label, regex: new RegExp(regex, 'iu') };
-		} catch {
-			fail(`.patterns.hosts[${i}].regex is not a valid regular expression`);
+		const [address, prefixText, extra] = typeof cidr === 'string' ? cidr.split('/') : [];
+		const family = isIPv4(address) ? 'ipv4' : isIPv6(address) ? 'ipv6' : undefined;
+		const prefix = prefixText === undefined ? (family === 'ipv4' ? 32 : 128) : Number(prefixText);
+		if (
+			!family ||
+			extra !== undefined ||
+			prefixText === '' ||
+			!Number.isInteger(prefix) ||
+			prefix < 0 ||
+			prefix > (family === 'ipv4' ? 32 : 128)
+		) {
+			fail(`.patterns.hosts[${i}].cidr must be an IPv4 or IPv6 address or CIDR range`);
 		}
+		const list = new BlockList();
+		list.addSubnet(address, prefix, family);
+		rules.anyRange.addSubnet(address, prefix, family);
+		rules.ranges.push({ label, list, family });
 	});
+	return rules;
 }
 
 function readNames(patterns: Record<string, unknown>, secrets: SecretsSource): string | undefined {
@@ -155,14 +223,16 @@ export function parseContentCheck(options: unknown, secrets: SecretsSource): Con
 	});
 }
 
-/** The text the check reads: every author-written field, including evidence refs (a URL names its host). */
+/** The text the check reads: every author-written field, the chosen id and evidence refs (a URL names its host). */
 export function checkedText(fields: {
+	id: string;
 	title?: string | null;
 	content?: string | null;
 	tags?: readonly string[] | null;
 	evidence?: ReadonlyArray<{ ref: string; note?: string | null }> | null;
 }): string {
 	return [
+		fields.id,
 		fields.title ?? '',
 		fields.content ?? '',
 		...(fields.tags ?? []),
@@ -170,7 +240,39 @@ export function checkedText(fields: {
 	].join('\n');
 }
 
-/** Sorted labels: `customer:<org>` per matched name, the configured label per matched host pattern. */
+function trimEdges(word: string): string {
+	let start = 0;
+	let end = word.length;
+	while (start < end && (word[start] === '.' || word[start] === '-')) start++;
+	while (end > start && (word[end - 1] === '.' || word[end - 1] === '-')) end--;
+	return word.slice(start, end);
+}
+
+function matchHosts(text: string, rules: HostRules, labels: Set<string>): void {
+	const add = (found: readonly string[] | undefined) => found?.forEach((label) => labels.add(label));
+	for (const word of text.toLowerCase().split(/[^a-z0-9.:-]+/)) {
+		const colon = word.includes(':');
+		if (!colon && !word.includes('.')) continue;
+		// A port or scheme rides on a host after a colon; an IPv6 address is the whole word.
+		const candidates = colon && isIPv6(word) ? [word] : colon ? word.split(':').map(trimEdges) : [trimEdges(word)];
+		for (const candidate of candidates) {
+			const family = isIPv4(candidate) ? 'ipv4' : candidate.includes(':') ? 'ipv6' : undefined;
+			if (family) {
+				if (rules.ranges.length === 0 || !rules.anyRange.check(candidate, family)) continue;
+				for (const range of rules.ranges) {
+					if (range.family === family && range.list.check(candidate, family)) labels.add(range.label);
+				}
+				continue;
+			}
+			if (candidate.length > MAX_HOST_NAME_CHARS || !candidate.includes('.')) continue;
+			add(rules.exact.get(candidate));
+			for (let dot = candidate.indexOf('.', 1); dot !== -1; dot = candidate.indexOf('.', dot + 1)) {
+				add(rules.suffixes.get(candidate.slice(dot)));
+			}
+		}
+	}
+}
+
 export function matchCustomerContent(text: string, matcher: CustomerMatcher): string[] {
 	const labels = new Set<string>();
 	if (matcher.names.size > 0) {
@@ -183,8 +285,7 @@ export function matchCustomerContent(text: string, matcher: CustomerMatcher): st
 			}
 		}
 	}
-	for (const { label, regex } of matcher.hosts) {
-		if (!labels.has(label) && regex.test(text)) labels.add(label);
-	}
+	const { exact, suffixes, ranges } = matcher.hosts;
+	if (exact.size > 0 || suffixes.size > 0 || ranges.length > 0) matchHosts(text, matcher.hosts, labels);
 	return [...labels].sort();
 }

@@ -155,9 +155,9 @@ Rules:
 
 | Operation           | Effect                                                                                                                                                                                                                                                                                                                                  |
 | ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| create (`PUT`)      | client chooses `id` (`^[A-Za-z0-9_-]{16,64}$`); absent id creates at `revision: 1` and returns `201 { id, revision, candidates, contentFlag }`; `If-None-Match: *` makes `PUT` create-only (`412` if the id exists); an identical retry returns `200 { id, revision, candidates }`                                                      |
-| revise (`PUT`)      | `PUT /Memory/<id>` on an owned memory whose editable fields (`title`, `content`, `tags`, `scopes`, `evidence`, `validUntil`) differ from the stored ones requires `If-Match: "<revision>"` (or `*`; missing → 428, stale → 412), bumps `revision`, clears `needsReview`, and returns `200 { id, revision, candidates }`                 |
-| confirm-scope       | `POST /Memory/<id>/confirm-scope` (a reader holding `customer:*` write or `super_user`; 403 `customer_clearance_required` otherwise, the missing-id 404 for a non-reader) clears the content flag and records `scopeConfirmed: { by, at }`; `If-Match` honoured when sent; 409 `not_flagged`, 409 on a withdrawn memory                 |
+| create (`PUT`)      | client chooses `id` (`^[A-Za-z0-9_-]{16,64}$`); absent id creates at `revision: 1` and returns `201 { id, revision, candidates, contentFlag }`; `If-None-Match: *` makes `PUT` create-only (`412` if the id exists); an identical retry returns `200 { id, revision, candidates, contentFlag }`                                         |
+| revise (`PUT`)      | `PUT /Memory/<id>` on an owned memory whose editable fields (`title`, `content`, `tags`, `scopes`, `evidence`, `validUntil`) differ from the stored ones requires `If-Match: "<revision>"` (or `*`; missing → 428, stale → 412), bumps `revision`, clears `needsReview`, and returns `200 { id, revision, candidates, contentFlag }`    |
+| confirm-scope       | `POST /Memory/<id>/confirm-scope` (a reviewer holding `customer:*` read and write, or `super_user`; 403 `customer_clearance_required` otherwise, the missing-id 404 for a non-reader) clears the content flag and records `scopeConfirmed: { by, at }`; `If-Match` honoured when sent; 409 `not_flagged`, 409 on a withdrawn memory     |
 | supersede           | create a memory via `PUT /Memory/<id>` with `supersedes: [ids]` (`supersedes` on a revise is 400 `supersedes_not_allowed`)                                                                                                                                                                                                              |
 | withdraw (`DELETE`) | `DELETE /Memory/<id>?reason=` requires `If-Match: "<revision>"` (or `*`; missing → 428, stale → 412); sets `status = withdrawn`, keeps the row as a tombstone, never deletes it                                                                                                                                                         |
 | pin / unpin         | records or deletes the caller's `MemoryPin` row (`<principalId>:<memoryId>`, up to 50 pins per principal; withdrawn pins are pruned on pin, 409 `pin_limit_exceeded` past 50); `pin` requires read access (same 404 when missing or unreadable), while `unpin` always deletes the caller's pin and includes `memory` only when readable |
@@ -218,7 +218,8 @@ first-class operation, and the write path proposes it.
   supersedes others must still cover each non-withdrawn one.
 - **Owner-only readers are not covered**: an owner who reads the old memory only by ownership (none
   of its labels is in their readable set) sees `supersededBy` but may be unable to read the
-  replacement. Covering them would publish the replacement to a principal its author did not choose.
+  replacement. Covering them would publish the replacement to a principal its author did not choose. The same
+  holds for every uncleared reader while the replacement is content-flagged (Customer content).
 - **A memory is superseded exactly while a non-withdrawn memory lists it in `supersedes`**; the newest
   such memory (by `createdAt`, then id) is its `supersededBy`. A superseder that is itself superseded
   (or expired via `validUntil`) still counts — its replacement carries the chain forward, and callers
@@ -299,42 +300,51 @@ reads `global` only (`src/patterns.ts`, `src/quarantine.ts`).
 - **Configuration** (`customerContentCheck`, absent = off): `mode: off | flag` (default `flag` when the block
   is present), `model` (optional `models.generate` name), `patterns.namesFile` (absolute path) or
   `patterns.namesSecret` (a name in the application's `scope.secrets`: a scoped secret, or a declared env name),
-  and `patterns.hosts: [{ label, regex }]` (at most 64, regex ≤ 512 characters, matched with flags `iu`). The
-  names source is JSON `{ "<org>": ["Name", "Alias", ...] }`. It is read when the plugin configures (startup and
-  every option change), never from the repository, and no message about it echoes its content, keys or the
-  regexes. Host regexes run synchronously: they are operator configuration, and a pathological one blocks the
-  worker with or without a lock held.
-- **The check** reads every author-written field: title, content, tags, evidence refs and notes. A name matches
-  as a whole token sequence (NFKC, lowercased, letter and digit runs), so `Acme` matches `acme-prod.example.com`
-  and not `Acmeville`. Labels: `customer:<org>` per matched name, the configured label per matched host regex.
+  and `patterns.hosts` (at most 256 of `{ label, host }`, an exact host name or `*.` for any subdomain, or
+  `{ label, cidr }`, an IPv4 or IPv6 address or range). The names source is JSON `{ "<org>": ["Name", "Alias",
+...] }`. It is read when the plugin configures (startup and every option change), never from the repository,
+  and no message about it echoes its content or keys. There is deliberately no regular-expression option: the
+  text is the writer's, so matching must stay linear in it (one split into words, map lookups, `net.BlockList`).
+- **The check** reads the chosen `id` and every author-written field: title, content, tags, evidence refs and
+  notes. A name matches as a whole token sequence (NFKC, lowercased, letter and digit runs), so `Acme` matches
+  `acme-prod.example.com` and not `Acmeville` (in a script written without spaces, a name matches only a whole
+  run). Labels: `customer:<org>` per matched name, the configured label per matched host or range.
 - **When**: on a create, and on a revise whose resulting scopes include `global` and that changes the checked
-  text or newly includes `global`; import checks its created rows by pattern only (a batch would otherwise
-  start a model call per row). A match sets `contentFlag: { kind: 'possible-customer-detail', since, source:
-'pattern', labels }` (keeping `since` while the memory stays flagged). Leaving `global` clears the flag; so does
-  a re-check that matches nothing, except that a flag is kept while a configured model re-checks the text. A
-  revise that changes neither the checked text nor `global` keeps whatever state the memory is in. `mode: off`
-  checks nothing and keeps existing flags enforced. Status-only writes never touch the flag. Flags are
-  prospective: changing the names list re-checks nothing already stored.
+  text or newly includes `global`; import checks its created rows by pattern only, before its locks (a batch
+  would otherwise start a model call per row). A match sets `contentFlag: { kind: 'possible-customer-detail',
+since, source: 'pattern', labels }` (keeping `since` while the memory stays flagged). Leaving `global` clears
+  the flag; so does a re-check that matches nothing, except that a flag is kept while a configured model
+  re-checks the text. A revise that changes neither the checked text nor `global` keeps whatever state the
+  memory is in. `mode: off` checks nothing and keeps existing flags enforced. Status-only writes never touch the
+  flag. Flags are prospective: changing the names list re-checks nothing already stored.
 - **The model** (optional) runs after the write commits and never holds up its response or a lock: a strict
-  one-word answer `customer | clean` (30 s), at most 8 in flight (more are skipped with a rate-limited warning),
-  failures logged with fixed text only. Its verdict applies in its own locked transaction only if the row's
-  checked text, `contentFlag`, `scopeConfirmed`, `mode` and `model` are unchanged since it started and the row is
-  still `global`: `customer` sets a `source: 'model'` flag (`lastEventKind: 'flagged'`), `clean` clears a kept
-  flag. Between commit and verdict a model-only true positive is readable by `global` readers, and a check lost
-  to a restart leaves it so: the patterns are the synchronous guarantee.
+  one-word answer `customer | clean` (30 s), at most 8 provider calls in flight per worker thread (counted until
+  the call itself ends, even past its deadline; more are skipped with a rate-limited warning), failures logged
+  with fixed text only. Its verdict applies in its own locked transaction only under the same settings object
+  (a reload invalidates it), with the row still `global` and its checked text, `contentFlag` and
+  `scopeConfirmed` unchanged: `customer` sets a `source: 'model'` flag (taking over, with its `since`, a pattern
+  flag kept for earlier text; `lastEventKind: 'flagged'`), and `clean` clears a kept flag only if the row's
+  `revision` is also unchanged, since clearing publishes. Between commit and verdict a model-only true positive
+  is readable by `global` readers, and a check lost to a restart or skipped leaves it so: the patterns are the
+  synchronous guarantee.
 - **Quarantine**: see rule 1 and rule 5. Clearance is the `customer:*` read wildcard; an exact `customer:<org>`
   grant does not clear, since a flag can name any customer. The flag only removes access, never grants it.
   `contentFlag.labels` is shown only to a cleared reader: an owner without clearance sees the flag but not which
   customer it matched (the flag's existence still tells a writer that a name is on the list; that is inherent
   in telling the owner at all). A flagged memory cannot be cited, pinned, watched or superseded by an uncleared
   reader (same 404 or 400 as missing), and a review flag whose source is quarantined is hidden from them. A
-  flagged replacement hides its superseded `global` predecessor from uncleared readers until review.
+  flagged replacement breaks the supersession guarantee that label readers can read the replacement: they still
+  read the superseded predecessor (hidden from default search) and its `supersededBy` names an id that answers
+  404, as for an owner-only reader.
 - **Review**: the owner clears a flag by revising the detail out or rescoping out of `global` (its own write
-  grants apply). A reader holding `customer:*` write may revise someone else's flagged memory when the payload
-  is only `scopes` and every resulting label is a `customer:` label, or call confirm-scope. An owner without
-  clearance cannot confirm-scope: that would publish exactly what the flag withheld. A confirmation holds for the
-  text it reviewed: a revise that changes the checked text runs the full check again, so a later mention of
-  the same customer is flagged too.
+  grants apply). A reviewer — `super_user`, or a principal holding `customer:*` read and write — may revise
+  someone else's flagged memory when the payload is only `scopes` and every resulting label is a `customer:`
+  label (the owner's `needsReview` survives it), or call confirm-scope. Ownership alone never qualifies: an owner
+  without clearance confirming its own flag would publish exactly what the flag withheld. A flagged memory that
+  supersedes a `global` one cannot leave `global` (the superset rule), so its review is confirm-scope or a
+  withdrawal, which restores its predecessor. `scopeConfirmed: { by, at }` describes the current text: a revise
+  that re-runs the check (the checked text changed, or `global` is new) or leaves `global`, and a model flag,
+  clear it, so a later mention of the same customer is flagged again.
 
 ## HTTP surface
 
@@ -421,8 +431,9 @@ Three levels, built in order:
    label readers and watchers learn that a shared memory they could read was withdrawn (`GET /Memory/<id>`
    still returns 404 to non-owners; a content-flagged memory's withdrawal reaches cleared readers only). Events
    carry `{ id, kind, revision }` — never content — with `kind` one of `created`, `revised`, `superseded`,
-   `withdrawn`, `restored`, or `flagged` (`needsReview` set, or a model's content flag),
-   so a reader re-reads through the guarded `GET`. Subscriptions are live-only (`omitCurrent: true`) with
+   `withdrawn`, `restored`, or `flagged` (`needsReview` set, or a model's content flag; a `flagged` row that
+   carries `needsReview` reaches only a reader who can see that flag), so a reader re-reads through the guarded
+   `GET`. Subscriptions are live-only (`omitCurrent: true`) with
    at-most-once delivery and no replay across disconnects; if Harper core re-emits existing rows on a
    table reload (`copyApply`, `harper-pro#495`) beyond the per-connection 1,024-entry deduplication
    window, rows may replay their stored `lastEventKind`, which clients handle idempotently by comparing
@@ -445,7 +456,9 @@ Three levels, built in order:
      read check, or
    - one of the caller's own memories (`ownerId === principal.id`) is flagged `needsReview`
      (`kind: 'flagged'`, or `restored` / `created` with a newly folded `needsReview` flag visible to the
-     caller), or a create or revise leaves it content-flagged (`created` / `revised` carrying `contentFlag`).
+     caller), or a create or revise newly content-flags it (the flag's `since` equals that write's
+     `author.authoredAt` / `lastEditor.revisedAt`, so editing an already flagged memory is not news; two writes in
+     one millisecond can repeat the notice).
      The notification fires when "a memory you relied on changed, or your own memory needs review", not on
      every write. A watcher that cannot read a memory once it is content-flagged hears nothing more about it,
      as after a scope narrowing.

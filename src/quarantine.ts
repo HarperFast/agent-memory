@@ -4,9 +4,9 @@ import { checkedText, type ContentCheckSettings } from './patterns.ts';
 import { GLOBAL_SCOPE } from './scopes.ts';
 import { getSettings } from './settings.ts';
 import { hasSinks, notifySinks } from './sinks.ts';
-import { askOneWord } from './supersession.ts';
+import { askOneWord, type OneWordOutcome } from './supersession.ts';
 
-export const CONTENT_FLAG_KIND = 'possible-customer-detail';
+const CONTENT_FLAG_KIND = 'possible-customer-detail';
 
 export interface ContentFlag {
 	kind: typeof CONTENT_FLAG_KIND;
@@ -25,6 +25,8 @@ export function contentFlagFields(flag: ContentFlag | null) {
 export interface FlagDecision {
 	flag: ContentFlag | null;
 	modelCheck: boolean;
+	/** The check ran again or the memory left `global`, so an earlier confirm-scope no longer describes it. */
+	reviewLapsed: boolean;
 }
 
 /**
@@ -34,25 +36,27 @@ export interface FlagDecision {
  */
 export function decideContentFlag(
 	check: ContentCheckSettings,
-	previous: { scopes: readonly string[]; text: string; flag: ContentFlag | null } | undefined,
+	previous: { scopes: readonly string[]; text: () => string; flag: ContentFlag | null } | undefined,
 	scopes: readonly string[],
-	text: string,
+	text: () => string,
 	labelsFor: (text: string) => string[],
 	now: Date,
 ): FlagDecision {
 	const current = previous?.flag ?? null;
-	if (!scopes.includes(GLOBAL_SCOPE)) return { flag: null, modelCheck: false };
-	const recheck = !previous || previous.text !== text || !previous.scopes.includes(GLOBAL_SCOPE);
-	if (check.mode === 'off' || !recheck) return { flag: current, modelCheck: false };
-	const labels = labelsFor(text);
+	if (!scopes.includes(GLOBAL_SCOPE)) return { flag: null, modelCheck: false, reviewLapsed: true };
+	const unchanged = { flag: current, modelCheck: false, reviewLapsed: false };
+	if (check.mode === 'off') return unchanged;
+	const resulting = text();
+	if (previous?.scopes.includes(GLOBAL_SCOPE) && previous.text() === resulting) return unchanged;
+	const labels = labelsFor(resulting);
 	if (labels.length > 0) {
 		return {
 			flag: { kind: CONTENT_FLAG_KIND, since: current?.since ?? now.toISOString(), source: 'pattern', labels },
 			modelCheck: false,
+			reviewLapsed: true,
 		};
 	}
-	if (check.model) return { flag: current, modelCheck: true };
-	return { flag: null, modelCheck: false };
+	return { flag: check.model ? current : null, modelCheck: Boolean(check.model), reviewLapsed: true };
 }
 
 const MODEL_CHECK_MAX_IN_FLIGHT = 8;
@@ -86,50 +90,64 @@ function sameJson(a: unknown, b: unknown): boolean {
 	return JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
 }
 
+interface Seen {
+	/** The settings object is replaced on every reload, so its identity is the configuration's generation. */
+	check: ContentCheckSettings;
+	revision: number;
+	text: string;
+	flag: unknown;
+	confirmed: unknown;
+}
+
 /**
  * Advisory and after commit: the request never waits for it, and it never holds a lock across the model call.
  * Lost on process exit, and skipped past MODEL_CHECK_MAX_IN_FLIGHT, which leaves the memory as the patterns left it.
  */
 export function scheduleModelCheck(id: string, row: any, requestContext: any): void {
-	const { model } = getSettings().customerContentCheck;
-	if (!model) return;
+	const check = getSettings().customerContentCheck;
+	if (!check.model) return;
 	if (inFlight >= MODEL_CHECK_MAX_IN_FLIGHT) {
 		warnRateLimited('saturated', `skipped: ${MODEL_CHECK_MAX_IN_FLIGHT} checks already running`);
 		return;
 	}
 	inFlight++;
-	const seen = { text: checkedText(row), flag: row.contentFlag ?? null, confirmed: row.scopeConfirmed ?? null };
-	runModelCheck(id, model, seen, { user: requestContext?.user })
-		.catch(() => warnRateLimited('failed', 'failed to record its verdict'))
-		.finally(() => inFlight--);
-}
-
-async function runModelCheck(
-	id: string,
-	model: string,
-	seen: { text: string; flag: unknown; confirmed: unknown },
-	context: object,
-): Promise<void> {
-	const outcome = await askOneWord(
+	const seen: Seen = {
+		check,
+		revision: row.revision,
+		text: checkedText(row),
+		flag: row.contentFlag ?? null,
+		confirmed: row.scopeConfirmed ?? null,
+	};
+	const { outcome, settled } = askOneWord(
 		{ system: MODEL_SYSTEM, messages: [{ role: 'user', content: `<memory>\n${seen.text}\n</memory>` }] },
-		{ model, maxTokens: MODEL_CHECK_MAX_TOKENS, timeoutMs: MODEL_CHECK_TIMEOUT_MS },
+		{ model: check.model, maxTokens: MODEL_CHECK_MAX_TOKENS, timeoutMs: MODEL_CHECK_TIMEOUT_MS },
 		MODEL_ANSWERS,
 	);
-	if (!('answer' in outcome)) {
-		warnRateLimited(outcome.failure, MODEL_FAILURES[outcome.failure]);
+	const applied = outcome
+		.then((result) => applyVerdict(id, result, seen, { user: requestContext?.user }))
+		.catch(() => warnRateLimited('failed', 'failed to record its verdict'));
+	// The slot stays taken until the provider call itself ends: a backend that ignores the abort still holds it.
+	void Promise.all([settled, applied]).then(() => inFlight--);
+}
+
+async function applyVerdict(
+	id: string,
+	result: OneWordOutcome<(typeof MODEL_ANSWERS)[number]>,
+	seen: Seen,
+	context: object,
+): Promise<void> {
+	if (!('answer' in result)) {
+		warnRateLimited(result.failure, MODEL_FAILURES[result.failure]);
 		return;
 	}
 	const Memory = memoryTable();
 	await withLockPlan(context, [id], async (txn) => {
 		const row = await Memory.get(id, txn);
-		const check = getSettings().customerContentCheck;
-		// The verdict is about the text the model read, under the review state it read it in: a confirm-scope, a
-		// rescope or a newer flag since then means it answers a question nobody is asking any more.
+		// The verdict is about the text the model read, under the configuration and review state it read it in.
 		if (
 			!row ||
 			row.status === STATUS_WITHDRAWN ||
-			check.mode !== 'flag' ||
-			check.model !== model ||
+			getSettings().customerContentCheck !== seen.check ||
 			!(row.scopes ?? []).includes(GLOBAL_SCOPE) ||
 			checkedText(row) !== seen.text ||
 			!sameJson(row.contentFlag, seen.flag) ||
@@ -138,13 +156,19 @@ async function runModelCheck(
 			return;
 		}
 		let changes;
-		if (outcome.answer === 'customer' && !row.contentFlag) {
-			const flag: ContentFlag = { kind: CONTENT_FLAG_KIND, since: new Date().toISOString(), source: 'model' };
-			changes = { ...contentFlagFields(flag), lastEventKind: 'flagged' };
-		} else if (outcome.answer === 'clean' && row.contentFlag) {
-			changes = { ...CLEARED_CONTENT_FLAG, lastEventKind: 'revised' };
+		if (result.answer === 'customer') {
+			// A flag the patterns set for earlier text is kept while the model re-checks; the model now owns it.
+			const flag: ContentFlag = {
+				kind: CONTENT_FLAG_KIND,
+				since: row.contentFlag?.since ?? new Date().toISOString(),
+				source: 'model',
+			};
+			if (sameJson(row.contentFlag, flag)) return;
+			changes = { ...contentFlagFields(flag), scopeConfirmed: null, lastEventKind: 'flagged' };
 		} else {
-			return;
+			// Clearing publishes, so it also wants the row exactly as the model saw it.
+			if (!row.contentFlag || row.revision !== seen.revision) return;
+			changes = { ...CLEARED_CONTENT_FLAG, lastEventKind: 'revised' };
 		}
 		await Memory.patch(id, { ...changes, revision: row.revision + 1 }, txn);
 		if (hasSinks()) await notifySinks('write', toMemoryView(await Memory.get(id, txn)), txn);

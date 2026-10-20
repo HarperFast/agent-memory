@@ -118,7 +118,7 @@ export async function findCandidates(
 }
 
 /** Only a complete one-word answer counts; anything else (truncated, filtered, a tool call, prose) abstains. */
-export function parseOneWord<T extends string>(result: any, words: readonly T[]): T | undefined {
+function parseOneWord<T extends string>(result: any, words: readonly T[]): T | undefined {
 	if (result?.finishReason !== 'stop' || result.toolCalls?.length) return undefined;
 	const answer = String(result.content ?? '')
 		.trim()
@@ -134,34 +134,45 @@ export function parseVerdict(result: any): Verdict | undefined {
 export type OneWordOutcome<T extends string> =
 	{ answer: T } | { failure: 'timeout' | 'unusable' | 'error'; error?: unknown };
 
-/** Never throws, and never waits past `timeoutMs`: a backend that ignores the abort must not hold its caller open. */
-export async function askOneWord<T extends string>(
+/**
+ * `outcome` never rejects and never waits past `timeoutMs`, so a backend that ignores the abort cannot hold its
+ * caller open; `settled` resolves when the provider call itself does, for a caller that bounds calls in flight.
+ */
+export function askOneWord<T extends string>(
 	input: { system: string; messages: Array<{ role: 'user'; content: string }> },
 	options: { model: string; maxTokens: number; timeoutMs: number },
 	words: readonly T[],
-): Promise<OneWordOutcome<T>> {
+): { outcome: Promise<OneWordOutcome<T>>; settled: Promise<void> } {
 	const controller = new AbortController();
-	let timer: ReturnType<typeof setTimeout> | undefined;
-	let call: Promise<unknown> | undefined;
+	let call: Promise<unknown>;
 	try {
-		call = models.generate(input, { model: options.model, maxTokens: options.maxTokens, signal: controller.signal });
-		const deadline = new Promise<'timeout'>((resolve) => {
-			timer = setTimeout(() => {
-				controller.abort();
-				resolve('timeout');
-			}, options.timeoutMs);
-		});
-		const result = await Promise.race([call, deadline]);
-		if (result === 'timeout') return { failure: 'timeout' };
-		const answer = parseOneWord(result, words);
-		return answer ? { answer } : { failure: 'unusable' };
+		call = Promise.resolve(
+			models.generate(input, { model: options.model, maxTokens: options.maxTokens, signal: controller.signal }),
+		);
 	} catch (error) {
-		return { failure: 'error', error };
-	} finally {
-		clearTimeout(timer);
-		call?.catch(() => {});
+		call = Promise.reject(error);
 	}
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const deadline = new Promise<'timeout'>((resolve) => {
+		timer = setTimeout(() => {
+			controller.abort();
+			resolve('timeout');
+		}, options.timeoutMs);
+	});
+	const outcome = Promise.race([call, deadline])
+		.then(
+			(result): OneWordOutcome<T> => {
+				if (result === 'timeout') return { failure: 'timeout' };
+				const answer = parseOneWord(result, words);
+				return answer ? { answer } : { failure: 'unusable' };
+			},
+			(error): OneWordOutcome<T> => ({ failure: 'error', error }),
+		)
+		.finally(() => clearTimeout(timer));
+	return { outcome, settled: call.then(noop, noop) };
 }
+
+function noop(): void {}
 
 function describe(tag: string, memory: { title: string | null; content: string }): string {
 	return `<${tag}>\nTitle: ${memory.title ?? ''}\n${String(memory.content).slice(0, JUDGE_CONTENT_CHARS)}\n</${tag}>`;
@@ -181,7 +192,7 @@ async function judgeOne(
 		},
 		{ model: judge, maxTokens: JUDGE_MAX_TOKENS, timeoutMs: JUDGE_TIMEOUT_MS },
 		VERDICTS,
-	);
+	).outcome;
 	if ('answer' in outcome) return outcome.answer;
 	if (outcome.failure === 'timeout') {
 		warnRateLimited('judge', `supersession judge "${judge}" timed out; candidate left unjudged`);

@@ -18,4 +18,6 @@ env:
       namesSecret: AGENT_MEMORY_TEST_CUSTOMER_NAMES
       hosts:
         - label: zorb-host
-          regex: '[a-z0-9-]+\.zorbcloud\.test'
+          host: '*.zorbcloud.test'
+        - label: zorb-lab
+          cidr: '10.77.0.0/16'

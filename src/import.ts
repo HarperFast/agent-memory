@@ -26,7 +26,7 @@ import {
 } from './lifecycle.ts';
 import { checkedText, matchCustomerContent } from './patterns.ts';
 import { activeDependentIds, CLEARED_REVIEW, flagDependents, reviewFlagFor } from './provenance.ts';
-import { contentFlagFields, decideContentFlag } from './quarantine.ts';
+import { type ContentFlag, contentFlagFields, decideContentFlag } from './quarantine.ts';
 import { isScopeLabel, MAX_SCOPES_PER_MEMORY, requirePrincipalId, type Principal } from './scopes.ts';
 import { getSettings } from './settings.ts';
 import { hasSinks, notifySinks } from './sinks.ts';
@@ -131,9 +131,21 @@ export async function importMemories(input: unknown, principal: Principal, reque
 	const settings = getSettings();
 	const Memory = memoryTable();
 	ensureEmbedder(Memory);
-	// Patterns only: a batch would otherwise start a model call per row.
+	// Patterns only (a batch would otherwise start a model call per row), and before the batch takes its locks.
 	const check = { ...settings.customerContentCheck, model: undefined };
-	const labelsFor = (text: string) => matchCustomerContent(text, check.matcher);
+	const flaggedAt = new Date();
+	const contentFlags = new Map<string, ContentFlag | null>();
+	for (const row of rows) {
+		const { flag } = decideContentFlag(
+			check,
+			undefined,
+			row.scopes,
+			() => checkedText(row),
+			(text) => matchCustomerContent(text, check.matcher),
+			flaggedAt,
+		);
+		contentFlags.set(row.id, flag);
+	}
 
 	const targetIds = new Set<string>(rows.flatMap((row: { supersedes: string[] }) => row.supersedes));
 	// A stored row this batch supersedes flags its citers, and citing serializes with that, as on PUT.
@@ -228,14 +240,6 @@ export async function importMemories(input: unknown, principal: Principal, reque
 						row.status === STATUS_WITHDRAWN
 							? { status: row.status, supersededBy: row.supersededBy }
 							: await graphState(row.id);
-					const { flag: contentFlag } = decideContentFlag(
-						check,
-						undefined,
-						row.scopes,
-						checkedText(row),
-						labelsFor,
-						now,
-					);
 					let reviewPatch = CLEARED_REVIEW as { needsReview: unknown; needsReviewSince: Date | null };
 					for (const source of transitions) {
 						const flag = reviewFlagFor({ ...row, ...state }, source, 'superseded', now);
@@ -254,7 +258,7 @@ export async function importMemories(input: unknown, principal: Principal, reque
 							autoSupersedes: [],
 							...reviewPatch,
 							confirmed: null,
-							...contentFlagFields(contentFlag),
+							...contentFlagFields(contentFlags.get(row.id)!),
 							scopeConfirmed: null,
 							author: { principalId: row.ownerId, source: 'import', authoredAt: row.createdAt.toISOString() },
 							lastEditor: null,

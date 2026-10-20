@@ -40,7 +40,8 @@ Requires Harper 5.3.1 or later on RocksDB (the default).
      #     namesFile: '/etc/agent-memory/customer-names.json'  # absolute path, never in a repo; or:
      #     namesSecret: 'AGENT_MEMORY_CUSTOMER_NAMES'          # a component secret: { "<org>": ["Name", "Alias"] }
      #     hosts:
-     #       - { label: 'cloud-host', regex: '[a-z0-9-]+\.example-cloud\.com' }
+     #       - { label: 'cloud-host', host: '*.example-cloud.com' }  # an exact host, or any subdomain with '*.'
+     #       - { label: 'lab-ip', cidr: '10.77.0.0/16' }             # an IPv4 or IPv6 address or range
    ```
 
    ```yaml
@@ -96,7 +97,7 @@ Requires Harper 5.3.1 or later on RocksDB (the default).
    # a memory whose cited evidence was superseded or withdrawn carries needsReview; the owner clears it
    curl -u carol:pass -X POST localhost:9926/Memory/<id>/confirm -H 'Content-Type: application/json' -d '{}'
 
-   # a global memory flagged for possible customer detail: a customer:* writer rescopes or confirms it
+   # a global memory flagged for possible customer detail: a reviewer holding customer:* read and write rescopes or confirms it
    curl -u dave:pass 'localhost:9926/Memory/?flagged=true'               # the review queue
    curl -u dave:pass -X PUT localhost:9926/Memory/<id> -H 'Content-Type: application/json' -H 'If-Match: "1"' \
      -d '{ "scopes": ["customer:acme"] }'

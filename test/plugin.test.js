@@ -83,15 +83,16 @@ describe('handleApplication', () => {
 
 describe('parseSettings', () => {
 	it('applies defaults and validates limits and mcp flag', () => {
-		assert.deepEqual(parseSettings({}), {
+		const { customerContentCheck, ...defaults } = parseSettings({});
+		assert.deepEqual(defaults, {
 			urlPath: 'Memory',
 			embeddingModel: 'default',
 			titleChars: 200,
 			contentChars: 20000,
 			supersession: { mode: 'suggest', similarity: 0.82 },
-			customerContentCheck: { mode: 'off', matcher: { names: new Map(), hosts: [] } },
 			mcp: false,
 		});
+		assert.equal(customerContentCheck.mode, 'off');
 		assert.equal(parseSettings({ mcp: true }).mcp, true);
 		assert.throws(() => parseSettings({ mcp: 'true' }), /mcp/);
 		assert.throws(() => parseSettings({ limits: { titleChars: 1001 } }));

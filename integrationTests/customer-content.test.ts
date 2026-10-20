@@ -225,10 +225,12 @@ suite('@harperfast/agent-memory customer-content check over HTTP', (ctx: Context
 			}),
 		);
 		ok(byHost.contentFlag);
+		const addressed = memId('addressed');
+		ok((await put('owner', addressed, shared('replication lag on 10.77.4.2 after compaction'))).contentFlag);
 
 		const missing = await call('fleet', 'GET', '0'.repeat(32));
 		strictEqual(missing.status, 404);
-		for (const id of [named, hosted]) {
+		for (const id of [named, hosted, addressed]) {
 			for (const reader of ['fleet', 'carol'])
 				deepStrictEqual(await call(reader, 'GET', id), missing, `${reader} ${id}`);
 			strictEqual((await call('owner', 'GET', id)).status, 200);
@@ -237,14 +239,15 @@ suite('@harperfast/agent-memory customer-content check over HTTP', (ctx: Context
 		strictEqual((await call('owner', 'GET', named)).body.memory.contentFlag.labels, undefined);
 		deepStrictEqual((await call('rhea', 'GET', named)).body.memory.contentFlag.labels, ['customer:zorblax']);
 		deepStrictEqual((await call('rhea', 'GET', hosted)).body.memory.contentFlag.labels, ['zorb-host']);
+		deepStrictEqual((await call('rhea', 'GET', addressed)).body.memory.contentFlag.labels, ['zorb-lab']);
 
 		for (const query of ['q=replication', 'q=Zorblax', '', 'flagged=true']) {
 			const ids = await search('fleet', query);
-			ok(!ids.includes(named) && !ids.includes(hosted), `${query}: ${ids}`);
+			ok(!ids.includes(named) && !ids.includes(hosted) && !ids.includes(addressed), `${query}: ${ids}`);
 		}
 		const reviewQueue = await search('dave', 'flagged=true');
 		ok(reviewQueue.includes(named) && reviewQueue.includes(hosted), String(reviewQueue));
-		deepStrictEqual((await search('owner', 'flagged=true')).sort(), [hosted, named].sort());
+		deepStrictEqual((await search('owner', 'flagged=true')).sort(), [addressed, hosted, named].sort());
 
 		const session = await mcpSession('fleet');
 		deepStrictEqual(
