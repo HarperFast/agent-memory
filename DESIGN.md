@@ -28,11 +28,13 @@ allowlists, idempotent `PUT` create/revise with `If-Match` revision precondition
 
 ## Implementation status
 
-| Area                                                                                                             | v0 core                                           |
-| ---------------------------------------------------------------------------------------------------------------- | ------------------------------------------------- |
-| Lifecycle, scopes and grants, supersede and restore, hybrid search, bootstrap, import, sinks, principal resolver | implemented (`src/`)                              |
-| Write-time supersession candidates and the judge (`supersession.*` options)                                      | not yet                                           |
-| Live updates (subscriptions, `MemoryWatch`, `/MemoryEvents`)                                                     | not yet; the `MemoryWatch` table is declared only |
+| Area                                                                                                             | v0 core                             |
+| ---------------------------------------------------------------------------------------------------------------- | ----------------------------------- |
+| Lifecycle, scopes and grants, supersede and restore, hybrid search, bootstrap, import, sinks, principal resolver | implemented (`src/`)                |
+| Write-time supersession candidates, the judge and auto mode (`supersession.*` options)                           | implemented (`src/supersession.ts`) |
+| Provenance review flags (`needsReview`, `confirm`)                                                               | implemented (`src/provenance.ts`)   |
+| Live updates (Level 1 subscriptions, Level 2 `MemoryWatch` and `/MemoryEvents`)                                  | implemented (`src/events.ts`)       |
+| MCP tools and `memory:///{id}` resource (`mcp` option)                                                           | implemented (`src/mcp.ts`)          |
 
 ## Data model
 
@@ -51,17 +53,28 @@ See `schema/memory.graphql`. The table is not `@export`ed: every read and write 
 `Memory` resource so the rules below have exactly one enforcement point.
 
 Server-owned fields: `ownerId`, `status`, `revision`, `author`, `lastEditor`, `supersededBy`,
-`evidenceMemoryIds`, `createdAt`, `embeddingModel`. `createdAt` is set by the lifecycle rather than
-`@createdTime`, because Harper's `@createdTime` overwrites a supplied value on insert and import must
-preserve it. `updatedAt` stays `@updatedTime`.
+`autoSupersedes`, `evidenceMemoryIds`, `needsReview`, `needsReviewSince`, `confirmed`, `createdAt`,
+`embeddingModel`, `lastEventKind`. `createdAt` is set by the lifecycle rather than `@createdTime`, because Harper's
+`@createdTime` overwrites a supplied value on insert and import must preserve it. `updatedAt` stays
+`@updatedTime`. `needsReviewSince` mirrors `needsReview.since` because Harper does not index object
+values; `lastEventKind` records the lifecycle event kind (`created`, `revised`, `superseded`, `withdrawn`,
+`restored`, `flagged`) on each write so real-time subscribers receive the exact transition. Neither
+`needsReviewSince` nor `lastEventKind` is ever in a view. Rows written before a field existed read it as
+absent, which every reader treats as null.
 
 ## Identity
 
 The principal is the Harper user on the request context (`context.user.username`). The plugin does no
 authentication of its own and has no credential tables.
 
-- Interactive MCP clients (Claude Code, desktop, claude.ai connectors) authenticate with OAuth 2.1
-  through `@harperfast/oauth` `mcp` mode, which resolves to a Harper user.
+- Interactive MCP clients (Claude Code, desktop, claude.ai connectors): intended to authenticate with
+  OAuth 2.1 through `@harperfast/oauth` `mcp` mode (`withMCPAuth`), which does not yet populate a Harper
+  user object on `context.user` for Harper core's `/mcp` endpoint (`withMCPAuth` only attaches its
+  middleware to `server.http` so `request.user` stays `undefined` on `/mcp`, and `@harperfast/oauth`'s
+  session-cookie hook sets `request.user` to a username string rather than `{ username, role }`, so
+  `resolvePrincipal` rejects with `401 principal_required`; see
+  [HarperFast/oauth#279](https://github.com/HarperFast/oauth/issues/279)). Until that lands, MCP clients
+  against `/mcp` authenticate with Harper credentials or a host-app middleware / principal resolver.
 - Headless agents use Harper credentials bound to a user (operation tokens, or a host-app API key that
   resolves to a user).
 - An app with its own principal registry (harper-eye's `AgentPrincipal`) can install a resolver with
@@ -109,7 +122,9 @@ Rules:
    readable by its owner and `super_user` only. A memory the caller cannot read is indistinguishable
    from one that does not exist (same 404 body on `GET`, `DELETE`, `pin` and `supersedes` references,
    and `{ pinned: false, memoryId }` with no `memory` field on `unpin`);
-   on `PUT /Memory/<id>`, an existing unreadable id returns `409 id_unavailable` (see Identity).
+   on `PUT /Memory/<id>`, an existing unreadable id returns `409 id_unavailable` (see Identity). One
+   deliberate exception: a review flag tells a former label reader of a withdrawn source that it was
+   withdrawn (see Provenance).
 2. **Write scopes**: creating or revising with scopes `S` requires every label of `S` to be writable by
    the caller — the resulting scopes, so revising a memory that stays `global` needs `global` write.
    `visibility: "private" | "shared"` is shorthand for `[user:<owner>]` / `[global]`; explicit
@@ -117,8 +132,9 @@ Rules:
 3. **Edit**: only the owner (or `super_user`) revises or withdraws. Read access never grants edit; a
    reader that is not the owner gets 403 (`not_memory_owner`), and a non-reader gets 404 on `DELETE`
    or 409 `id_unavailable` on `PUT`.
-4. **Supersede**: see below. It is the only write that touches another principal's memory, and it
-   only changes status fields (`status`, `supersededBy`, `revision`).
+4. **Supersede and review flags**: see below. They are the only writes that touch another principal's
+   memory: a supersede changes only status fields (`status`, `supersededBy`, `revision`), a flag only
+   `needsReview`, `needsReviewSince` and `revision`.
 5. **Search pushes the readable set into the query**, applied before the limit in every lane, never
    as a post-filter on a top-k. The set compiles to one condition (`src/scopes.ts`
    `readableCondition`): an `or` of `ownerId = self`, `scopes = <label>` per exact grant, and
@@ -129,11 +145,12 @@ Rules:
 
 | Operation           | Effect                                                                                                                                                                                                                                                                                                                                  |
 | ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| create (`PUT`)      | client chooses `id` (`^[A-Za-z0-9_-]{16,64}$`); absent id creates at `revision: 1` and returns `201 { id, revision }`; `If-None-Match: *` makes `PUT` create-only (`412` if the id exists); an identical retry returns `200 { id, revision }`                                                                                           |
-| revise (`PUT`)      | `PUT /Memory/<id>` on an owned memory whose editable fields (`title`, `content`, `tags`, `scopes`, `evidence`, `validUntil`) differ from the stored ones requires `If-Match: "<revision>"` (or `*`; missing → 428, stale → 412), bumps `revision`, and returns `200 { id, revision }`                                                   |
+| create (`PUT`)      | client chooses `id` (`^[A-Za-z0-9_-]{16,64}$`); absent id creates at `revision: 1` and returns `201 { id, revision, candidates }`; `If-None-Match: *` makes `PUT` create-only (`412` if the id exists); an identical retry returns `200 { id, revision, candidates }`                                                                   |
+| revise (`PUT`)      | `PUT /Memory/<id>` on an owned memory whose editable fields (`title`, `content`, `tags`, `scopes`, `evidence`, `validUntil`) differ from the stored ones requires `If-Match: "<revision>"` (or `*`; missing → 428, stale → 412), bumps `revision`, clears `needsReview`, and returns `200 { id, revision, candidates }`                 |
 | supersede           | create a memory via `PUT /Memory/<id>` with `supersedes: [ids]` (`supersedes` on a revise is 400 `supersedes_not_allowed`)                                                                                                                                                                                                              |
 | withdraw (`DELETE`) | `DELETE /Memory/<id>?reason=` requires `If-Match: "<revision>"` (or `*`; missing → 428, stale → 412); sets `status = withdrawn`, keeps the row as a tombstone, never deletes it                                                                                                                                                         |
 | pin / unpin         | records or deletes the caller's `MemoryPin` row (`<principalId>:<memoryId>`, up to 50 pins per principal; withdrawn pins are pruned on pin, 409 `pin_limit_exceeded` past 50); `pin` requires read access (same 404 when missing or unreadable), while `unpin` always deletes the caller's pin and includes `memory` only when readable |
+| confirm             | `POST /Memory/<id>/confirm` (owner or `super_user`; 403 for another reader, the missing-id 404 for a non-reader) clears `needsReview`, records `confirmed: { by, at }` and bumps `revision`; `If-Match` is honoured when sent (412) but not required; 409 on a superseded or withdrawn memory                                           |
 
 `status` is `active | superseded | withdrawn`. Search returns `active` by default. Owners share one id
 namespace: `PUT /Memory/<id>` to an existing id owned by another principal returns `403
@@ -148,8 +165,23 @@ cannot probe existence), and their ids are stored deduplicated on `evidenceMemor
 
 Every lifecycle operation runs in a transaction of its own (not the request's, which would commit
 whatever was staged before an error the resource turns into a response) and takes Harper's record
-lock (`Memory.lock`) on every row it will change, in sorted id order, before reading it. A withdrawal
-plans its lock set from a pre-transaction read of the memory's `supersedes` (which never changes after create) and retries once if `supersedes` was populated between that read and lock acquisition. The plugin is the
+lock (`Memory.lock`) on every row it will change, in sorted id order, before reading it
+(`withLockPlan`, `src/lifecycle.ts`). An operation plans its whole lock set before the transaction:
+a `PUT` locks its id, its `supersedes`, the memories it newly cites, and the active citers of what it
+supersedes; a withdrawal locks its id, its `supersedes` (which never changes after create) and its
+active citers. Under the locks, before its first write, the operation re-reads every row it will
+change; one the plan missed (a citer that appeared, a `supersedes` populated after the pre-read)
+aborts the attempt, and the next attempt locks the union in one sorted pass, so no operation waits
+for a lock while holding one out of order; after three attempts it answers 503 `unavailable`. The
+planning reads run only for a request that would pass the cheap checks (owner, a matching `If-Match`,
+explicit targets and cited memories readable), so a refused request never locks a citation graph or a
+memory it cites. An operation that supersedes or withdraws takes a 5-minute lease instead of Harper's
+30 s default, since it flags every citer inside the transaction. No model call runs under a lock: a
+`PUT` that writes content embeds it before the transaction and carries the vector in the write, and
+the table's embedder (`setEmbedAttribute`, installed for every model) uses a carried vector, embedding
+only a write that carries none. A `PUT` whose transaction finds it must write content it has
+no vector for (another writer changed the row after the pre-read) releases its locks, embeds, and
+retries. An embedding failure fails the write before it takes any lock. The plugin is the
 only writer of `Memory`, so on one node a read-check-write is serialized: of N concurrent revisions at
 the same `If-Match` revision exactly one succeeds. The locks are node-scoped, because a cluster-scoped
 lock on a replicated database fails closed unless the cluster has opted into replicated record locks
@@ -183,26 +215,89 @@ first-class operation, and the write path proposes it.
   memory it superseded under that rule, returning it to `active` when no superseder is left; import
   derives status by the same rule. The lookup reads non-withdrawn superseders newest first through
   the indexed `supersedes` and `createdAt`, so it is exact however many there are.
-- **Write-time candidates** (not yet implemented): after a create or revise, the plugin runs a vector
-  search for the nearest memories readable by the writer that share at least one scope label, and
-  returns those above `supersession.similarity` (default 0.82) as `candidates: [{ id, title,
-similarity }]` on the response. With `supersession.judge` configured, `models.generate` classifies
-  each candidate as `supersedes | refines | unrelated`; `supersession.mode: auto` applies a
-  `supersedes` verdict through the explicit path (same rules). The default mode is `suggest`.
+- **Write-time candidates**: every successful `PUT` (create, revise, identical retry) returns
+  `candidates: [{ id, title, similarity, verdict?, applied? }]`: up to 5 of the nearest active,
+  unexpired memories the writer can read that share at least one scope label with the written memory,
+  other than itself and what it supersedes, with cosine similarity at least `supersession.similarity`
+  (default 0.82). The search runs after the write commits, with the row's own vector and only among
+  rows of the row's `embeddingModel`, and does not wait for index coverage: candidates are advice, so a
+  memory committed within the index lag can be missed, and a failed search yields `[]` rather than
+  failing a committed write. It never holds a record lock. `supersession.mode: off` searches nothing and
+  returns `[]`. Measured on Harper 5.3.2 (one node, local, CPU capped at 2 GHz, 300 memories, judge
+  stubbed): a create took 7.7 ms p50 / 10.2 ms p95 in `suggest` against 2.7 / 3.4 ms with `off`, and an
+  identical retry 6.1 / 7.6 ms against 1.9 / 2.4 ms. A real judge adds its model's latency, per candidate
+  and in parallel.
+- **Judge**: with `supersession.judge` (a `models.generate` model name), each candidate is classified
+  `supersedes | refines | unrelated`. Only a complete one-word answer counts (at most 16 output tokens,
+  20 s per candidate); anything else, or a failed call, leaves the candidate without a `verdict`. The
+  judge runs outside every transaction, and only for a `PUT` that wrote a new title or content (a
+  retry or a tags-only revise gets its candidates unjudged).
+- **Auto** (`supersession.mode: auto`, requires `judge`; default `suggest`): on a create, the plugin
+  searches with the write's vector and judges before the transaction, because `supersedes` cannot
+  change after create. Each `supersedes` verdict joins the create's `supersedes` under the explicit rules and
+  only if the candidate's `revision` is still the one the judge compared; `applied: true | false` says
+  whether it did. Applied links are also listed in `autoSupersedes`, so an identical retry compares only
+  the links the author sent, and readers can tell the judge's links from the author's. Auto adds at most
+  5 links beyond the 10 a request may name. On a revise, verdicts are advice only. The judge can only
+  cause a supersede the writer could have requested explicitly, so a prompt injected through memory
+  content gains no access.
+
+### Provenance
+
+When a memory X becomes superseded (`active → superseded`) or withdrawn, every active memory D whose
+`evidenceMemoryIds` contains X gets, in the same transaction, `needsReview: { since, cause:
+superseded | withdrawn, sourceId: X, replacementId? }` (`replacementId` is X's `supersededBy` at that
+moment), a `revision` bump and a sink `write` (`flagDependents`, `src/provenance.ts`). A flag is
+advice for a human or agent to re-check D, never an automatic invalidation: a conclusion often survives
+one of its supports changing.
+
+- **One hop**: flagging D never flags the memories citing D, and neither does revising or confirming D
+  or X; only another supersede or withdrawal flags.
+- **Only transitions flag**: superseding an already superseded memory, re-pointing `supersededBy`, and
+  restoring a memory to `active` flag nothing, and a restore does not clear flags it left behind. A
+  memory that a withdrawal restores, and that cites the withdrawn memory, is flagged like any citer.
+- **First cause stands**: a memory already flagged keeps its first flag, unrewritten, until its owner
+  revises it or calls `confirm`. A review should therefore re-check all of its memory evidence.
+- **`confirmed` is an event, not a state**: it records the latest confirmation `{ by, at }` and survives
+  later revisions; compare it with `lastEditor.revisedAt` to see which came last.
+- **Not its replacement**: a memory that lists X in `supersedes` (on create, or in the same import) is
+  never flagged for X.
+- **Citing serializes with the transition**: a create or revise locks the memories it newly cites, so a
+  citer either commits first and is flagged, or reads X's new status. A citation the row already has is
+  in the index, where the transition finds the citer and locks it. The lock is held for milliseconds, since
+  the citer's embedding happens before its transaction. Across nodes the same caveat as every other
+  lock-based rule applies.
+- **Who sees a flag**: `needsReview` is shown to a reader who can read X through its labels or owns it,
+  ignoring withdrawal (that reader could read X before, so learning it was withdrawn reveals no
+  existence it did not know); everyone else sees `null`. `replacementId` is shown only to a reader who
+  can read the replacement now. Sinks receive the unredacted row.
+- **Fan-out**: one transaction flags every citer, with one sink call each, under the 5-minute lease.
+  Keep sinks to a write in the `memory` database (an outbox) so a heavily cited memory can still be
+  withdrawn.
+- **Prospective only**: flags start with the transition; memories that were already stale when this
+  shipped are not backfilled.
 
 ## HTTP surface
 
-Mounted at `urlPath` (default `Memory`); hidden from MCP and OpenAPI auto-export until the MCP task.
+Mounted at `urlPath` (default `Memory`, with the per-caller watch stream at `<urlPath>Events`, default
+`MemoryEvents`); every HTTP route class stays `hidden = true`, while `MemoryMcpResource` (registered at
+`MemoryMcp` with `static path = '/MemoryMcp'`, no prototype CRUD methods, and `MemoryEndpoint`'s static
+verb and `connect` overrides so direct HTTP, SSE, or WebSocket requests to `/MemoryMcp` return `405`) is
+mounted with `hidden = false` only when the plugin option `mcp` is `true` (default `false`).
 
-| Route                                                                   | Purpose                                                                                                    |
-| ----------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
-| `PUT /Memory/<id>`                                                      | create (`201 { id, revision }`), idempotent retry (`200`), or revise with `If-Match: "<revision>"` (`200`) |
-| `GET /Memory/<id>`                                                      | read (`{ memory }` + `ETag: "<revision>"`)                                                                 |
-| `DELETE /Memory/<id>?reason=`                                           | withdraw with `If-Match: "<revision>"` (tombstone, returns `{ memory }`)                                   |
-| `GET /Memory/?q=&tag=&scope=&limit=&includeSuperseded=&includeExpired=` | search (no `q`: newest first)                                                                              |
-| `GET /Memory/bootstrap?q=&budget=`                                      | session-start context                                                                                      |
-| `POST /Memory/<id>/pin` · `/unpin`                                      | per-reader pin / unpin (empty or `{}` body)                                                                |
-| `POST /Memory/import`                                                   | bulk import (`super_user`)                                                                                 |
+| Route                                                                          | Purpose                                                                                                  |
+| ------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------- |
+| `PUT /Memory/<id>`                                                             | create (`201 { id, revision, candidates }`), idempotent retry (`200`), or revise with `If-Match` (`200`) |
+| `GET /Memory/<id>`                                                             | read (`{ memory }` + `ETag: "<revision>"`)                                                               |
+| `DELETE /Memory/<id>?reason=`                                                  | withdraw with `If-Match: "<revision>"` (tombstone, returns `{ memory }`)                                 |
+| `GET /Memory/?q=&tag=&scope=&limit=&includeSuperseded=&includeExpired=&watch=` | search (no `q`: newest first; `watch=true` watches every returned id)                                    |
+| `GET /Memory/bootstrap?q=&budget=&watch=`                                      | session-start context (`watch=true` watches every returned id)                                           |
+| `POST /Memory/<id>/pin` · `/unpin`                                             | per-reader pin / unpin (empty or `{}` body)                                                              |
+| `POST /Memory/<id>/confirm`                                                    | owner's review: clears `needsReview`, records `confirmed` (returns `{ memory }`)                         |
+| `POST /Memory/watch`                                                           | watch readable memories (`{ ids, ttlSeconds? }` → `{ watched, expiresAt }`)                              |
+| `GET /Memory` · `/Memory/<id>` (SSE / WebSocket)                               | Level 1 record-change subscription (`{ id, kind, revision }`)                                            |
+| `GET /MemoryEvents` (SSE / WebSocket)                                          | Level 2 per-caller watch and `needsReview` event stream (`{ id, kind, revision }`)                       |
+| `POST /Memory/import`                                                          | bulk import (`super_user`)                                                                               |
 
 Errors are `{ error, code }` (plus `index` for an import row). Only errors the plugin creates carry
 their own message; anything else is a 500 `internal_error`. Harper's retryable failures — 503 (an index
@@ -210,18 +305,20 @@ rebuilding or lagging, a database closing), 423 (a record lock not granted withi
 a lock lease that lapsed before commit, and transient embedding backend failures (429, 5xx, timeout,
 connection failure) on writes — become a 503 `unavailable` to retry, with a rate-limited warning
 in the log. Any other 409 from Harper (for example a sink inserting a row that exists) is a 500. Import
-holds its locks with a 5-minute lease, since a batch embeds every row inside its transaction.
+embeds the rows it will create before its transaction, in requests of at most 100,000 characters, and holds its locks with a 5-minute
+lease, since a batch writes up to 100 rows and flags their citers inside one transaction.
 
 ## Search and bootstrap
 
-- `GET /Memory/?q=&tag=&scope=&limit=&includeSuperseded=&includeExpired=` — hybrid: HNSW over
+- `GET /Memory/?q=&tag=&scope=&limit=&includeSuperseded=&includeExpired=&watch=` — hybrid: HNSW over
   `embedding` (query embedded with the same model) and the `@fullText` index, fused with reciprocal
   rank fusion (k = 60, `2 × limit` per lane). If embedding the query string fails, search and bootstrap
   fall back to the full-text lane and log a rate-limited warning. Both lanes carry the status, expiry (`validUntil` null
   or `> now` unless `includeExpired=true`) and readable-scope conditions. `scope=` narrows within the
-  readable set; it never widens it. Results include `supersededBy` when `includeSuperseded` is set;
-  withdrawn memories never appear. The vector lane has no distance cutoff, so it contributes the
-  nearest readable memories whatever their distance.
+  readable set; it never widens it. Results include `supersededBy` when `includeSuperseded` is set,
+  and `needsReview` under the Provenance visibility rule; withdrawn memories never appear. The vector lane has no distance cutoff, so it contributes the
+  nearest readable memories whatever their distance. Passing `watch=true` records a `MemoryWatch` (with
+  the default 1 h TTL) for every memory id returned in the result.
 - **Searchable at commit**: both indexes are Harper derived indexes maintained after commit (`audit:
 true` puts `@embed`'s HNSW index on the native plane). Each lane passes `waitForIndexMilliseconds`,
   so a search covers every write committed before it began; an index that is already current does not
@@ -237,35 +334,103 @@ true` puts `@embed`'s HNSW index on the native plane). Each lane passes `waitFor
   skips (and logs) vectors of another size, and rejects a query vector of another size. Search then
   serves the full-text lane alone and logs the rejection once per mismatch episode for that model. Switching dimensions needs a
   re-embedding migration, which v0 does not provide.
-- `GET /Memory/bootstrap?q=&budget=` — the caller's pinned memories (up to 50 `MemoryPin` rows for
-  `principal.id`, newest pin first, whose target memory is active, unexpired and readable by the caller), then the caller's recent
+- `GET /Memory/bootstrap?q=&budget=&watch=` — the caller's pinned memories (up to 50 `MemoryPin` rows for
+  `principal.id`, newest pin first, whose target memory is active, unexpired and readable by the caller), then the caller's own
+  memories that need review (section `needsReview`: up to 20 the caller may see, newest flag first,
+  through the indexed `needsReviewSince`, from at most the 100 newest flags, so hidden flags cannot make a
+  bootstrap scan without bound), then the caller's recent
   memories, then memories relevant to `q`, deduplicated and packed into a character budget (title +
-  content; default 8000). Expired memories (`validUntil <= now`) are excluded from all three sections.
-  A memory that does not fit is skipped rather than ending the pack. Used at session start.
+  content; default 8000). Expired memories (`validUntil <= now`) are excluded from every section.
+  A memory that does not fit is skipped rather than ending the pack. Passing `watch=true` records a
+  `MemoryWatch` (default 1 h TTL) for every memory id returned across all sections. Used at session start.
 - Ranking may add recency decay and retrieval/citation counts later; decay is a ranking function only,
   never deletion.
 
 ## Live updates
 
-Three levels, built in order (none in the v0 core):
+Three levels, built in order:
 
-1. **Record changes**: the `Memory` resource supports Harper subscriptions (WebSocket, SSE, MQTT).
-   Each event is checked against the subscriber's read rule before delivery. Event kinds: `created`,
-   `revised`, `superseded`, `withdrawn`, `restored`.
-2. **Watches**: `POST /Memory/watch { ids, ttlSeconds }` (and `watch=true` on search, which watches
-   every returned id) records a `MemoryWatch`. A change to a watched memory is delivered on the
-   principal's event stream, `/MemoryEvents/<principal>`, and as an MCP
-   `notifications/resources/updated` for `memory://<id>`. Watches expire with their task.
-   The notification fires when "a memory you relied on changed", not on every write.
+1. **Record changes**: `Memory` (`/Memory` and `/Memory/<id>`) supports Harper real-time subscriptions
+   over WebSocket and SSE (`Accept: text/event-stream`). Every event is checked against the subscriber's
+   read rule (`canRead`) at delivery time: `ScopeGrant` rows and custom principal resolver results are
+   cached for up to 5 s and invalidated via the worker hub's `ScopeGrant` subscription, so a scope
+   narrowing or grant revocation revokes visibility mid-subscription; Harper user role assignments on
+   `context.user` are captured when the connection opens and take effect on reconnect. For `withdrawn`,
+   read access checks the memory's scope labels ignoring `status = withdrawn` (matching Provenance), so
+   label readers and watchers learn that a shared memory they could read was withdrawn (`GET /Memory/<id>`
+   still returns 404 to non-owners). Events carry `{ id, kind, revision }` — never content — with `kind`
+   one of `created`, `revised`, `superseded`, `withdrawn`, `restored`, or `flagged` (`needsReview` set),
+   so a reader re-reads through the guarded `GET`. Subscriptions are live-only (`omitCurrent: true`) with
+   at-most-once delivery and no replay across disconnects; if Harper core re-emits existing rows on a
+   table reload (`copyApply`, `harper-pro#495`) beyond the per-connection 1,024-entry deduplication
+   window, rows may replay their stored `lastEventKind`, which clients handle idempotently by comparing
+   `revision`. If a slow subscriber accumulates more than 256 undrained events in its client buffer (or
+   its filter stalls for 30 s with 256 pending events), or if the worker's `Memory`, `MemoryWatch`, or
+   `ScopeGrant` subscription ends, active streams close so the client reconnects and re-reads watched ids
+   (comparing `revision`) or re-bootstraps (`watch=true`) to catch up.
+2. **Watches**: `POST /Memory/watch { ids, ttlSeconds? }` (1–100 ids; `ttlSeconds` integer in
+   `1..86400`, default 3600) and `watch=true` on search and bootstrap record `MemoryWatch` rows
+   (`<principalId>:<memoryId>`, `expiresAt @expiresAt`), keeping whichever `expiresAt` is later when a
+   watch already exists and returning the earliest effective `expiresAt` across the watched ids. Each
+   worker indexes active watches per principal in memory (lazily pruning expired entries on lookup and
+   sweeping expired entries whenever a principal's bucket reaches 4,096 watches). `POST /Memory/watch`
+   requires read access on every requested id and rejects unreadable ids with the same 404
+   (`memory_not_found`) as missing ones before writing any watch. A per-caller event stream at
+   `/MemoryEvents` (`<urlPath>Events` when `urlPath` is customized; identity comes from `context`, with no
+   principal in the path — `/MemoryEvents/<principal>` returns 404) delivers `{ id, kind, revision }` over
+   SSE or WebSocket whenever:
+   - a memory with an unexpired `MemoryWatch` for the caller changes and passes the caller's delivery-time
+     read check, or
+   - one of the caller's own memories (`ownerId === principal.id`) is flagged `needsReview`
+     (`kind: 'flagged'`, or `restored` / `created` with a newly folded `needsReview` flag visible to the
+     caller). The notification fires when "a memory you relied on changed, or your own memory needs
+     review", not on every write.
+   - **MCP resource subscriptions (`resources/subscribe`)**: Harper core's `resources/subscribe` handler
+     (`subscribeToResource` in `components/mcp/resources.ts`) only accepts `harper+rest://` and `http(s)://`
+     URIs and rejects custom `mcpResources` URI schemes such as `memory:///{id}` with
+     `-32602 resource is not subscribable: memory:///{id}`. Per design we do not patch Harper core: the
+     needed core hook is filed at [HarperFast/harper#3250](https://github.com/HarperFast/harper/issues/3250),
+     and MCP clients should subscribe to `/MemoryEvents` (calling the `watch` tool or `recall` with
+     `watch: true`) instead.
 3. **Standing queries**: notify when a new memory would now rank in a result a session already used.
    Depends on core post-commit derived-index delivery (harper#2489). Not in v0.
+
+## MCP surface
+
+Behind the plugin option `mcp` (`boolean`, default `false`), `handleApplication` mounts `MemoryMcpResource`
+(`static path = '/MemoryMcp'`, `static hidden = false`, extending `MemoryEndpoint` with no prototype CRUD
+methods) to expose MCP tools and a resource template on Harper's native `/mcp` endpoint (`src/mcp.ts`),
+each delegating to the same lifecycle, search, and watch functions and enforcing the same permission checks
+as REST:
+
+- **`static mcpTools`**:
+  - `remember` — create a memory (`PUT`; generates a UUID when `id` is omitted, or idempotently retries an
+    identical create).
+  - `revise` — revise an existing memory (`PUT` with required `revision` mapped to `If-Match: "<revision>"`).
+  - `recall` — hybrid search (`q`, `tags`/`tag`, `scopes`/`scope`, `limit`, `includeSuperseded`,
+    `includeExpired`, and optional `watch: true` to watch every returned id).
+  - `get` — fetch a single memory by `id` (`{ memory }`, or 404 if missing/unreadable).
+  - `withdraw` — withdraw an owned memory (`DELETE` with required `revision` and optional `reason`).
+  - `pin` / `unpin` — pin or unpin a memory for session bootstrap.
+  - `confirm` — clear `needsReview` on an owned memory and record `confirmed` (optional `revision` mapped
+    to `If-Match`).
+  - `watch` — watch `1..100` readable memory ids (`{ ids, ttlSeconds? }` → `{ watched, expiresAt }`).
+- **`static mcpResources`**: `uriTemplate: 'memory:///{id}'` (`mimeType: 'application/json'`,
+  `method: 'mcpReadMemory'`), whose read calls `getMemory` and returns the guarded memory view (or
+  `undefined` when missing/unreadable, which Harper's MCP layer surfaces as a JSON-RPC read error).
+- Tool and resource handlers are bound on `MemoryMcpResource.prototype` under `mcp*` method names
+  (`mcpRemember`, `mcpRevise`, `mcpRecall`, `mcpGet`, `mcpWithdraw`, `mcpPin`, `mcpUnpin`, `mcpConfirm`,
+  `mcpWatch`, `mcpReadMemory`), while every HTTP route class stays `hidden = true`, so neither Harper's
+  MCP discovery nor OpenAPI export auto-generates generic REST verb tools or unguarded `harper+rest://`
+  templates alongside the explicit surface.
 
 ## Extension points
 
 - `registerMemorySink({ write(memory, context), withdraw(memory, context) })` returns an unregister
   function. Sinks are awaited in order inside the lifecycle transaction for every row an operation
-  changes (create, revise, the supersede and restore side effects → `write`; withdraw →
-  `withdraw`; import calls `withdraw` for a row imported as withdrawn). A write the sink makes through
+  changes (create, revise, confirm, the supersede, restore and review-flag side effects → `write`;
+  withdraw → `withdraw`; import calls `withdraw` for a row imported as withdrawn), and only after every
+  lock the operation needs is held, so an attempt the lock plan restarts never reaches a sink. A write the sink makes through
   `context` to a table in the `memory` database commits or rolls back with the memory, and a sink that
   throws aborts the operation. Harper commits each database separately, so a write to another database
   can be lost if the process dies between the two commits, and a create retry would not repair it.
@@ -274,14 +439,13 @@ Three levels, built in order (none in the v0 core):
   `PUT` retry calls no sink. harper-eye uses it for the interim Reflex source-row handoff until memory is a
   Reflex lane.
 - `setPrincipalResolver(fn)` — see Identity.
-- Options (`config.yaml` under the plugin's key): `urlPath`, `embeddingModel` (default `default`),
-  `limits.{contentChars, titleChars}` (default 20000 / 200), and, once implemented,
-  `supersession.{mode, similarity, judge}`. The schema's `@embed` names `default`; for any other
-  `embeddingModel` the plugin installs a per-table embedder (`setEmbedAttribute`) that embeds with the
-  model recorded on the row. A changed option is checked for well-formedness before it applies; a
-  malformed change is logged and the previous configuration keeps serving (model compatibility is not
-  checked — see "One vector space"). Changing `urlPath` mounts the new path and
-  removes the old one if the plugin still owns it.
+- Options (`config.yaml` under the plugin's key): `urlPath`, `mcp` (default `false`), `embeddingModel`
+  (default `default`), `limits.{contentChars, titleChars}` (default 20000 / 200), and
+  `supersession.{mode, similarity, judge}` (`off | suggest | auto`, default `suggest`; 0.82; none; `auto`
+  without `judge` is rejected as malformed). The plugin's table embedder embeds with the model recorded on
+  the row. A changed option is checked for well-formedness before it applies; a malformed change is logged
+  and the previous configuration keeps serving (model compatibility is not checked — see "One vector
+  space"). Changing `urlPath` mounts the new path and removes the old one if the plugin still owns it.
 
 ## Import
 
@@ -297,6 +461,9 @@ status, supersedes?, supersededBy?, createdAt?, validUntil?, withdrawnAt?, withd
   as it stands (stored rows plus this batch), and a stored row that a new row supersedes is marked
   superseded. So whatever the batch order, and however a run is interrupted or replayed, no memory is
   hidden behind a missing or withdrawn replacement. The client still sends successors first.
+- A stored row the batch turns superseded flags its active citers, stored or created in the same batch,
+  except the rows that supersede it (Provenance). Rows created superseded or withdrawn are history, not
+  transitions, and flag nothing.
 - A re-run is idempotent by the same identical-fields rule as `PUT`: an existing id with matching
   `ownerId`, editable fields (`title`, `content`, `tags`, `scopes`, `evidence`, `validUntil`), and
   `supersedes` (plus `withdrawnReason` when the import row is `withdrawn`) is `unchanged`; a row whose
@@ -330,6 +497,107 @@ sends identical rows.
 - **Not imported**: `ephemeral` rows (the only Flair tier with `expiresAt`; the target has no expiry),
   rows outside the target's content or tag limits (`skipped.invalid`), `durability`, embeddings (the
   target re-embeds through `@embed`), and Flair bookkeeping fields.
+
+## Claude Code plugin
+
+`claude-plugin/` (published at the repository root via `.claude-plugin/marketplace.json`) integrates
+`agent-memory` into Claude Code without adding harness-specific routes to the Harper server:
+
+- **Remote HTTP MCP (`claude-plugin/.mcp.json`, `claude-plugin/bin/headers.mjs`)**: `.mcp.json` declares
+  Harper's native Streamable HTTP endpoint directly (`"type": "http"`, `"url": "${AGENT_MEMORY_URL}/mcp"`,
+  `"headersHelper": "node \"${CLAUDE_PLUGIN_ROOT}/bin/headers.mjs\""`) rather than wrapping REST calls in a
+  local `stdio` proxy.
+  - _Trade-off_: pointing directly at `/mcp` keeps a single tool schema source of truth on the server
+    (`remember`, `revise`, `recall`, `get`, `withdraw`, `pin`, `unpin`, `confirm`, `watch`) and authenticates
+    each request with the caller's Harper-user-bound credential (`Bearer` or `Basic`) read by `headersHelper`
+    from `process.env` or `~/.config/agent-memory/env`, so `AGENT_MEMORY_TOKEN` is never exported to
+    `CLAUDE_ENV_FILE` where model `Bash` commands could read it. In exchange, the host Harper app must enable
+    `mcp: true`, and `AGENT_MEMORY_URL` must be present in the process environment (or Claude Code's
+    `settings.json` `env` block) at startup because Claude Code expands `${AGENT_MEMORY_URL}` in `.mcp.json`
+    before `SessionStart` hooks run. When `AGENT_MEMORY_URL` is found only in `~/.config/agent-memory/env`,
+    `SessionStart` injects a configuration notice reminding the user to export it in their shell or settings.
+- **Bootstrap hook (`SessionStart`: `startup`, `resume`, `compact`)**: calls
+  `GET /Memory/bootstrap?budget=<chars>&watch=true` (default budget `4000` characters via
+  `AGENT_MEMORY_BOOTSTRAP_BUDGET`, timeout `3000` ms via `AGENT_MEMORY_BOOTSTRAP_TIMEOUT_MS`), formats
+  returned memories within the character budget (counting wrapper overhead and skipping oversized records to
+  continue checking smaller ones), records `injectedIds`, `watchedIds`, and per-id `{ revision, status,
+needsReview, author, ownerId, scopes }` for all watched and injected memories in atomic per-session state
+  (`state.json` written via temp-file + `rename`), and updates the local read-through cache
+  (`bootstrap-cache.json`). `startup` and `compact` reset `injectedIds` so bootstrap context is
+  re-established; `resume` preserves `injectedIds`.
+- **Recall hook (`UserPromptSubmit`)**: truncates the submitted prompt to `QUERY_MAX_CHARS` (`1000`
+  characters) and calls `GET /Memory/?q=<prompt>&limit=<k>&watch=true` (`k` defaults to `5` via
+  `AGENT_MEMORY_RECALL_LIMIT`, bounding per-prompt `MemoryWatch` upserts to `<= k` active hits; local RocksDB
+  `eval-recall.mjs` benchmark with `watch=true`: `p50 ~ 4-8 ms`, `p95 ~ 10-18 ms`) under a single shared
+  `AbortSignal` deadline (default `1500` ms via `AGENT_MEMORY_RECALL_TIMEOUT_MS`, clamped to `<= 2000` ms and
+  backed by a `3` s command timeout in `hooks.json`). Only active (`status === 'active'`) memories not yet in
+  `state.injectedIds` are injected as recalled records within `AGENT_MEMORY_RECALL_BUDGET` (default `2000`
+  characters). On timeout, network error, or server error, or when `state.json` is corrupt, the hook skips
+  recall and always exits `0` (`hook.mjs` installs top-level `uncaughtException`, `unhandledRejection`, and
+  `EPIPE` guards and calls `process.exit(0)` after flushing stdout). Setting `AGENT_MEMORY_RECALL=off` skips
+  the per-prompt network search when users do not want prompts sent in query strings or to the server's
+  embedding provider, while still draining `<session>.events.jsonl` to surface pending live change notices.
+- **Live changes (`/MemoryEvents` follower + in-band revision diffing)**:
+  - _Trade-off vs. `GET /Memory/changes?since=<ts>`_: combining a per-session `/MemoryEvents` SSE follower
+    with in-band revision diffing consumes PR #9's existing server surface with zero new server routes or
+    timestamp change-log indexes, delivering `withdrawn`, `superseded`, `revised`, and `flagged` events in
+    real time via `/MemoryEvents` (with in-band recall diffing as a fallback for `revised` and `flagged` on
+    active memories) without adding a second per-prompt HTTP round-trip on the `UserPromptSubmit` latency path.
+  - `SessionStart` unlinks any prior `.stop` sentinel, garbage-collects inactive sessions as a unit only when
+    all of their session files (`state.json`, `events.jsonl`, `follower.lock`, `.stop`) are older than
+    `AGENT_MEMORY_CACHE_MAX_AGE_MS` (default `24` hours; endpoint-directory GC only inspects 16-hex plugin
+    directories containing plugin files and removes empty directories with non-recursive `rmdirSync`), and
+    spawns a detached per-session follower (`claude-plugin/lib/follower.mjs`, `stdio: 'ignore'`, `unref()`).
+    The follower acquires `<session>.follower.lock` with `O_EXCL` (taking over locks whose heartbeat `mtime`
+    is older than `3 * AGENT_MEMORY_HEARTBEAT_MS`), verifies lock ownership (`pid` and `startedAt`) before
+    every heartbeat and on exit, connects to `GET /MemoryEvents` (`Accept: text/event-stream`) with jittered
+    reconnect, appends incoming `{ id, kind, revision, ts }` frames to `<session>.events.jsonl` (`O_APPEND`),
+    and periodically renews `POST /Memory/watch` for active watched IDs in batches of `<= 100` before the
+    3600 s watch TTL expires (falling back to per-ID watch requests, tracking pruned `404` / withdrawn /
+    superseded IDs in memory so `state.json` remains single-writer from hooks only, and applying exponential
+    backoff on renewal failures). `SessionEnd` writes `<session>.stop` so the follower aborts any active
+    stream or backoff timer and exits cleanly.
+  - On `UserPromptSubmit`, the hook drains `<session>.events.jsonl` from `state.eventsOffset` using bounded
+    byte-offset reads (`openSync`/`readSync`, resetting to offset `0` if the file was truncated or recreated)
+    and compares `revision`, `status`, and `needsReview` on memories returned by recall against
+    `state.revisions`. When an injected memory (`injectedIds`) is `superseded`, `revised`, `withdrawn`, or
+    `flagged` (`needsReview`), or when one of the caller's own memories is `flagged` (which `/MemoryEvents`
+    delivers to the owner), the hook emits an attributed `[memory-change-<nonce> ...]` notice built directly
+    from `state.revisions` and the event payload, requiring zero extra per-notice `GET /Memory/<id>` calls.
+    Notices are marked notified in `state.notifiedRevisions` only after they fit within the turn's character
+    budget; any overflow notices are persisted in `state.pendingNotices` for subsequent turns.
+- **Untrusted-data injection format (`claude-plugin/lib/format.mjs`)**: every injected memory and change
+  notice carries `id`, `author` (`author.principalId`, plus `lastEditor` when different), `scopes`,
+  `revision`, and `needsReview` (`"true"` or `"false"`) inside a per-call random nonced wrapper
+  (`<agent-memory-data-<nonce> role="stored-data" notice="...">...</agent-memory-data-<nonce>>` and
+  `[memory-<nonce> ...]...[/memory-<nonce>]`). Attribute values escape quotes, brackets, angle brackets, and
+  newlines, and any occurrence of the nonce or tag names in memory bodies is scrubbed so stored content
+  cannot break out of the data block or masquerade as instructions.
+- **Read-through offline cache (`bootstrap-cache.json`)**: stores only `pinned` (`section === 'pinned'`) and
+  private (`user:*`) memories from the last successful `/Memory/bootstrap` snapshot authoritatively under
+  `AGENT_MEMORY_CACHE_DIR` (`0700` dir, `0600` file, bounded by `AGENT_MEMORY_CACHE_MAX_AGE_MS`, default `24`
+  hours), excluding unpinned shared/team-scoped (`global`, `team:*`, `project:*`) bootstrap memories and
+  evicting any memory IDs that later transition to `withdrawn` or `superseded`. Pinned shared memories remain
+  in the user-only (`0600`) cache up to `24` hours so offline bootstrap preserves explicit user pins unless
+  evicted by live events or purged immediately on `401`/`403`. Used only when `/Memory/bootstrap` fails due to
+  network unreachability, timeout, or `5xx`, prepending a `[STALE CACHE ...]` notice.
+- **Routing skill & CLI utilities**:
+  - `claude-plugin/skills/memory-routing/SKILL.md`: routes team-relevant findings, decisions, and shared
+    lessons to `agent-memory` while keeping machine-specific paths, worktree state, and personal workflow
+    preferences in Claude's native file memory (`~/.claude/projects/.../memory/`), enforcing a strict
+    single-home rule.
+  - `scripts/import-claude-memory.mjs`: migrates selected native Claude memory Markdown files into
+    `agent-memory` with `--dry-run`, skipping `user`-type personal profile files by default (`--include-user`
+    to opt in), deriving per-principal deterministic ids (`cm_<sha256(principalKey:name)[:32]>`, matching
+    `^[A-Za-z0-9_-]{16,64}$`; requires `--user` or `AGENT_MEMORY_USER` when authenticating with a `Bearer`
+    token so derived IDs remain stable across token rotation), mapping frontmatter `type` to `type:<type>`
+    tags, preserving `Why`/`How to apply` lines in `content`, defaulting scope to `user:<self>`, and
+    converting `[[name]]` wikilinks to `{ kind: 'memory', ref }` evidence via a two-pass `PUT /Memory/<id>`
+    write (`If-Match` on pass 2 when forward/cyclic links exist).
+  - `scripts/eval-recall.mjs`: evaluates a JSONL dataset of `{ prompt, expectedIds }` against the recall
+    hook's exact search query (`GET /Memory/?q=<prompt>&limit=<k>&watch=true` by default; `--no-watch` to opt
+    out), reporting `recall@k`, hit rate, timeout rate, and full-response latency percentiles (`min`, `p50`,
+    `p95`, `max`, `mean` ms).
 
 ## Not in v0
 
