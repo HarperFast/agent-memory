@@ -299,7 +299,7 @@ principal.
 Imported history rarely records which memory replaced which. `scripts/backfill-supersession.mjs` finds
 those pairs with the server's own supersession candidates, has a model judge each pair, and links only
 the pairs you approve. Run it from a checkout (Node 22+) on your own machine, as a `super_user` of the
-target. Rules: [DESIGN.md](DESIGN.md#supersession-backfill-scriptsbackfill-supersessionmjs).
+target; `--judge anthropic` also needs the checkout's dev dependencies (`npm ci`). Rules: [DESIGN.md](DESIGN.md#supersession-backfill-scriptsbackfill-supersessionmjs).
 
 ```sh
 # 1. Report: judge every (newer, older) candidate pair; writes a new 0600 file, links nothing
