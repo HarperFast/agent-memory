@@ -452,7 +452,7 @@ lease, since a batch writes up to 100 rows and flags their citers inside one tra
   id, under the same status, expiry, tag, scope and readable-set conditions as a search. `after` is the last
   row of the previous page (`createdAt` as ISO, then id). The query leads with a plain `createdAt >= t` (a floor
   date on the first page) plus the tie-break `createdAt > t or id > lastId` and the usual conditions. For a
-  walk of everything (a `super_user` with no `tag` or `scope`) it sets `enforceExecutionOrder`, so Harper scans
+  walk of everything (a `super_user` with no `tag`, `scope` or `flagged`) it sets `enforceExecutionOrder`, so Harper scans
   the `createdAt` index from the cursor whatever the other conditions estimate; for a narrower listing Harper
   starts from its most selective condition and sorts the few matching rows, since pinning the scan would make
   a caller who reads 3 rows of a large store read the whole index. Every page holds exactly `limit` rows even when an import batch shares one

@@ -259,9 +259,10 @@ export async function searchMemories(
 									: [{ attribute: 'createdAt', comparator: 'greater_than_equal', value: EARLIEST }]),
 								...conditions,
 							],
-							// A walk of everything (a super_user, no tag or scope filter) pins the createdAt range to drive the
+							// A walk of everything (a super_user, no tag, scope or flagged filter) pins the createdAt range to drive the
 							// scan; a narrower listing lets Harper start from its most selective condition and sort the few rows.
-							enforceExecutionOrder: principal.superUser && params.tags.length === 0 && params.scopes.length === 0,
+							enforceExecutionOrder:
+								principal.superUser && params.tags.length === 0 && params.scopes.length === 0 && !params.flagged,
 							sort: { attribute: 'createdAt', next: { attribute: 'id' } },
 							select: VIEW_FIELDS,
 							limit: params.limit,

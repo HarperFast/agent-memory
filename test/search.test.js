@@ -101,6 +101,7 @@ describe('parseSearchParams', () => {
 			limit: 50,
 			includeSuperseded: false,
 			includeExpired: false,
+			flagged: false,
 			watch: false,
 			order: 'created',
 			after: { createdAt: new Date('2025-06-01T00:00:00.000Z'), id },
@@ -345,6 +346,7 @@ describe('created-order cursor', () => {
 		assert.equal(await pinned(root, ''), true);
 		assert.equal(await pinned(root, '&tag=ops'), false);
 		assert.equal(await pinned(root, '&scope=team:x'), false);
+		assert.equal(await pinned(root, '&flagged=true'), false);
 		assert.equal(await pinned(alice, ''), false);
 	});
 
