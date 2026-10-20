@@ -475,8 +475,6 @@ async function sourceStatus(id, { target, authorization }) {
 	return typeof body?.memory?.status === 'string' ? body.memory.status : null;
 }
 
-// Sources go first, all of them: a lesson is sent only for a source that is stored as imported and still active,
-// so a lesson never outlives a source the target already revised, withdrew or superseded.
 async function importLessons(lessonRows, skipped, sourceResult, options) {
 	const conflicted = new Set(sourceResult.conflicts.map((conflict) => conflict.id));
 	const ready = [];
@@ -582,12 +580,16 @@ export async function run(argv, env, { stdout = process.stdout, stderr = process
 			stdout.write(USAGE);
 			return 0;
 		}
+		// An unset shell variable passes "", which must not read as an absent --decisions and import everything as global.
+		const empty = Object.keys(values).find((name) => values[name] === '');
+		if (empty) throw new UsageError(`--${empty} needs a value`);
 		if (Boolean(values.flair) === Boolean(values['from-jsonl'])) {
 			throw new UsageError('pass exactly one of --flair or --from-jsonl');
 		}
 		if (values.snapshot && !values.flair) throw new UsageError('--snapshot applies only to --flair');
 		if (!values['principal-map']) throw new UsageError('--principal-map is required');
-		if (values.classify && values.decisions) throw new UsageError('pass at most one of --classify or --decisions');
+		if (values.classify && values.decisions !== undefined)
+			throw new UsageError('pass at most one of --classify or --decisions');
 		if (values.classify) {
 			if (!values.report) throw new UsageError('--classify requires --report <file>');
 			if (values.target) {
@@ -618,14 +620,14 @@ export async function run(argv, env, { stdout = process.stdout, stderr = process
 			if (await fileExists(values.report)) {
 				throw new Error('--report names an existing file, and a report is never overwritten (EEXIST)');
 			}
-			await access(dirname(resolve(values.report)), constants.W_OK).catch((error) => {
+			await access(dirname(resolve(values.report)), constants.W_OK | constants.X_OK).catch((error) => {
 				throw new Error(`cannot write --report: ${error.code ?? 'unwritable directory'}`);
 			});
 		}
 
 		const principalMap = parsePrincipalMap(await readJsonFile(values['principal-map'], '--principal-map'));
 		const orgMap = values['org-map'] ? parseOrgMap(await readJsonFile(values['org-map'], '--org-map')) : new Map();
-		const decisionsJson = values.decisions && (await readJsonFile(values.decisions, '--decisions'));
+		const decisionsJson = values.decisions !== undefined && (await readJsonFile(values.decisions, '--decisions'));
 
 		let flairRows;
 		if (values.flair) {
@@ -691,7 +693,7 @@ export async function run(argv, env, { stdout = process.stdout, stderr = process
 		let summary;
 		let lessonRows = null;
 		const inactiveLessons = [];
-		if (values.decisions) {
+		if (values.decisions !== undefined) {
 			const candidates = classificationCandidates(flairRows, principalMap, mapOptions);
 			const decisions = readDecisions(decisionsJson, candidates, { maxContentChars });
 			const scopeOverrides = new Map(

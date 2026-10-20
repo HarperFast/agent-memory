@@ -117,7 +117,7 @@ function matchesSchema(answer, schema) {
 		answer !== null &&
 		typeof answer === 'object' &&
 		!Array.isArray(answer) &&
-		Object.keys(answer).every((key) => key in schema.properties)
+		Object.keys(answer).every((key) => Object.hasOwn(schema.properties, key))
 	);
 }
 
@@ -141,7 +141,8 @@ async function ask(backend, system, prompt, schema) {
 	try {
 		return { answer: await backend.complete({ system, prompt, schema }) };
 	} catch (error) {
-		return { failed: true, code: FAILURE_CODE.test(error?.code) ? error.code : 'unknown' };
+		const code = error?.code;
+		return { failed: true, code: typeof code === 'string' && FAILURE_CODE.test(code) ? code : 'unknown' };
 	}
 }
 
@@ -194,7 +195,6 @@ async function classifyOne(backend, candidate, orgMap) {
 	};
 }
 
-/** An organization whose slug cannot be trusted becomes `customer:unclassified`, never `global`. */
 export async function classifyCandidates(candidates, { backend, orgMap, concurrency, onProgress = () => {} }) {
 	let done = 0;
 	const outcomes = await mapLimit(candidates, concurrency, async (candidate) => {
@@ -203,7 +203,8 @@ export async function classifyCandidates(candidates, { backend, orgMap, concurre
 		return outcome;
 	});
 
-	const mappedSlugs = new Set([...orgMap.values()].map((entry) => entry.slug));
+	const aliasesBySlug = new Map();
+	for (const [alias, { slug }] of orgMap) aliasesBySlug.set(slug, [...(aliasesBySlug.get(slug) ?? []), alias]);
 	const unusable = (name, slug) => name.length > ORGANIZATION_NAME_MAX_CHARS || !isSlug(slug);
 	const namesBySlug = new Map();
 	for (const outcome of outcomes) {
@@ -223,8 +224,14 @@ export async function classifyCandidates(candidates, { backend, orgMap, concurre
 			if (orgMap.has(key)) return { name, slug: orgMap.get(key).slug, source: 'map' };
 			const slug = slugify(name);
 			if (unusable(name, slug)) return { name, slug: null, source: 'unusable' };
-			if (mappedSlugs.has(slug) || namesBySlug.get(slug).size > 1) {
-				return { name, slug: null, source: 'collision', proposedSlug: slug, inOrgMap: mappedSlugs.has(slug) };
+			if (aliasesBySlug.has(slug) || namesBySlug.get(slug).size > 1) {
+				return {
+					name,
+					slug: null,
+					source: 'collision',
+					proposedSlug: slug,
+					mappedAliases: aliasesBySlug.get(slug) ?? [],
+				};
 			}
 			return { name, slug, source: 'new' };
 		});
@@ -327,17 +334,18 @@ export function buildReport(entries, { source, classifier, statusById }) {
 			const bucket = org.source === 'new' ? newOrganizations : org.source === 'collision' ? collisions : null;
 			const slug = org.slug ?? org.proposedSlug;
 			if (!bucket) continue;
-			if (!bucket.has(slug)) bucket.set(slug, { slug, names: new Set(), rows: new Set(), inOrgMap: org.inOrgMap });
+			if (!bucket.has(slug))
+				bucket.set(slug, { slug, names: new Set(), rows: new Set(), mappedAliases: org.mappedAliases });
 			bucket.get(slug).names.add(org.name);
 			bucket.get(slug).rows.add(entry.id);
 		}
 	}
 	const listed = (bucket) =>
-		[...bucket.values()].map(({ slug, names, rows, inOrgMap }) => ({
+		[...bucket.values()].map(({ slug, names, rows, mappedAliases }) => ({
 			slug,
 			names: [...names],
 			rows: [...rows],
-			...(inOrgMap === undefined ? {} : { inOrgMap }),
+			...(mappedAliases ? { mappedAliases } : {}),
 		}));
 	return {
 		version: REPORT_VERSION,

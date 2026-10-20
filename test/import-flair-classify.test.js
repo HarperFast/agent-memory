@@ -26,12 +26,10 @@ const DEFAULT_LESSON = {
 	title: 'Compaction stalls under write bursts',
 	content: 'When compaction falls behind, raise the compaction thread count.',
 };
-// Customer-derived text that must never reach stdout or stderr.
 const FORBIDDEN = /SECRET|Zentrix Labs|Orbweaver Freight|A\/B Corp|Names a customer|Compaction stalls/;
 
 const id = (flairId) => memoryIdFor(flairId);
 
-/** Deterministic stand-in for the claude/anthropic backends; rules key on markers in the synthetic fixture. */
 function stubBackend({ delayMs = 0 } = {}) {
 	const backend = {
 		name: 'stub',
@@ -99,7 +97,6 @@ async function stubServer(handler) {
 	return { url: `http://127.0.0.1:${server.address().port}`, requests, close: () => server.close() };
 }
 
-/** Answers POST /Memory/import and GET /Memory/<id>; `resultFor` and `statusFor` pick per-row outcomes. */
 function targetHandler({ resultFor = () => 'created', statusFor = () => 'active' } = {}) {
 	return ({ method, url, body }) => {
 		if (method === 'POST') {
@@ -165,7 +162,7 @@ describe('import-flair --classify', () => {
 		assert.deepEqual(rowOf('c15').scopes, ['customer:unclassified']);
 		assert.deepEqual(rowOf('c16').scopes, ['customer:unclassified']);
 		assert.deepEqual(report.slugCollisions, [
-			{ slug: 'a-b-corp', names: ['A/B Corp', 'A B Corp'], rows: [id('c15'), id('c16')], inOrgMap: false },
+			{ slug: 'a-b-corp', names: ['A/B Corp', 'A B Corp'], rows: [id('c15'), id('c16')], mappedAliases: [] },
 		]);
 	});
 
@@ -449,6 +446,18 @@ describe('import-flair --decisions', () => {
 		}
 	});
 
+	it('refuses an empty --decisions value instead of importing everything as global', async () => {
+		const target = await stubServer(targetHandler());
+		try {
+			const result = await cli([...SOURCE, '--decisions', '', '--target', target.url], { env: TARGET_ENV });
+			assert.equal(result.code, 2);
+			assert.match(result.stderr, /--decisions needs a value/);
+			assert.equal(target.requests.length, 0);
+		} finally {
+			target.close();
+		}
+	});
+
 	it('previews with --dry-run and sends nothing', async () => {
 		const decisions = await decisionsFile('preview.json', () => {});
 		const result = await cli([...SOURCE, '--decisions', decisions, '--dry-run']);
@@ -538,14 +547,18 @@ describe('customer-content helpers', () => {
 		assert.deepEqual(entry.scopes, ['customer:unclassified', 'customer:zentrix']);
 	});
 
-	it('treats an answer with keys outside the schema as invalid', async () => {
-		const [entry] = await classifyCandidates([candidate('u2', 'note')], {
-			backend: answering(() => ({ customerSpecific: false, organizations: [], rationale: 'x', extra: 1 })),
-			orgMap: new Map(),
-			concurrency: 1,
-		});
-		assert.deepEqual(entry.scopes, ['customer:unclassified']);
-		assert.equal(entry.failure, 'invalid_answer');
+	it('treats an answer with keys outside the schema as invalid, inherited names included', async () => {
+		for (const extra of ['{"extra":1}', '{"constructor":1}', '{"__proto__":{}}', '{"toString":1}']) {
+			const [entry] = await classifyCandidates([candidate('u2', 'note')], {
+				backend: answering(() =>
+					Object.assign(JSON.parse(extra), { customerSpecific: false, organizations: [], rationale: 'x' }),
+				),
+				orgMap: new Map(),
+				concurrency: 1,
+			});
+			assert.deepEqual(entry.scopes, ['customer:unclassified'], extra);
+			assert.equal(entry.failure, 'invalid_answer', extra);
+		}
 	});
 
 	it('does not let an unusable name quarantine a valid one that shares its truncated slug', async () => {
@@ -571,7 +584,7 @@ describe('customer-content helpers', () => {
 		assert.deepEqual(entries[0].scopes, ['customer:unclassified']);
 		const report = buildReport(entries, { source: 'flair', classifier: 'stub', statusById: new Map() });
 		assert.deepEqual(report.slugCollisions, [
-			{ slug: 'zentrix', names: ['Zentrix!'], rows: [id('u5')], inOrgMap: true },
+			{ slug: 'zentrix', names: ['Zentrix!'], rows: [id('u5')], mappedAliases: ['zentrix labs'] },
 		]);
 	});
 
