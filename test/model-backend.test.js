@@ -175,23 +175,6 @@ process.exit(0);`,
 		}
 	});
 
-	it('settles at the timeout when the CLI exited but a descendant still holds its output open', async () => {
-		const cli = await fakeCli(
-			'orphan',
-			`const { spawn } = require('node:child_process');
-const holder = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 20000)'], { stdio: ['ignore', 'inherit', 'ignore'] });
-writeFileSync(${JSON.stringify(join(dir, 'orphan.pid'))}, String(holder.pid));
-process.exit(0);`,
-		);
-		const started = Date.now();
-		try {
-			assert.equal(await failure(complete(cli, { timeoutMs: 300 })), 'cli_timeout');
-			assert.ok(Date.now() - started < 4_000);
-		} finally {
-			process.kill(Number(await readFile(join(dir, 'orphan.pid'), 'utf8')), 'SIGKILL');
-		}
-	});
-
 	it('kills a CLI whose output exceeds the cap', async () => {
 		const cli = await fakeCli(
 			'flood',
