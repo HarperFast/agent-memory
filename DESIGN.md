@@ -480,7 +480,8 @@ sends identical rows.
   are skipped and reported, never guessed. Because `id` is derived from the Flair id alone, remapping an
   agent after an import reports those rows as `conflict` rather than overwriting or duplicating them.
 - **Scopes**: Flair treats only the literal `private` as owner-only, so `private` → `[user:<owner>]` and
-  every other value (`shared`, absent, legacy) → `[global]`.
+  every other value (`shared`, absent, legacy) → `[global]`, unless a reviewed classification replaces
+  `[global]` (below).
 - **Lifecycle**: `archived` → `withdrawn` with `withdrawnAt` = `archivedAt`. Flair's archive is a
   restorable basement, mostly filled by age-based hygiene, so the row is kept out of default search,
   not dropped. A non-withdrawn row is `superseded` when a non-withdrawn imported row supersedes it;
@@ -497,6 +498,64 @@ sends identical rows.
 - **Not imported**: `ephemeral` rows (the only Flair tier with `expiresAt`; the target has no expiry),
   rows outside the target's content or tag limits (`skipped.invalid`), `durability`, embeddings (the
   target re-embeds through `@embed`), and Flair bookkeeping fields.
+
+#### Customer classification (`--classify`, `--decisions`)
+
+Flair mixed Harper lessons with customer investigation write-ups, and `global` is readable by fleet
+workers, whose role reads `global` only. A customer incident is therefore imported as two memories: the
+record, labeled `customer:<org>` (readable by holders of `customer:*` or that label), and a sanitized
+lesson, labeled `global`, that cites the record as `memory` evidence, so superseding or withdrawing the
+record flags the lesson (Provenance). The invariant: in this mode a non-private row reaches the target
+as `global` only through an operator-reviewed decision, and every machine failure lands on
+`customer:unclassified`, never on `global`.
+
+- **Two runs**: `--classify --report <file>` proposes, writes the report, and contacts no target; a run
+  whose classifier errors on every row (a missing CLI or key) writes nothing. The operator edits the
+  report; `--decisions <file>` imports with exactly what it says and makes no model calls, so a re-run
+  with the same file sends identical rows.
+- **What is classified**: every row a plain import would send as `global`: `active`, `superseded` and
+  `withdrawn` alike, because scopes outlive status. Private rows are never sent to the classifier.
+- **Labels**: one `customer:<slug>` per organization the classifier names. Names go through
+  `--org-map` (alias → slug); an alias found literally in the row adds its organization even when the
+  model missed it. An unmapped name becomes `slugify(name)` and is listed for review. A classifier error,
+  an answer outside the schema, or more than 16 distinct labels make the row `customer:unclassified` alone.
+  `customer:unclassified` replaces the label of a name with no usable slug, or of a generated slug shared
+  by two different names or equal to a mapped slug (either would merge two customers' readers); the
+  row keeps its other labels, because any one label grants read. It is also added when the model finds
+  customer detail but names no organization, even if an alias matched.
+- **Before links**: decided scopes enter `mapFlairMemories` before `supersedes` is resolved, so the
+  reader rule above judges the labels actually sent: the link from a customer successor to a `global`
+  memory is dropped as `narrowing`.
+- **Binding**: each decision carries a fingerprint over every Flair field the mapping reads plus the
+  resolved owner. A source row that changed since classification (content, tags, archive, expiry, links,
+  owner) refuses the whole apply, and the decisions must cover exactly the rows that would be classified.
+  Decided scopes are `["global"]` or `customer:<slug>` labels, nothing else. A lesson needs a
+  customer-labeled row, must not name an organization the row lists, and is sent only for a row the
+  mapping leaves `active`.
+- **Lessons** (`--lessons`): drafted only for `active`, unexpired, customer-labeled rows; a lesson from a
+  superseded or archived record would publish knowledge its author already replaced. The draft is
+  dropped (and kept in the report with a reason) when it names a source organization or a mapped alias,
+  or when the classifier, run again on the draft, still finds customer detail or fails. A lesson row is
+  `{ id: sha256('lesson:' + sourceId)[:32], ownerId: source owner, title, content, scopes: [global],
+evidence: [{ kind: memory, ref: sourceId }], createdAt: source createdAt, validUntil: source validUntil }`
+  and carries no tags, which can name customers.
+- **Sources first**: every source batch commits before any lesson is sent, and a lesson is sent only if
+  its source did not come back `conflict` and a super_user read shows it `active` (an `unchanged` result
+  does not prove that; the import equality check ignores stored status). A source withdrawn in the target
+  between that read and the lesson batch is not caught; the import window already forbids edits. An
+  edited lesson comes back `conflict` and a removed one stays in the target: re-applying never withdraws
+  what an earlier apply published.
+- **Backends** (`scripts/lib/model-backend.mjs`, one interface for every backend): `claude`
+  (default) runs `claude -p --safe-mode` with no tools, no MCP servers and no session persistence, the
+  memory on stdin; `anthropic` calls the Messages API with `ANTHROPIC_API_KEY` at effort `medium`. Both
+  return JSON-schema output that the script validates again, and a failure carries only a code.
+  Admin-managed policy hooks still run under `--safe-mode`; where one forwards prompts, use `anthropic`.
+- **Who sees what**: owners read their own customer records whatever their role, so a fleet principal
+  must not own any. A lesson's evidence shows the record's id to every reader; its `needsReview` flag
+  shows only to readers of the record. Rows an earlier plain import sent as `global` come back
+  `conflict` and are not relabeled.
+- **Customer data**: stdout and stderr carry ids, counts, scope labels and error codes only. The report
+  (titles, organization names, rationales, lesson drafts) is written 0600 and never overwritten.
 
 ## Claude Code plugin
 

@@ -1,8 +1,18 @@
 #!/usr/bin/env node
 import { createHash } from 'node:crypto';
-import { realpathSync } from 'node:fs';
-import { link, open, readFile, unlink } from 'node:fs/promises';
+import { constants, realpathSync } from 'node:fs';
+import { access, link, open, readFile, unlink } from 'node:fs/promises';
+import { dirname, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
+import {
+	buildReport,
+	classifyCandidates,
+	draftLessons,
+	lessonRow,
+	parseOrgMap,
+	readDecisions,
+	reportSummary,
+} from './lib/customer-content.mjs';
 
 export const MAX_BATCH_SIZE = 100;
 export const DEFAULT_MAX_CONTENT_CHARS = 20_000;
@@ -10,6 +20,9 @@ const MAX_CONTENT_CHARS_LIMIT = 100_000;
 const TAGS_MAX_ITEMS = 20;
 const TAG_MAX_CHARS = 64;
 const REQUEST_TIMEOUT_MS = 300_000;
+const DEFAULT_CONCURRENCY = 4;
+const MAX_CONCURRENCY = 16;
+const CLASSIFIERS = new Set(['claude', 'anthropic']);
 const FLAIR_FIELDS = [
 	'id',
 	'agentId',
@@ -122,7 +135,15 @@ function increment(counts, key) {
 	counts.set(key, (counts.get(key) ?? 0) + 1);
 }
 
-export function mapFlairMemories(flairRows, principalMap, { maxContentChars = DEFAULT_MAX_CONTENT_CHARS } = {}) {
+/**
+ * `scopeOverrides` (Flair id → labels) replaces `global` for non-private rows, before links are resolved, so the
+ * reader rule below sees the scopes that will be sent.
+ */
+export function mapFlairMemories(
+	flairRows,
+	principalMap,
+	{ maxContentChars = DEFAULT_MAX_CONTENT_CHARS, scopeOverrides } = {},
+) {
 	if (!Number.isInteger(maxContentChars) || maxContentChars < 1 || maxContentChars > MAX_CONTENT_CHARS_LIMIT) {
 		throw new Error(`maxContentChars must be an integer from 1 to ${MAX_CONTENT_CHARS_LIMIT}`);
 	}
@@ -165,7 +186,7 @@ export function mapFlairMemories(flairRows, principalMap, { maxContentChars = DE
 			continue;
 		}
 		// Flair reads only the literal "private" as owner-only; any other value is readable by every agent.
-		const scopes = row.visibility === 'private' ? [`user:${ownerId}`] : ['global'];
+		const scopes = row.visibility === 'private' ? [`user:${ownerId}`] : (scopeOverrides?.get(row.id) ?? ['global']);
 		if (row.visibility != null && row.visibility !== 'private' && row.visibility !== 'shared') {
 			increment(unknownVisibility, row.visibility);
 		}
@@ -272,6 +293,30 @@ export function mapFlairMemories(flairRows, principalMap, { maxContentChars = DE
 	return { rows, summary };
 }
 
+function flairFingerprint(flairRow, ownerId) {
+	const fields = [ownerId, ...FLAIR_FIELDS.map((field) => flairRow[field] ?? null)];
+	return createHash('sha256').update(JSON.stringify(fields)).digest('hex');
+}
+
+export function classificationCandidates(flairRows, principalMap, options) {
+	const { rows } = mapFlairMemories(flairRows, principalMap, options);
+	const flairById = new Map(flairRows.map((flairRow) => [memoryIdFor(flairRow.id), flairRow]));
+	return rows
+		.filter((row) => row.scopes.length === 1 && row.scopes[0] === 'global')
+		.map((row) => {
+			const flairRow = flairById.get(row.id);
+			return {
+				id: row.id,
+				flairId: flairRow.id,
+				ownerId: row.ownerId,
+				content: row.content,
+				tags: row.tags ?? [],
+				validUntil: row.validUntil ?? null,
+				fingerprint: flairFingerprint(flairRow, row.ownerId),
+			};
+		});
+}
+
 function assertSafeUrl(value, name) {
 	let url;
 	try {
@@ -344,14 +389,14 @@ async function errorDetail(response, rows) {
 	}
 }
 
-async function postBatches(rows, { target, authorization, batchSize, stderr }) {
+async function postBatches(rows, { target, authorization, batchSize, stderr, label = 'batch' }) {
 	const url = `${target}/Memory/import`;
 	const result = { created: 0, unchanged: 0, conflict: 0, conflicts: [], dependsOnConflict: [] };
 	const conflictIds = new Set();
 	const batchCount = Math.ceil(rows.length / batchSize);
 	const failBatch = (batch, detail, cause) => {
 		const error = new Error(
-			`batch ${batch}/${batchCount} failed: ${detail}; earlier batches are committed and a re-run resumes`,
+			`${label} ${batch}/${batchCount} failed: ${detail}; earlier batches are committed and a re-run resumes`,
 			cause ? { cause } : undefined,
 		);
 		if (batch > 1) error.partialResult = result;
@@ -403,19 +448,58 @@ async function postBatches(rows, { target, authorization, batchSize, stderr }) {
 				result.dependsOnConflict.push({ id, supersededBy });
 			}
 		});
-		stderr.write(`batch ${batch}/${batchCount}: ${batchRows.length} rows\n`);
+		stderr.write(`${label} ${batch}/${batchCount}: ${batchRows.length} rows\n`);
 	}
 	return result;
 }
 
-// Written aside, fsynced and linked into place, so an interrupted write never leaves a truncated snapshot
-// under the final name, and an existing file is never replaced.
-async function writeSnapshot(path, flairRows) {
+async function sourceStatus(id, { target, authorization }) {
+	let response;
+	try {
+		response = await fetch(`${target}/Memory/${id}`, {
+			headers: { Authorization: authorization, Accept: 'application/json' },
+			redirect: 'error',
+			signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+		});
+	} catch (error) {
+		throw new Error(`checking source ${id} failed: ${requestFailureCode(error)}`, { cause: error });
+	}
+	if (response.status === 404) return null;
+	if (!response.ok) throw new Error(`checking source ${id} failed: HTTP ${response.status}`);
+	let body;
+	try {
+		body = await response.json();
+	} catch (error) {
+		throw new Error(`checking source ${id} failed: ${requestFailureCode(error)}`, { cause: error });
+	}
+	return typeof body?.memory?.status === 'string' ? body.memory.status : null;
+}
+
+async function importLessons(lessonRows, skipped, sourceResult, options) {
+	const conflicted = new Set(sourceResult.conflicts.map((conflict) => conflict.id));
+	const ready = [];
+	for (const row of lessonRows) {
+		const sourceId = row.evidence[0].ref;
+		const reason = conflicted.has(sourceId)
+			? 'source_conflict'
+			: (await sourceStatus(sourceId, options)) !== 'active'
+				? 'source_not_active'
+				: null;
+		if (reason) skipped.push({ id: row.id, source: sourceId, reason });
+		else ready.push(row);
+	}
+	const result = ready.length ? await postBatches(ready, { ...options, label: 'lesson batch' }) : null;
+	return { result, skipped };
+}
+
+// Written aside, fsynced and linked into place, so an interrupted write never leaves a truncated file under the
+// final name, and an existing file is never replaced.
+async function writeNewFile(path, text) {
 	const partial = `${path}.${process.pid}.partial`;
 	let handle;
 	try {
 		handle = await open(partial, 'wx', 0o600);
-		await handle.writeFile(flairRows.map((row) => JSON.stringify(row)).join('\n') + '\n');
+		await handle.writeFile(text);
 		await handle.sync();
 		await handle.close();
 		handle = null;
@@ -435,31 +519,93 @@ const OPTIONS = {
 	'batch-size': { type: 'string', default: String(MAX_BATCH_SIZE) },
 	'max-content-chars': { type: 'string', default: String(DEFAULT_MAX_CONTENT_CHARS) },
 	'dry-run': { type: 'boolean', default: false },
+	classify: { type: 'boolean', default: false },
+	report: { type: 'string' },
+	'org-map': { type: 'string' },
+	lessons: { type: 'boolean', default: false },
+	classifier: { type: 'string' },
+	'classifier-model': { type: 'string' },
+	concurrency: { type: 'string' },
+	decisions: { type: 'string' },
 	help: { type: 'boolean', default: false },
 };
+const CLASSIFY_ONLY = ['report', 'org-map', 'classifier', 'classifier-model', 'concurrency'];
 
 const USAGE = `Usage: node scripts/import-flair.mjs (--flair <url> [--snapshot <file>] | --from-jsonl <file>)
-       --principal-map <file> (--dry-run | --target <url>) [--batch-size <1-${MAX_BATCH_SIZE}>]
-       [--max-content-chars <1-${MAX_CONTENT_CHARS_LIMIT}>]
+       --principal-map <file> [--batch-size <1-${MAX_BATCH_SIZE}>] [--max-content-chars <1-${MAX_CONTENT_CHARS_LIMIT}>]
+       and one of:
+       (--dry-run | --target <url>)                       import; shared rows become global
+       --classify --report <file> [--org-map <file>] [--lessons] [--classifier claude|anthropic]
+         [--classifier-model <id>] [--concurrency <1-${MAX_CONCURRENCY}>]  propose customer scopes; writes the report only
+       --decisions <file> (--dry-run | --target <url>)    import with a reviewed report applied
 
 Environment: FLAIR_ADMIN_USER (default admin), FLAIR_ADMIN_PASS for --flair;
-             AGENT_MEMORY_USER, AGENT_MEMORY_PASS (a super_user) for --target.
+             AGENT_MEMORY_USER, AGENT_MEMORY_PASS (a super_user) for --target;
+             ANTHROPIC_API_KEY for --classifier anthropic.
 `;
 
-export async function run(argv, env, { stdout = process.stdout, stderr = process.stderr } = {}) {
+function fileExists(path) {
+	return access(path).then(
+		() => true,
+		() => false,
+	);
+}
+
+async function readJsonFile(path, option) {
+	try {
+		return JSON.parse(await readFile(path, 'utf8'));
+	} catch (error) {
+		throw new Error(`cannot read ${option}: ${error.code ?? 'invalid JSON'}`);
+	}
+}
+
+async function loadBackend(name, model, env) {
+	const { createModelBackend } = await import('./lib/model-backend.mjs');
+	// Above the shared default of low: a missed detection publishes customer detail to every global reader.
+	return createModelBackend(name, { model, env, effort: 'medium' });
+}
+
+function progress(stderr, stage) {
+	return (done, total) => {
+		if (done === total || done % 25 === 0) stderr.write(`${stage}: ${done}/${total}\n`);
+	};
+}
+
+export async function run(argv, env, { stdout = process.stdout, stderr = process.stderr, backend } = {}) {
 	let mappedSummary;
+	let sourceResult;
 	try {
 		const { values } = parseArgs({ args: argv, options: OPTIONS, strict: true });
 		if (values.help) {
 			stdout.write(USAGE);
 			return 0;
 		}
+		// An unset shell variable passes "", which must not read as an absent --decisions and import everything as global.
+		const empty = Object.keys(values).find((name) => values[name] === '');
+		if (empty) throw new UsageError(`--${empty} needs a value`);
 		if (Boolean(values.flair) === Boolean(values['from-jsonl'])) {
 			throw new UsageError('pass exactly one of --flair or --from-jsonl');
 		}
 		if (values.snapshot && !values.flair) throw new UsageError('--snapshot applies only to --flair');
 		if (!values['principal-map']) throw new UsageError('--principal-map is required');
-		if (!values['dry-run'] && !values.target) throw new UsageError('pass --target, or --dry-run to write nothing');
+		if (values.classify && values.decisions !== undefined)
+			throw new UsageError('pass at most one of --classify or --decisions');
+		if (values.classify) {
+			if (!values.report) throw new UsageError('--classify requires --report <file>');
+			if (values.target) {
+				throw new UsageError('--classify only writes the report; apply it with --decisions and --target');
+			}
+		} else {
+			const misplaced = CLASSIFY_ONLY.find((name) => values[name] !== undefined) ?? (values.lessons && 'lessons');
+			if (misplaced) throw new UsageError(`--${misplaced} applies only to --classify`);
+			if (!values['dry-run'] && !values.target) throw new UsageError('pass --target, or --dry-run to write nothing');
+		}
+		const classifier = values.classifier ?? 'claude';
+		if (!CLASSIFIERS.has(classifier)) throw new UsageError('--classifier must be claude or anthropic');
+		const concurrency = Number(values.concurrency ?? DEFAULT_CONCURRENCY);
+		if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > MAX_CONCURRENCY) {
+			throw new UsageError(`--concurrency must be an integer from 1 to ${MAX_CONCURRENCY}`);
+		}
 		const batchSize = Number(values['batch-size']);
 		if (!Number.isInteger(batchSize) || batchSize < 1 || batchSize > MAX_BATCH_SIZE) {
 			throw new UsageError(`--batch-size must be an integer from 1 to ${MAX_BATCH_SIZE}`);
@@ -468,16 +614,20 @@ export async function run(argv, env, { stdout = process.stdout, stderr = process
 		if (!Number.isInteger(maxContentChars) || maxContentChars < 1 || maxContentChars > MAX_CONTENT_CHARS_LIMIT) {
 			throw new UsageError(`--max-content-chars must be an integer from 1 to ${MAX_CONTENT_CHARS_LIMIT}`);
 		}
-		const target = values['dry-run'] ? null : assertSafeUrl(values.target, '--target');
+		const target = values['dry-run'] || values.classify ? null : assertSafeUrl(values.target, '--target');
 		const targetAuthorization = target && basicAuth(env, 'AGENT_MEMORY_USER', 'AGENT_MEMORY_PASS');
-
-		let principalJson;
-		try {
-			principalJson = JSON.parse(await readFile(values['principal-map'], 'utf8'));
-		} catch (error) {
-			throw new Error(`cannot read --principal-map: ${error.code ?? 'invalid JSON'}`);
+		if (values.classify) {
+			if (await fileExists(values.report)) {
+				throw new Error('--report names an existing file, and a report is never overwritten (EEXIST)');
+			}
+			await access(dirname(resolve(values.report)), constants.W_OK | constants.X_OK).catch((error) => {
+				throw new Error(`cannot write --report: ${error.code ?? 'unwritable directory'}`);
+			});
 		}
-		const principalMap = parsePrincipalMap(principalJson);
+
+		const principalMap = parsePrincipalMap(await readJsonFile(values['principal-map'], '--principal-map'));
+		const orgMap = values['org-map'] ? parseOrgMap(await readJsonFile(values['org-map'], '--org-map')) : new Map();
+		const decisionsJson = values.decisions !== undefined && (await readJsonFile(values.decisions, '--decisions'));
 
 		let flairRows;
 		if (values.flair) {
@@ -486,7 +636,7 @@ export async function run(argv, env, { stdout = process.stdout, stderr = process
 				basicAuth(env, 'FLAIR_ADMIN_USER', 'FLAIR_ADMIN_PASS', 'admin'),
 			);
 			if (values.snapshot) {
-				await writeSnapshot(values.snapshot, flairRows);
+				await writeNewFile(values.snapshot, flairRows.map((row) => JSON.stringify(row)).join('\n') + '\n');
 				stderr.write(`snapshot: ${flairRows.length} Flair memories written to ${values.snapshot}\n`);
 			}
 		} else {
@@ -499,24 +649,90 @@ export async function run(argv, env, { stdout = process.stdout, stderr = process
 			flairRows = parseJsonl(text);
 		}
 
-		const { rows, summary } = mapFlairMemories(flairRows, principalMap, { maxContentChars });
-		mappedSummary = summary;
-		if (values['dry-run']) {
-			stdout.write(JSON.stringify({ dryRun: true, summary }, null, '\t') + '\n');
-			return 0;
-		}
-		const result = await postBatches(rows, { target, authorization: targetAuthorization, batchSize, stderr });
-		stdout.write(JSON.stringify({ dryRun: false, summary, result }, null, '\t') + '\n');
-		return 0;
-	} catch (error) {
-		if (error.partialResult && mappedSummary) {
+		const mapOptions = { maxContentChars };
+		if (values.classify) {
+			const candidates = classificationCandidates(flairRows, principalMap, mapOptions);
+			const classifierBackend = backend ?? (await loadBackend(classifier, values['classifier-model'], env));
+			let entries = await classifyCandidates(candidates, {
+				backend: classifierBackend,
+				orgMap,
+				concurrency,
+				onProgress: progress(stderr, 'classified'),
+			});
+			if (entries.length > 0 && entries.every((entry) => entry.failure === 'classifier_error')) {
+				const codes = [...new Set(entries.map((entry) => entry.errorCode))].join(', ');
+				throw new Error(`the classifier failed on every row (${codes}); check the backend. No report was written`);
+			}
+			const scopeOverrides = new Map(entries.map((entry) => [entry.flairId, entry.scopes]));
+			const { rows, summary } = mapFlairMemories(flairRows, principalMap, { ...mapOptions, scopeOverrides });
+			const statusById = new Map(rows.map((row) => [row.id, row.status]));
+			if (values.lessons) {
+				entries = await draftLessons(entries, {
+					backend: classifierBackend,
+					orgMap,
+					concurrency,
+					statusById,
+					maxContentChars,
+					now: Date.now(),
+					onProgress: progress(stderr, 'lessons'),
+				});
+			}
+			const report = buildReport(entries, { source: 'flair', classifier: classifierBackend.name, statusById });
+			await writeNewFile(values.report, JSON.stringify(report, null, '\t') + '\n');
 			stdout.write(
 				JSON.stringify(
-					{ dryRun: false, partial: true, summary: mappedSummary, result: error.partialResult },
+					{ dryRun: true, summary, classification: reportSummary(report), report: values.report },
 					null,
 					'\t',
 				) + '\n',
 			);
+			return 0;
+		}
+
+		let rows;
+		let summary;
+		let lessonRows = null;
+		const inactiveLessons = [];
+		if (values.decisions !== undefined) {
+			const candidates = classificationCandidates(flairRows, principalMap, mapOptions);
+			const decisions = readDecisions(decisionsJson, candidates, { maxContentChars });
+			const scopeOverrides = new Map(
+				candidates.map((candidate) => [candidate.flairId, decisions.get(candidate.id).scopes]),
+			);
+			({ rows, summary } = mapFlairMemories(flairRows, principalMap, { ...mapOptions, scopeOverrides }));
+			lessonRows = [];
+			for (const row of rows) {
+				const lesson = decisions.get(row.id)?.lesson;
+				if (!lesson) continue;
+				const built = lessonRow(row, lesson);
+				if (row.status === 'active') lessonRows.push(built);
+				else inactiveLessons.push({ id: built.id, source: row.id, reason: 'source_not_active' });
+			}
+		} else {
+			({ rows, summary } = mapFlairMemories(flairRows, principalMap, mapOptions));
+		}
+		mappedSummary = summary;
+		const lessonCount = lessonRows && { lessons: { toImport: lessonRows.length, skipped: inactiveLessons } };
+		if (values['dry-run']) {
+			stdout.write(JSON.stringify({ dryRun: true, summary, ...lessonCount }, null, '\t') + '\n');
+			return 0;
+		}
+		const options = { target, authorization: targetAuthorization, batchSize, stderr };
+		sourceResult = await postBatches(rows, options);
+		const output = { dryRun: false, summary, result: sourceResult };
+		if (lessonRows) output.lessons = await importLessons(lessonRows, inactiveLessons, sourceResult, options);
+		stdout.write(JSON.stringify(output, null, '\t') + '\n');
+		return 0;
+	} catch (error) {
+		if (mappedSummary && (error.partialResult || sourceResult)) {
+			const output = {
+				dryRun: false,
+				partial: true,
+				summary: mappedSummary,
+				result: sourceResult ?? error.partialResult,
+			};
+			if (sourceResult) output.lessons = { result: error.partialResult ?? null };
+			stdout.write(JSON.stringify(output, null, '\t') + '\n');
 		}
 		const cause = error.cause?.code ?? error.code;
 		const suffix = cause && !error.message.includes(cause) ? ` (${cause})` : '';

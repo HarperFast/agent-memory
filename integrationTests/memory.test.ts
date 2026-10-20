@@ -10,6 +10,8 @@ import { createHash } from 'node:crypto';
 import { setupHarperWithFixture, teardownHarper, type ContextWithHarper } from '@harperfast/integration-testing';
 import { getSessionPaths } from '../claude-plugin/lib/cache.mjs';
 import { resolveConfig } from '../claude-plugin/lib/config.mjs';
+import { classificationCandidates, parsePrincipalMap } from '../scripts/import-flair.mjs';
+import { lessonIdFor } from '../scripts/lib/customer-content.mjs';
 
 const require = createRequire(import.meta.url);
 const fixturePath = join(import.meta.dirname, 'fixtures', 'memory-app');
@@ -811,6 +813,95 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 				.result,
 			'conflict',
 		);
+	});
+
+	test('import-flair.mjs --decisions: customer records stay out of global reads; lessons are global and flagged on withdrawal', async () => {
+		const tmpDir = mkdtempSync(join(tmpdir(), 'agent-memory-flair-classify-'));
+		try {
+			const flairRows = [
+				{
+					id: 'cx-record',
+					agentId: 'agent-erin',
+					content: 'Pelican Shipping cluster pel-7 stalled on compaction; more compaction threads fixed it.',
+					visibility: 'shared',
+					createdAt: '2025-02-01T00:00:00.000Z',
+				},
+				{
+					id: 'cx-generic',
+					agentId: 'agent-erin',
+					content: 'pelican note: compaction threads default to the core count',
+					visibility: 'shared',
+					createdAt: '2025-02-02T00:00:00.000Z',
+				},
+			];
+			const principals = { 'agent-erin': 'erin' };
+			const sourcePath = join(tmpDir, 'flair.jsonl');
+			const principalPath = join(tmpDir, 'principals.json');
+			const decisionsPath = join(tmpDir, 'decisions.json');
+			writeFileSync(sourcePath, flairRows.map((row) => JSON.stringify(row)).join('\n'));
+			writeFileSync(principalPath, JSON.stringify(principals));
+			const [record, generic] = classificationCandidates(flairRows, parsePrincipalMap(principals));
+			const lessonId = lessonIdFor(record.id);
+			writeFileSync(
+				decisionsPath,
+				JSON.stringify({
+					version: 1,
+					rows: [
+						{
+							id: record.id,
+							fingerprint: record.fingerprint,
+							scopes: ['customer:pelican'],
+							lesson: { title: 'Compaction stalls', content: 'pelican lesson: raise compaction threads on stalls' },
+						},
+						{ id: generic.id, fingerprint: generic.fingerprint, scopes: ['global'], lesson: null },
+					],
+				}),
+			);
+			const importArgs = [
+				...['--from-jsonl', sourcePath, '--principal-map', principalPath],
+				...['--decisions', decisionsPath, '--target', ctx.harper.httpURL],
+			];
+			const env = { AGENT_MEMORY_USER: ctx.harper.admin.username, AGENT_MEMORY_PASS: ctx.harper.admin.password };
+			const importScript = resolve(import.meta.dirname, '..', 'scripts', 'import-flair.mjs');
+
+			const first = await execNodeScript(importScript, importArgs, '', env);
+			strictEqual(first.code, 0, first.stderr);
+			const firstOutput = JSON.parse(first.stdout);
+			strictEqual(firstOutput.result.created, 2);
+			strictEqual(firstOutput.lessons.result.created, 1);
+
+			// alice reads `global` only, like a fleet worker; dave holds customer:*; carol holds customer:x only.
+			strictEqual((await call('alice', 'GET', record.id)).status, 404);
+			strictEqual((await call('carol', 'GET', record.id)).status, 404);
+			deepStrictEqual((await call('dave', 'GET', record.id)).body.memory.scopes, ['customer:pelican']);
+			ok(!(await search('alice', 'q=pelican')).some((memory) => memory.id === record.id));
+			strictEqual((await call('alice', 'GET', generic.id)).status, 200);
+			const lesson = (await call('alice', 'GET', lessonId)).body.memory;
+			deepStrictEqual(lesson.scopes, ['global']);
+			deepStrictEqual(lesson.evidence, [{ kind: 'memory', ref: record.id }]);
+			strictEqual(lesson.ownerId, 'erin');
+
+			const replay = await execNodeScript(importScript, importArgs, '', env);
+			strictEqual(replay.code, 0, replay.stderr);
+			strictEqual(JSON.parse(replay.stdout).result.unchanged, 2);
+			strictEqual(JSON.parse(replay.stdout).lessons.result.unchanged, 1);
+
+			strictEqual((await call('admin', 'DELETE', record.id, undefined, { 'If-Match': '"1"' })).status, 200);
+			const flag = (await call('dave', 'GET', lessonId)).body.memory.needsReview;
+			strictEqual(flag.cause, 'withdrawn');
+			strictEqual(flag.sourceId, record.id);
+			strictEqual((await call('alice', 'GET', lessonId)).body.memory.needsReview, null);
+
+			// The withdrawn source still compares `unchanged`, so only the status check keeps its lesson out.
+			const afterWithdrawal = await execNodeScript(importScript, importArgs, '', env);
+			strictEqual(afterWithdrawal.code, 0, afterWithdrawal.stderr);
+			deepStrictEqual(JSON.parse(afterWithdrawal.stdout).lessons, {
+				result: null,
+				skipped: [{ id: lessonId, source: record.id, reason: 'source_not_active' }],
+			});
+		} finally {
+			rmSync(tmpDir, { recursive: true, force: true });
+		}
 	});
 
 	test("never touches the host app's own Memory table in its data database", async () => {
