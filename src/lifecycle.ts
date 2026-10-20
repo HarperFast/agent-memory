@@ -455,6 +455,14 @@ function isReviewRescope(existing: any, payload: Record<string, any>, principal:
 	);
 }
 
+/**
+ * The other review exit: a flagged memory that supersedes a `global` one cannot leave `global`, so a reviewer may
+ * withdraw it instead, which restores what it superseded.
+ */
+function mayReviewWithdraw(existing: any, principal: Principal): boolean {
+	return Boolean(existing.contentFlag) && reviewsCustomerContent(principal) && canRead(existing, principal);
+}
+
 function plannedScopes(
 	payload: Record<string, any>,
 	principal: Principal,
@@ -510,14 +518,11 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 	const Memory = memoryTable();
 	ensureEmbedder(Memory);
 	const { supersession, customerContentCheck: check } = settings;
-	// Matched while planning, outside the locks; the transaction matches again only if the row changed since.
-	let matched: Map<string, string[]> | undefined;
-	const labelsFor = (text: string) => {
-		matched ??= new Map();
-		let labels = matched.get(text);
-		if (!labels) matched.set(text, (labels = matchCustomerContent(text, check.matcher)));
-		return labels;
-	};
+	const checkedFieldsChange = (record: any): boolean =>
+		(parsedTitle !== undefined && parsedTitle !== (record.title ?? null)) ||
+		(parsedContent !== undefined && parsedContent !== record.content) ||
+		(parsedTags !== undefined && !sameStringArray(parsedTags, record.tags ?? [])) ||
+		(parsedEvidence !== undefined && !sameEvidence(parsedEvidence, record.evidence ?? []));
 
 	// Planning runs again when the transaction finds the pre-read overtaken; `reembed` then guarantees a vector.
 	const newCitations = (record: any): string[] =>
@@ -549,6 +554,8 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 				? plannedScopes(payload, principal, preExisting.ownerId, preExisting.scopes)
 				: undefined;
 		const mayRevise = revisedScopes !== undefined;
+		// Matched here, outside the locks; the transaction reuses it while the row is the one it was matched against.
+		let matched: { revision: number | undefined; labels: string[] } | undefined;
 		if (check.mode === 'flag' && (planningCreate ? createScopes : revisedScopes)?.includes(GLOBAL_SCOPE)) {
 			const text = checkedText({
 				id,
@@ -557,8 +564,8 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 				tags: parsedTags ?? (planningCreate ? [] : preExisting.tags),
 				evidence: parsedEvidence ?? (planningCreate ? [] : preExisting.evidence),
 			});
-			if (planningCreate || !(preExisting.scopes ?? []).includes(GLOBAL_SCOPE) || text !== checkedText(preExisting)) {
-				labelsFor(text);
+			if (planningCreate || !(preExisting.scopes ?? []).includes(GLOBAL_SCOPE) || checkedFieldsChange(preExisting)) {
+				matched = { revision: preExisting?.revision, labels: matchCustomerContent(text, check.matcher) };
 			}
 		}
 		const writesContent =
@@ -601,11 +608,15 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 			);
 		}
 		const citedLocks = planningCreate || mayRevise ? newCitations(preExisting) : [];
-		return { planningCreate, vector, proposals, autoTargets, plannedDependents, citedLocks };
+		return { planningCreate, vector, proposals, autoTargets, plannedDependents, citedLocks, matched };
 	};
 
-	const write = (planned: Awaited<ReturnType<typeof plan>>) =>
-		withLockPlan(
+	const write = (planned: Awaited<ReturnType<typeof plan>>) => {
+		const labelsFor = (existing: any, text: () => string) =>
+			planned.matched && planned.matched.revision === existing?.revision
+				? planned.matched.labels
+				: matchCustomerContent(text(), check.matcher);
+		return withLockPlan(
 			requestContext,
 			[
 				id,
@@ -621,8 +632,9 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 				const existing = await Memory.get(id, txn);
 				const now = new Date();
 				if (existing) {
-					const reviewing = existing.ownerId !== principal.id && !principal.superUser;
-					if (reviewing) {
+					// A customer review (super_user's included) changes scopes only, so it leaves the owner's review flag alone.
+					const reviewing = existing.ownerId !== principal.id && isReviewRescope(existing, payload, principal);
+					if (existing.ownerId !== principal.id && !principal.superUser) {
 						if (!canRead(existing, principal)) {
 							throw memoryError('Memory id is not available', 409, 'id_unavailable');
 						}
@@ -702,10 +714,13 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 					locks.require(newCitations(existing));
 					const decision = decideContentFlag(
 						check,
-						{ scopes: existing.scopes ?? [], text: () => checkedText(existing), flag: existing.contentFlag ?? null },
+						{
+							scopes: existing.scopes ?? [],
+							textChanged: checkedFieldsChange(existing),
+							flag: existing.contentFlag ?? null,
+						},
 						candidate.scopes,
-						() => checkedText({ id, ...candidate }),
-						labelsFor,
+						() => labelsFor(existing, () => checkedText({ id, ...candidate })),
 						now,
 					);
 					const changes: Record<string, any> = {
@@ -790,8 +805,7 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 					check,
 					undefined,
 					scopes,
-					() => checkedText({ id, title, content, tags, evidence }),
-					labelsFor,
+					() => labelsFor(undefined, () => checkedText({ id, title, content, tags, evidence })),
 					now,
 				);
 
@@ -864,6 +878,7 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 			},
 			supersedes.length + planned.autoTargets.length > 0 ? LONG_LOCK_LEASE_MS : undefined,
 		);
+	};
 	let planned = await plan(false);
 	let outcome;
 	try {
@@ -1018,7 +1033,7 @@ export async function withdrawMemory(
 		ifMatch !== undefined &&
 		matchesIfMatch(ifMatch, planned.revision) &&
 		planned.status !== STATUS_WITHDRAWN &&
-		(planned.ownerId === principal.id || principal.superUser);
+		(planned.ownerId === principal.id || principal.superUser || mayReviewWithdraw(planned, principal));
 	const plan = mayWithdraw
 		? [id, ...(planned.supersedes ?? []), ...(await activeDependentIds(Memory, [id], requestContext))]
 		: [id];
@@ -1031,7 +1046,7 @@ export async function withdrawMemory(
 			if (!existing) throw notFound();
 			// A caller that cannot read the memory gets the same 404 as a missing one, so a write attempt does not
 			// confirm another principal's memory exists. One that can read it gets an informative 403.
-			if (existing.ownerId !== principal.id && !principal.superUser) {
+			if (existing.ownerId !== principal.id && !principal.superUser && !mayReviewWithdraw(existing, principal)) {
 				if (!canRead(existing, principal)) throw notFound();
 				throw memoryError('Only the owner can modify this memory', 403, 'not_memory_owner');
 			}

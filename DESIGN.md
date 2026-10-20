@@ -133,23 +133,25 @@ Rules:
    the caller — the resulting scopes, so revising a memory that stays `global` needs `global` write.
    `visibility: "private" | "shared"` is shorthand for `[user:<owner>]` / `[global]`; explicit
    `scopes` wins when both are given. Withdrawal is exempt.
-3. **Edit**: only the owner (or `super_user`) revises or withdraws. Read access never grants edit; a
+3. **Edit**: only the owner (or `super_user`) revises or withdraws, apart from the customer-content review
+   (rule 4). Read access never grants edit; a
    reader that is not the owner gets 403 (`not_memory_owner`), and a non-reader gets 404 on `DELETE`
    or 409 `id_unavailable` on `PUT`.
 4. **Supersede, review flags and customer-content review**: see below. They are the only writes that touch
    another principal's memory: a supersede changes only status fields (`status`, `supersededBy`, `revision`),
    a flag only `needsReview`, `needsReviewSince` and `revision`, a customer reviewer's rescope only `scopes`
-   (into `customer:` labels) and its consequences, and a confirm-scope only the content flag, `scopeConfirmed`
-   and `revision`.
+   (into `customer:` labels) and its consequences, a customer reviewer may withdraw a flagged memory, and a
+   confirm-scope changes only the content flag, `scopeConfirmed` and `revision`.
 5. **Search pushes the readable set into the query**, applied before the limit in every lane, never
    as a post-filter on a top-k. The set compiles to conditions (`src/scopes.ts` `readableConditions`):
    an `or` of `ownerId = self`, `scopes = <label>` per exact grant, and `scopes gelt [ns:, ns;)` per
    wildcard — the exact prefix range, which Harper plans from the index where `starts_with` would scan.
    Harper matches an array attribute when any element matches. For a caller not cleared for customer
-   content, a second group `or(ownerId = self, contentFlagged not_equals true)` adds the quarantine: kept
+   content, a second group `or(ownerId = self, contentFlagged not_equal true)` adds the quarantine: kept
    apart from the label group so that group's estimate stays finite and its index can still drive a narrow
-   caller's search, and `not_equals` (filter-only in Harper) because it is true for rows written before
-   `contentFlagged` existed, where `equals null` would drop them (Harper does not index an absent attribute).
+   caller's search, and `not_equal` because it is true for rows written before `contentFlagged` existed, where
+   `equals null` would drop them (Harper does not index an absent attribute). Harper runs `not_equal` as a plain
+   filter; the negated `not_equals` switches to a full index scan on its first miss, which measured 7× slower.
 
 ## Lifecycle
 
@@ -218,8 +220,8 @@ first-class operation, and the write path proposes it.
   supersedes others must still cover each non-withdrawn one.
 - **Owner-only readers are not covered**: an owner who reads the old memory only by ownership (none
   of its labels is in their readable set) sees `supersededBy` but may be unable to read the
-  replacement. Covering them would publish the replacement to a principal its author did not choose. The same
-  holds for every uncleared reader while the replacement is content-flagged (Customer content).
+  replacement. Covering them would publish the replacement to a principal its author did not choose. While the
+  replacement is content-flagged, an uncleared reader sees `supersededBy` as null (Customer content).
 - **A memory is superseded exactly while a non-withdrawn memory lists it in `supersedes`**; the newest
   such memory (by `createdAt`, then id) is its `supersededBy`. A superseder that is itself superseded
   (or expired via `validUntil`) still counts — its replacement carries the chain forward, and callers
@@ -304,7 +306,8 @@ reads `global` only (`src/patterns.ts`, `src/quarantine.ts`).
   `{ label, cidr }`, an IPv4 or IPv6 address or range). The names source is JSON `{ "<org>": ["Name", "Alias",
 ...] }`. It is read when the plugin configures (startup and every option change), never from the repository,
   and no message about it echoes its content or keys. There is deliberately no regular-expression option: the
-  text is the writer's, so matching must stay linear in it (one split into words, map lookups, `net.BlockList`).
+  text is the writer's, so matching must stay linear in it (one split into words, a token trie whose cost is
+  the longest name rather than the list's size, map lookups, `net.BlockList`).
 - **The check** reads the chosen `id` and every author-written field: title, content, tags, evidence refs and
   notes. A name matches as a whole token sequence (NFKC, lowercased, letter and digit runs), so `Acme` matches
   `acme-prod.example.com` and not `Acmeville` (in a script written without spaces, a name matches only a whole
@@ -313,8 +316,8 @@ reads `global` only (`src/patterns.ts`, `src/quarantine.ts`).
   text or newly includes `global`; import checks its created rows by pattern only, before its locks (a batch
   would otherwise start a model call per row). A match sets `contentFlag: { kind: 'possible-customer-detail',
 since, source: 'pattern', labels }` (keeping `since` while the memory stays flagged). Leaving `global` clears
-  the flag; so does a re-check that matches nothing, except that a flag is kept while a configured model
-  re-checks the text. A revise that changes neither the checked text nor `global` keeps whatever state the
+  the flag; so does a re-check that matches nothing, except that a flag is kept, without labels, while a
+  configured model re-checks the text. A revise that changes neither the checked text nor `global` keeps whatever state the
   memory is in. `mode: off` checks nothing and keeps existing flags enforced. Status-only writes never touch the
   flag. Flags are prospective: changing the names list re-checks nothing already stored.
 - **The model** (optional) runs after the write commits and never holds up its response or a lock: a strict
@@ -334,17 +337,25 @@ since, source: 'pattern', labels }` (keeping `since` while the memory stays flag
   in telling the owner at all). A flagged memory cannot be cited, pinned, watched or superseded by an uncleared
   reader (same 404 or 400 as missing), and a review flag whose source is quarantined is hidden from them. A
   flagged replacement breaks the supersession guarantee that label readers can read the replacement: they still
-  read the superseded predecessor (hidden from default search) and its `supersededBy` names an id that answers
-  404, as for an owner-only reader.
+  read the superseded predecessor (hidden from default search), with `supersededBy` shown as null because the
+  replacement's id is checked text that may name the customer.
 - **Review**: the owner clears a flag by revising the detail out or rescoping out of `global` (its own write
   grants apply). A reviewer — `super_user`, or a principal holding `customer:*` read and write — may revise
   someone else's flagged memory when the payload is only `scopes` and every resulting label is a `customer:`
-  label (the owner's `needsReview` survives it), or call confirm-scope. Ownership alone never qualifies: an owner
+  label (the owner's `needsReview` survives it), withdraw it, or call confirm-scope. Ownership alone never qualifies: an owner
   without clearance confirming its own flag would publish exactly what the flag withheld. A flagged memory that
   supersedes a `global` one cannot leave `global` (the superset rule), so its review is confirm-scope or a
   withdrawal, which restores its predecessor. `scopeConfirmed: { by, at }` describes the current text: a revise
   that re-runs the check (the checked text changed, or `global` is new) or leaves `global`, and a model flag,
   clear it, so a later mention of the same customer is flagged again.
+- **Across nodes** the locks are node-scoped (Lifecycle), so a revise that flags a memory on one node and a
+  confirm-scope or model `clean` of the same revision on another can both commit, and replication can keep the
+  revise's text with the other write's cleared flag.
+- **Cost**, measured on Harper 5.3.2 (one node, local, a loaded host, 2,000 `global` memories): the quarantine
+  group added about 0.4 ms to a 3 ms search without `q` and stayed within run-to-run noise for a hybrid search;
+  a `PUT` with the check on (2,000 organizations) was within noise of the check off. The matcher alone took
+  0.85 ms p50 for 20,000 characters against 5,000 organizations × 3 names and 64 host rules, 4.2 ms for 100,000,
+  and 1 ms for 20,000 characters of a word that starts 50,000 names.
 
 ## HTTP surface
 
@@ -456,8 +467,8 @@ Three levels, built in order:
      read check, or
    - one of the caller's own memories (`ownerId === principal.id`) is flagged `needsReview`
      (`kind: 'flagged'`, or `restored` / `created` with a newly folded `needsReview` flag visible to the
-     caller), or a create or revise newly content-flags it (the flag's `since` equals that write's
-     `author.authoredAt` / `lastEditor.revisedAt`, so editing an already flagged memory is not news; two writes in
+     caller), or a create or revise newly content-flags it (any flag on a created row; on a revise, the flag's `since`
+     equals that write's `lastEditor.revisedAt`, so editing an already flagged memory is not news; two writes in
      one millisecond can repeat the notice).
      The notification fires when "a memory you relied on changed, or your own memory needs review", not on
      every write. A watcher that cannot read a memory once it is content-flagged hears nothing more about it,

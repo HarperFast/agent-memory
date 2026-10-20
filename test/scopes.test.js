@@ -26,8 +26,7 @@ function evaluate(condition, record) {
 		return condition.operator === 'or' ? results.some(Boolean) : results.every(Boolean);
 	}
 	const value = record[condition.attribute];
-	// Negated comparators are evaluated on the whole value, and an absent attribute is not equal to anything.
-	if (condition.comparator === 'not_equals') return value !== condition.value;
+	if (condition.comparator === 'not_equal') return value !== condition.value;
 	const test = (value) => {
 		if (condition.comparator === 'equals') return value === condition.value;
 		if (condition.comparator === 'gelt') return value >= condition.value[0] && value < condition.value[1];
@@ -207,8 +206,8 @@ describe('readableConditions', () => {
 		assert.deepEqual(conditions[1], {
 			operator: 'or',
 			conditions: [
+				{ attribute: 'contentFlagged', comparator: 'not_equal', value: true },
 				{ attribute: 'ownerId', comparator: 'equals', value: 'carol' },
-				{ attribute: 'contentFlagged', comparator: 'not_equals', value: true },
 			],
 		});
 	});

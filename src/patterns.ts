@@ -3,37 +3,33 @@ import { BlockList, isIPv4, isIPv6 } from 'node:net';
 import { isAbsolute } from 'node:path';
 import { isScopeLabel } from './scopes.ts';
 
-export type ContentCheckMode = 'off' | 'flag';
-
-interface NameEntry {
-	readonly rest: readonly string[];
-	readonly label: string;
+/** A trie over name tokens: matching costs the length of the longest name, not the size of the list. */
+interface NameNode {
+	labels?: string[];
+	next?: Map<string, NameNode>;
 }
 
 interface AddressRange {
 	readonly label: string;
 	readonly list: BlockList;
-	readonly family: 'ipv4' | 'ipv6';
 }
 
 interface HostRules {
-	/** Exact host name → labels. */
 	readonly exact: ReadonlyMap<string, readonly string[]>;
-	/** `.example.com` (from `*.example.com`) → labels. */
+	/** Keyed `.example.com` for the rule `*.example.com`. */
 	readonly suffixes: ReadonlyMap<string, readonly string[]>;
 	readonly ranges: readonly AddressRange[];
 	/** Every range in one list, so an address outside all of them costs one check. */
 	readonly anyRange: BlockList;
 }
 
-export interface CustomerMatcher {
-	/** First token of a name → the remaining tokens and the `customer:<org>` label. */
-	readonly names: ReadonlyMap<string, readonly NameEntry[]>;
+interface CustomerMatcher {
+	readonly names: ReadonlyMap<string, NameNode>;
 	readonly hosts: HostRules;
 }
 
 export interface ContentCheckSettings {
-	readonly mode: ContentCheckMode;
+	readonly mode: 'off' | 'flag';
 	readonly model?: string;
 	readonly matcher: CustomerMatcher;
 }
@@ -77,7 +73,7 @@ function tokens(text: string): string[] {
 	);
 }
 
-function compileNames(source: string): Map<string, NameEntry[]> {
+function compileNames(source: string): Map<string, NameNode> {
 	let parsed: unknown;
 	try {
 		parsed = JSON.parse(source);
@@ -85,7 +81,7 @@ function compileNames(source: string): Map<string, NameEntry[]> {
 		fail(' names source is not valid JSON');
 	}
 	if (!isPlainObject(parsed)) fail(' names source must be a JSON object of organization keys to arrays of names');
-	const index = new Map<string, NameEntry[]>();
+	const root = new Map<string, NameNode>();
 	let count = 0;
 	for (const [org, names] of Object.entries(parsed)) {
 		const label = `customer:${org}`;
@@ -97,15 +93,21 @@ function compileNames(source: string): Map<string, NameEntry[]> {
 			if (typeof name !== 'string' || name.length > MAX_NAME_CHARS) {
 				fail(` names source names must be strings of at most ${MAX_NAME_CHARS} characters`);
 			}
-			const [first, ...rest] = tokens(name);
-			if (first === undefined) fail(' names source names must contain a letter or digit');
+			const words = tokens(name);
+			if (words.length === 0) fail(' names source names must contain a letter or digit');
 			if (++count > MAX_NAMES) fail(` names source holds more than ${MAX_NAMES} names`);
-			let entries = index.get(first);
-			if (!entries) index.set(first, (entries = []));
-			entries.push({ rest, label });
+			let level = root;
+			let node: NameNode | undefined;
+			for (const word of words) {
+				node = level.get(word);
+				if (!node) level.set(word, (node = {}));
+				level = node.next ??= new Map();
+			}
+			node!.labels ??= [];
+			if (!node!.labels.includes(label)) node!.labels.push(label);
 		}
 	}
-	return index;
+	return root;
 }
 
 function isHostName(name: string): boolean {
@@ -174,7 +176,7 @@ function compileHosts(value: unknown): HostRules {
 		const list = new BlockList();
 		list.addSubnet(address, prefix, family);
 		rules.anyRange.addSubnet(address, prefix, family);
-		rules.ranges.push({ label, list, family });
+		rules.ranges.push({ label, list });
 	});
 	return rules;
 }
@@ -240,32 +242,40 @@ export function checkedText(fields: {
 	].join('\n');
 }
 
-function trimEdges(word: string): string {
+/** Strips `.` and `-` from both ends, and says whether a dot was stripped from the front. */
+function trimEdges(word: string): [string, boolean] {
 	let start = 0;
 	let end = word.length;
 	while (start < end && (word[start] === '.' || word[start] === '-')) start++;
 	while (end > start && (word[end - 1] === '.' || word[end - 1] === '-')) end--;
-	return word.slice(start, end);
+	return [word.slice(start, end), start > 0 && word[start - 1] === '.'];
 }
 
 function matchHosts(text: string, rules: HostRules, labels: Set<string>): void {
 	const add = (found: readonly string[] | undefined) => found?.forEach((label) => labels.add(label));
-	for (const word of text.toLowerCase().split(/[^a-z0-9.:-]+/)) {
+	const matchAddress = (address: string, family: 'ipv4' | 'ipv6') => {
+		if (rules.ranges.length === 0 || !rules.anyRange.check(address, family)) return;
+		for (const range of rules.ranges) if (range.list.check(address, family)) labels.add(range.label);
+	};
+	for (const raw of text.toLowerCase().split(/[^a-z0-9._:-]+/)) {
+		const [word] = trimEdges(raw);
 		const colon = word.includes(':');
 		if (!colon && !word.includes('.')) continue;
-		// A port or scheme rides on a host after a colon; an IPv6 address is the whole word.
-		const candidates = colon && isIPv6(word) ? [word] : colon ? word.split(':').map(trimEdges) : [trimEdges(word)];
-		for (const candidate of candidates) {
-			const family = isIPv4(candidate) ? 'ipv4' : candidate.includes(':') ? 'ipv6' : undefined;
-			if (family) {
-				if (rules.ranges.length === 0 || !rules.anyRange.check(candidate, family)) continue;
-				for (const range of rules.ranges) {
-					if (range.family === family && range.list.check(candidate, family)) labels.add(range.label);
-				}
+		if (colon && isIPv6(word)) {
+			matchAddress(word, 'ipv6');
+			continue;
+		}
+		// A port or a scheme rides on a host after a colon.
+		for (const part of colon ? raw.split(':') : [raw]) {
+			const [candidate, leadingDot] = trimEdges(part);
+			if (isIPv4(candidate)) {
+				matchAddress(candidate, 'ipv4');
 				continue;
 			}
 			if (candidate.length > MAX_HOST_NAME_CHARS || !candidate.includes('.')) continue;
 			add(rules.exact.get(candidate));
+			// `<db>.example.com` or `*.example.com` reaches here as `.example.com`: a name under the domain.
+			if (leadingDot) add(rules.suffixes.get(`.${candidate}`));
 			for (let dot = candidate.indexOf('.', 1); dot !== -1; dot = candidate.indexOf('.', dot + 1)) {
 				add(rules.suffixes.get(candidate.slice(dot)));
 			}
@@ -278,10 +288,10 @@ export function matchCustomerContent(text: string, matcher: CustomerMatcher): st
 	if (matcher.names.size > 0) {
 		const words = tokens(text);
 		for (let i = 0; i < words.length; i++) {
-			const entries = matcher.names.get(words[i]);
-			if (!entries) continue;
-			for (const { rest, label } of entries) {
-				if (!labels.has(label) && rest.every((word, j) => words[i + 1 + j] === word)) labels.add(label);
+			let node = matcher.names.get(words[i]);
+			for (let j = i + 1; node; j++) {
+				node.labels?.forEach((label) => labels.add(label));
+				node = j < words.length ? node.next?.get(words[j]) : undefined;
 			}
 		}
 	}

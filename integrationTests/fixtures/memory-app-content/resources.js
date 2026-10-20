@@ -1,4 +1,3 @@
-// Deterministic embedding model: a hashed bag of words, so two texts are close exactly when they share words.
 function embedText(text, dimensions = 32) {
 	const vector = new Array(dimensions).fill(0);
 	vector[0] = 0.01;
@@ -24,7 +23,6 @@ models.registerBackend(
 	}),
 );
 
-// Deterministic customer-content model: answers by a marker in the memory text.
 models.registerBackend(
 	'generative',
 	'content-stub',

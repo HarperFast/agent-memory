@@ -22,7 +22,7 @@ export function contentFlagFields(flag: ContentFlag | null) {
 	return flag ? { contentFlag: flag, contentFlagged: true } : CLEARED_CONTENT_FLAG;
 }
 
-export interface FlagDecision {
+interface FlagDecision {
 	flag: ContentFlag | null;
 	modelCheck: boolean;
 	/** The check ran again or the memory left `global`, so an earlier confirm-scope no longer describes it. */
@@ -36,27 +36,28 @@ export interface FlagDecision {
  */
 export function decideContentFlag(
 	check: ContentCheckSettings,
-	previous: { scopes: readonly string[]; text: () => string; flag: ContentFlag | null } | undefined,
+	previous: { scopes: readonly string[]; textChanged: boolean; flag: ContentFlag | null } | undefined,
 	scopes: readonly string[],
-	text: () => string,
-	labelsFor: (text: string) => string[],
+	labels: () => string[],
 	now: Date,
 ): FlagDecision {
 	const current = previous?.flag ?? null;
 	if (!scopes.includes(GLOBAL_SCOPE)) return { flag: null, modelCheck: false, reviewLapsed: true };
 	const unchanged = { flag: current, modelCheck: false, reviewLapsed: false };
 	if (check.mode === 'off') return unchanged;
-	const resulting = text();
-	if (previous?.scopes.includes(GLOBAL_SCOPE) && previous.text() === resulting) return unchanged;
-	const labels = labelsFor(resulting);
-	if (labels.length > 0) {
+	if (previous?.scopes.includes(GLOBAL_SCOPE) && !previous.textChanged) return unchanged;
+	const matched = labels();
+	if (matched.length > 0) {
 		return {
-			flag: { kind: CONTENT_FLAG_KIND, since: current?.since ?? now.toISOString(), source: 'pattern', labels },
+			flag: { kind: CONTENT_FLAG_KIND, since: current?.since ?? now.toISOString(), source: 'pattern', labels: matched },
 			modelCheck: false,
 			reviewLapsed: true,
 		};
 	}
-	return { flag: check.model ? current : null, modelCheck: Boolean(check.model), reviewLapsed: true };
+	if (!check.model) return { flag: null, modelCheck: false, reviewLapsed: true };
+	// Kept for the model, without the labels the current text no longer matches.
+	const kept: ContentFlag | null = current && { kind: current.kind, since: current.since, source: current.source };
+	return { flag: kept, modelCheck: true, reviewLapsed: true };
 }
 
 const MODEL_CHECK_MAX_IN_FLIGHT = 8;

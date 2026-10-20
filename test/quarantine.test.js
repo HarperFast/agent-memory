@@ -100,6 +100,14 @@ describe('patterns', () => {
 			matchCustomerContent('localhost 127.0.0.1 10.78.0.1 zorbcloud.test db.zorb.test.example 2001:db8:78::1', matcher),
 			[],
 		);
+		for (const [text, labels] of [
+			['Connect to 2001:db8:77::9.', ['lab-ip6']],
+			['mapped as ::ffff:10.77.4.2', ['lab-ip']],
+			['each <db>.zorbcloud.test, ${env}.zorbcloud.test or *.zorbcloud.test', ['zorb-host']],
+			['prod_db.zorbcloud.test', ['zorb-host']],
+		]) {
+			assert.deepEqual(matchCustomerContent(text, matcher), labels, text);
+		}
 	});
 
 	it('matches in time linear in the text, whatever the text', () => {
@@ -108,6 +116,15 @@ describe('patterns', () => {
 			matchCustomerContent(filler.repeat(100_000 / filler.length), matcher);
 		}
 		assert.ok(performance.now() - started < 2000, `${performance.now() - started} ms`);
+	});
+
+	it('matches in time bounded by the longest name, not by how many names share a first word', () => {
+		const names = { company: Array.from({ length: 50_000 }, (_, i) => `The Company ${i}`) };
+		const check = parseContentCheck({ patterns: { namesSecret: 'N' } }, () => ({ N: JSON.stringify(names) }));
+		const started = performance.now();
+		assert.deepEqual(matchCustomerContent('The '.repeat(5000), check.matcher), []);
+		assert.deepEqual(matchCustomerContent('see the company 49999 runbook', check.matcher), ['customer:company']);
+		assert.ok(performance.now() - started < 500, `${performance.now() - started} ms`);
 	});
 
 	it('reads every author-written field and the chosen id', () => {
@@ -366,6 +383,36 @@ describe('review', () => {
 		await putMemory(id, { scopes: ['customer:zorblax'] }, dave, ifMatch(2));
 		assert.ok(stored(id).needsReview);
 		assert.equal(stored(id).contentFlag, null);
+
+		const byRoot = idFor('rescope-root');
+		await putMemory(byRoot, shared('Zorblax lesson', { evidence: [{ kind: 'memory', ref: id }] }), dave, context);
+		await withdrawMemory(id, {}, fleet, ifMatch(3));
+		assert.ok(stored(byRoot).needsReview);
+		const root = createPrincipal({ id: 'root', superUser: true });
+		await putMemory(byRoot, { scopes: ['customer:zorblax'] }, root, ifMatch(2));
+		assert.ok(stored(byRoot).needsReview);
+	});
+
+	it('lets a reviewer withdraw a flagged replacement that cannot leave global, restoring what it replaced', async () => {
+		const runbook = idFor('runbook');
+		const replacement = 'zorblax-failover-runbook';
+		await putMemory(runbook, shared('failover runbook'), fleet, context);
+		await putMemory(replacement, shared('failover runbook v2', { supersedes: [runbook] }), fleet, context);
+		assert.ok(stored(replacement).contentFlag);
+		assert.equal((await getMemory(runbook, fleet2, context)).supersededBy, null);
+		assert.equal((await getMemory(runbook, dave, context)).supersededBy, replacement);
+
+		await rejection(
+			putMemory(replacement, { scopes: ['customer:zorblax'] }, dave, ifMatch(1)),
+			403,
+			'supersede_scope_narrowing',
+		);
+		await rejection(withdrawMemory(replacement, {}, fleet2, ifMatch(1)), 404, 'memory_not_found');
+		await rejection(withdrawMemory(replacement, {}, rhea, ifMatch(1)), 403, 'not_memory_owner');
+		await withdrawMemory(replacement, { reason: 'customer detail' }, dave, ifMatch(1));
+		assert.equal(stored(runbook).status, 'active');
+		const params = { tags: [], scopes: [], limit: 10, includeSuperseded: false, includeExpired: false };
+		assert.ok((await searchMemories(params, fleet2, context)).some((memory) => memory.id === runbook));
 	});
 
 	it('confirm-scope: a customer:* writer clears it; an uncleared owner cannot', async () => {
@@ -398,7 +445,6 @@ describe('review', () => {
 		await putMemory(id, { validUntil: '2999-01-01T00:00:00Z' }, fleet, ifMatch(2));
 		assert.equal(stored(id).contentFlag, null);
 		assert.equal(stored(id).scopeConfirmed.by, 'dave');
-		// A confirmation covers the text it reviewed, not the customer it names.
 		await putMemory(id, { content: 'Zorblax production password rotation' }, fleet, ifMatch(3));
 		assert.deepEqual(stored(id).contentFlag.labels, ['customer:zorblax']);
 		assert.equal(stored(id).scopeConfirmed, null);
@@ -464,6 +510,7 @@ describe('the model check', () => {
 		models.generator = () => pending.promise;
 		await putMemory(id, { content: 'rewritten without names' }, fleet, ifMatch(1));
 		assert.ok(stored(id).contentFlag);
+		assert.equal(stored(id).contentFlag.labels, undefined);
 		pending.resolve('clean');
 		await eventually(() => stored(id).contentFlag === null);
 		assert.ok(await getMemory(id, fleet2, context));

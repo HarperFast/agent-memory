@@ -113,16 +113,20 @@ export async function forReader<T extends MemoryView>(
 	context?: object,
 	access = new Map<string, Promise<any>>(),
 ): Promise<T[]> {
+	const cleared = readsCustomerContent(principal);
 	const views =
-		readsCustomerContent(principal) || !unredacted.some((view) => (view.contentFlag as any)?.labels)
+		cleared || !unredacted.some((view) => (view.contentFlag as any)?.labels)
 			? unredacted
 			: unredacted.map(withoutFlagLabels);
-	if (principal.superUser || !views.some((view) => view.needsReview)) return [...views];
+	// Only a quarantined replacement can be unreadable to a label reader of what it supersedes.
+	const checksReplacement = (view: T) => !cleared && typeof view.supersededBy === 'string';
+	if (principal.superUser) return [...views];
+	if (!views.some((view) => view.needsReview || checksReplacement(view))) return [...views];
 	const missing = new Set<string>();
 	for (const view of views) {
 		const flag = view.needsReview as ReviewFlag | null;
-		if (!flag) continue;
-		for (const id of [flag.sourceId, flag.replacementId]) if (id && !access.has(id)) missing.add(id);
+		const ids = [flag?.sourceId, flag?.replacementId, checksReplacement(view) ? (view.supersededBy as string) : null];
+		for (const id of ids) if (id && !access.has(id)) missing.add(id);
 	}
 	if (missing.size > 0) {
 		// Cached as a promise, so a concurrent caller waits for this lookup rather than reading an unfinished one.
@@ -147,7 +151,13 @@ export async function forReader<T extends MemoryView>(
 		}
 	}
 	return Promise.all(
-		views.map(async (view) => {
+		views.map(async (shown) => {
+			let view = shown;
+			if (checksReplacement(view)) {
+				const replacement = await access.get(view.supersededBy as string);
+				// The check reads a memory's chosen id, so a quarantined replacement's id is held back like the memory.
+				if (replacement?.contentFlag && !canRead(replacement, principal)) view = { ...view, supersededBy: null };
+			}
 			const flag = view.needsReview as ReviewFlag | null;
 			if (!flag) return view;
 			const source = await access.get(flag.sourceId);

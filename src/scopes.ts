@@ -219,8 +219,9 @@ export function anyOf(conditions: Condition[]): Condition {
  * plans `gelt` from the index where it would scan for `starts_with`. Empty for super_user, who reads everything.
  *
  * The quarantine is a second group rather than a branch of the first, so the label group keeps the finite
- * estimate that lets its index drive a narrow principal's search. `not_equals` is filter-only in Harper and is
- * true for rows written before `contentFlagged` existed, where `equals null` would drop them.
+ * estimate that lets its index drive a narrow principal's search. `not_equal` is true for rows written before
+ * `contentFlagged` existed, where `equals null` would drop them (Harper does not index an absent attribute), and
+ * Harper evaluates it as a plain filter: a negated `not_equals` would switch to a full index scan on its first miss.
  */
 export function readableConditions(principal: Principal): Condition[] {
 	if (principal.superUser) return [];
@@ -231,5 +232,5 @@ export function readableConditions(principal: Principal): Condition[] {
 		labels.push({ attribute: 'scopes', comparator: 'gelt', value: [`${namespace}:`, `${namespace};`] });
 	}
 	if (readsCustomerContent(principal)) return [anyOf(labels)];
-	return [anyOf(labels), anyOf([owned, { attribute: 'contentFlagged', comparator: 'not_equals', value: true }])];
+	return [anyOf(labels), anyOf([{ attribute: 'contentFlagged', comparator: 'not_equal', value: true }, owned])];
 }

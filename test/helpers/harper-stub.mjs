@@ -52,9 +52,6 @@ function matchesCondition(record, condition) {
 				return value === condition.value;
 			case 'not_equal':
 				return value !== condition.value;
-			// Harper's negated comparator: filter-only, and true for a row that lacks the attribute.
-			case 'not_equals':
-				return value !== condition.value;
 			case 'greater_than':
 				return value instanceof Date && condition.value instanceof Date
 					? value.getTime() > condition.value.getTime()

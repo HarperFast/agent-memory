@@ -738,15 +738,13 @@ export async function subscribeMemoryEvents(
 		throw notFound();
 	}
 
-	// A create or revise sets a new content flag's `since` from the same clock reading as its own timestamp; a flag
-	// kept from before does not match, so an edit to an already flagged memory is not news (unless it lands in the
-	// same millisecond as the write that flagged it, which costs one repeated notice).
+	// Any flag on a new row is new. A revise that sets one takes its `since` from the same clock reading as its own
+	// timestamp; a flag kept from before does not match, so an edit to an already flagged memory is not news (unless it
+	// lands in the same millisecond as the write that flagged it, which costs one repeated notice).
 	const isNewContentFlag = (kind: MemoryEventKind, record: any): boolean => {
 		const since = record?.contentFlag?.since;
 		if (since === undefined) return false;
-		return kind === 'created'
-			? since === record.author?.authoredAt
-			: kind === 'revised' && since === record.lastEditor?.revisedAt;
+		return kind === 'created' || (kind === 'revised' && since === record.lastEditor?.revisedAt);
 	};
 	const isFlagEvent = (kind: MemoryEventKind, record: any): boolean =>
 		kind === 'flagged' ||

@@ -115,14 +115,10 @@ suite('@harperfast/agent-memory customer-content check over HTTP', (ctx: Context
 						if (!raw) continue;
 						try {
 							events.push(JSON.parse(raw));
-						} catch {
-							// Not a JSON frame.
-						}
+						} catch {}
 					}
 				}
-			} catch {
-				// Aborted on close.
-			}
+			} catch {}
 		})();
 		return {
 			events,
@@ -191,7 +187,6 @@ suite('@harperfast/agent-memory customer-content check over HTTP', (ctx: Context
 			database: 'memory',
 			table: 'ScopeGrant',
 			records: [
-				// The fleet's role: global only.
 				{ id: 'role:member', read: ['global'], write: ['global'] },
 				{ id: 'user:dave', read: ['customer:*'], write: ['customer:*'] },
 				{ id: 'user:rhea', read: ['customer:*'] },
