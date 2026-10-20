@@ -262,7 +262,8 @@ classifier could not decide are `customer:unclassified`, readable only by `custo
 `newOrganizations` and `slugCollisions` list the slugs to check. `--decisions` refuses a report whose
 rows no longer match the source, so re-run `--classify` after the source changes. Sources are imported
 first; a lesson goes in only when its source is stored as imported and still active (`lessons.skipped`
-lists the rest). Rows a plain import already sent as `global` come back `conflict` and keep their
+lists the rest). Re-applying never withdraws a lesson an earlier apply published: an edited lesson comes
+back `conflict`, and a removed one stays. Withdraw it in the target. Rows a plain import already sent as `global` come back `conflict` and keep their
 scopes. The `claude` classifier runs `claude -p` with your login and no tools, plugins, hooks or
 project instructions, except hooks your administrator manages. If such a hook forwards prompts, use
 `--classifier anthropic`. Owners always read their own memories, so map no Flair agent to a fleet

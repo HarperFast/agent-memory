@@ -6,7 +6,15 @@ import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { classificationCandidates, memoryIdFor, parseJsonl, parsePrincipalMap, run } from '../scripts/import-flair.mjs';
-import { CLASSIFY_SCHEMA, lessonIdFor, parseOrgMap, readDecisions, slugify } from '../scripts/lib/customer-content.mjs';
+import {
+	buildReport,
+	classifyCandidates,
+	CLASSIFY_SCHEMA,
+	lessonIdFor,
+	parseOrgMap,
+	readDecisions,
+	slugify,
+} from '../scripts/lib/customer-content.mjs';
 
 const FIXTURE = new URL('./fixtures/flair-customer-memories.jsonl', import.meta.url).pathname;
 const PRINCIPAL_MAP = new URL('./fixtures/principal-map.json', import.meta.url).pathname;
@@ -157,7 +165,7 @@ describe('import-flair --classify', () => {
 		assert.deepEqual(rowOf('c15').scopes, ['customer:unclassified']);
 		assert.deepEqual(rowOf('c16').scopes, ['customer:unclassified']);
 		assert.deepEqual(report.slugCollisions, [
-			{ slug: 'a-b-corp', names: ['A/B Corp', 'A B Corp'], rows: [id('c15'), id('c16')] },
+			{ slug: 'a-b-corp', names: ['A/B Corp', 'A B Corp'], rows: [id('c15'), id('c16')], inOrgMap: false },
 		]);
 	});
 
@@ -251,6 +259,30 @@ describe('import-flair --classify', () => {
 		assert.equal(again.calls.length, 0);
 	});
 
+	it('refuses an unwritable report directory before any model call', async () => {
+		const again = stubBackend();
+		const result = await cli([...SOURCE, '--classify', '--report', join(directory, 'missing', 'report.json')], {
+			backend: again,
+		});
+		assert.equal(result.code, 1);
+		assert.match(result.stderr, /cannot write --report: ENOENT/);
+		assert.equal(again.calls.length, 0);
+	});
+
+	it('writes no report when the classifier fails on every row', async () => {
+		const reportPath = join(directory, 'all-failed.json');
+		const broken = {
+			name: 'stub',
+			complete: async () => {
+				throw Object.assign(new Error('model backend failed: cli_not_found'), { code: 'cli_not_found' });
+			},
+		};
+		const result = await cli([...SOURCE, '--classify', '--report', reportPath], { backend: broken });
+		assert.equal(result.code, 1);
+		assert.match(result.stderr, /the classifier failed on every row \(cli_not_found\)/);
+		await assert.rejects(stat(reportPath), { code: 'ENOENT' });
+	});
+
 	it('contacts no target: --classify refuses --target and needs no target credentials', async () => {
 		const target = await stubServer(targetHandler());
 		try {
@@ -299,6 +331,7 @@ describe('import-flair --decisions', () => {
 			row('c01').lesson.title = 'Operator-edited title';
 			row('c10').lesson = null;
 			row('c14').lesson = { title: 'Added by the operator', content: 'A reviewed lesson.' };
+			row('c09').lesson = { title: 'Lesson from a superseded record', content: 'Not sent.' };
 		});
 		const target = await stubServer(
 			targetHandler({ statusFor: (rowId) => (rowId === id('c04') ? 'withdrawn' : 'active') }),
@@ -350,8 +383,10 @@ describe('import-flair --decisions', () => {
 
 			const output = JSON.parse(result.stdout);
 			assert.deepEqual(output.lessons.skipped, [
+				{ id: lessonIdFor(id('c09')), source: id('c09'), reason: 'source_not_active' },
 				{ id: lessonIdFor(id('c04')), source: id('c04'), reason: 'source_not_active' },
 			]);
+			assert.ok(!gets.some((request) => request.url === `/Memory/${id('c09')}`), 'superseded here, so no GET');
 			assert.equal(output.lessons.result.created, lessons.length);
 		} finally {
 			target.close();
@@ -393,6 +428,22 @@ describe('import-flair --decisions', () => {
 			assert.equal(output.partial, true);
 			assert.equal(output.result.created, 16);
 			assert.deepEqual(output.lessons, { result: null });
+		} finally {
+			target.close();
+		}
+	});
+
+	it('refuses a decisions file that is not a report, rather than importing everything as global', async () => {
+		const target = await stubServer(targetHandler());
+		try {
+			for (const content of ['null', 'false', '0', '""']) {
+				const decisions = join(directory, 'falsy.json');
+				await writeFile(decisions, content);
+				const result = await cli([...SOURCE, '--decisions', decisions, '--target', target.url], { env: TARGET_ENV });
+				assert.equal(result.code, 1, content);
+				assert.match(result.stderr, /version 1 classification report/);
+			}
+			assert.equal(target.requests.length, 0);
 		} finally {
 			target.close();
 		}
@@ -448,6 +499,14 @@ describe('import-flair --decisions', () => {
 			[(_edited, row) => (row('c01').lesson.id = 'x'.repeat(32)), /lesson.id is derived/],
 			[(_edited, row) => (row('c01').lesson.content = ' '), /lesson is unusable \(no_lesson\)/],
 			[(edited) => (edited.version = 2), /version 1 classification report/],
+			[
+				(_edited, row) => (row('c02').lesson = { title: 'A lesson', content: 'For a global row.' }),
+				/a lesson applies only to a customer-labeled row/,
+			],
+			[
+				(_edited, row) => (row('c01').lesson.content = 'What Zentrix Labs learned.'),
+				/names an organization this row lists/,
+			],
 		];
 		for (const [index, [edit, pattern]] of cases.entries()) {
 			const decisions = await decisionsFile(`bad-${index}.json`, edit);
@@ -459,6 +518,63 @@ describe('import-flair --decisions', () => {
 });
 
 describe('customer-content helpers', () => {
+	const candidate = (flairId, content) => ({
+		id: id(flairId),
+		flairId,
+		ownerId: 'ann',
+		content,
+		tags: [],
+		validUntil: null,
+		fingerprint: 'f',
+	});
+	const answering = (respond) => ({ name: 'stub', complete: async ({ prompt }) => respond(prompt) });
+
+	it('adds customer:unclassified when the model finds customer detail it cannot name, even beside an alias hit', async () => {
+		const [entry] = await classifyCandidates([candidate('u1', 'Zentrix said the host was down')], {
+			backend: answering(() => ({ customerSpecific: true, organizations: [], rationale: 'Unnamed party.' })),
+			orgMap: parseOrgMap({ Zentrix: 'zentrix' }),
+			concurrency: 1,
+		});
+		assert.deepEqual(entry.scopes, ['customer:unclassified', 'customer:zentrix']);
+	});
+
+	it('treats an answer with keys outside the schema as invalid', async () => {
+		const [entry] = await classifyCandidates([candidate('u2', 'note')], {
+			backend: answering(() => ({ customerSpecific: false, organizations: [], rationale: 'x', extra: 1 })),
+			orgMap: new Map(),
+			concurrency: 1,
+		});
+		assert.deepEqual(entry.scopes, ['customer:unclassified']);
+		assert.equal(entry.failure, 'invalid_answer');
+	});
+
+	it('does not let an unusable name quarantine a valid one that shares its truncated slug', async () => {
+		const entries = await classifyCandidates([candidate('u3', 'SHORT'), candidate('u4', 'LONG')], {
+			backend: answering((prompt) => ({
+				customerSpecific: true,
+				organizations: [prompt.includes('LONG') ? 'A'.repeat(250) : 'A'.repeat(64)],
+				rationale: 'x',
+			})),
+			orgMap: new Map(),
+			concurrency: 1,
+		});
+		assert.deepEqual(entries[0].scopes, [`customer:${'a'.repeat(64)}`]);
+		assert.equal(entries[1].organizations[0].source, 'unusable');
+	});
+
+	it('flags a generated slug that an org-map organization already uses', async () => {
+		const entries = await classifyCandidates([candidate('u5', 'note')], {
+			backend: answering(() => ({ customerSpecific: true, organizations: ['Zentrix!'], rationale: 'x' })),
+			orgMap: parseOrgMap({ 'Zentrix Labs': 'zentrix' }),
+			concurrency: 1,
+		});
+		assert.deepEqual(entries[0].scopes, ['customer:unclassified']);
+		const report = buildReport(entries, { source: 'flair', classifier: 'stub', statusById: new Map() });
+		assert.deepEqual(report.slugCollisions, [
+			{ slug: 'zentrix', names: ['Zentrix!'], rows: [id('u5')], inOrgMap: true },
+		]);
+	});
+
 	it('binds a decision to every mapped source field, not only the content', () => {
 		const [before] = classificationCandidates(flairRows.slice(0, 1), principalMap);
 		for (const change of [{ archived: true }, { validTo: '2030-01-01T00:00:00.000Z' }, { agentId: 'agent-bob' }]) {

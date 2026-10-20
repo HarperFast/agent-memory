@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 import { createHash } from 'node:crypto';
-import { realpathSync } from 'node:fs';
+import { constants, realpathSync } from 'node:fs';
 import { access, link, open, readFile, unlink } from 'node:fs/promises';
+import { dirname, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import {
 	buildReport,
@@ -292,12 +293,11 @@ export function mapFlairMemories(
 	return { rows, summary };
 }
 
-export function flairFingerprint(flairRow, ownerId) {
+function flairFingerprint(flairRow, ownerId) {
 	const fields = [ownerId, ...FLAIR_FIELDS.map((field) => flairRow[field] ?? null)];
 	return createHash('sha256').update(JSON.stringify(fields)).digest('hex');
 }
 
-/** The rows a plain import would send as `global`: the ones customer classification decides. */
 export function classificationCandidates(flairRows, principalMap, options) {
 	const { rows } = mapFlairMemories(flairRows, principalMap, options);
 	const flairById = new Map(flairRows.map((flairRow) => [memoryIdFor(flairRow.id), flairRow]));
@@ -477,9 +477,8 @@ async function sourceStatus(id, { target, authorization }) {
 
 // Sources go first, all of them: a lesson is sent only for a source that is stored as imported and still active,
 // so a lesson never outlives a source the target already revised, withdrew or superseded.
-async function importLessons(lessonRows, sourceResult, options) {
+async function importLessons(lessonRows, skipped, sourceResult, options) {
 	const conflicted = new Set(sourceResult.conflicts.map((conflict) => conflict.id));
-	const skipped = [];
 	const ready = [];
 	for (const row of lessonRows) {
 		const sourceId = row.evidence[0].ref;
@@ -615,13 +614,18 @@ export async function run(argv, env, { stdout = process.stdout, stderr = process
 		}
 		const target = values['dry-run'] || values.classify ? null : assertSafeUrl(values.target, '--target');
 		const targetAuthorization = target && basicAuth(env, 'AGENT_MEMORY_USER', 'AGENT_MEMORY_PASS');
-		if (values.classify && (await fileExists(values.report))) {
-			throw new Error('--report names an existing file, and a report is never overwritten (EEXIST)');
+		if (values.classify) {
+			if (await fileExists(values.report)) {
+				throw new Error('--report names an existing file, and a report is never overwritten (EEXIST)');
+			}
+			await access(dirname(resolve(values.report)), constants.W_OK).catch((error) => {
+				throw new Error(`cannot write --report: ${error.code ?? 'unwritable directory'}`);
+			});
 		}
 
 		const principalMap = parsePrincipalMap(await readJsonFile(values['principal-map'], '--principal-map'));
 		const orgMap = values['org-map'] ? parseOrgMap(await readJsonFile(values['org-map'], '--org-map')) : new Map();
-		const decisionsJson = values.decisions ? await readJsonFile(values.decisions, '--decisions') : null;
+		const decisionsJson = values.decisions && (await readJsonFile(values.decisions, '--decisions'));
 
 		let flairRows;
 		if (values.flair) {
@@ -653,6 +657,10 @@ export async function run(argv, env, { stdout = process.stdout, stderr = process
 				concurrency,
 				onProgress: progress(stderr, 'classified'),
 			});
+			if (entries.length > 0 && entries.every((entry) => entry.failure === 'classifier_error')) {
+				const codes = [...new Set(entries.map((entry) => entry.errorCode))].join(', ');
+				throw new Error(`the classifier failed on every row (${codes}); check the backend. No report was written`);
+			}
 			const scopeOverrides = new Map(entries.map((entry) => [entry.flairId, entry.scopes]));
 			const { rows, summary } = mapFlairMemories(flairRows, principalMap, { ...mapOptions, scopeOverrides });
 			const statusById = new Map(rows.map((row) => [row.id, row.status]));
@@ -682,21 +690,27 @@ export async function run(argv, env, { stdout = process.stdout, stderr = process
 		let rows;
 		let summary;
 		let lessonRows = null;
-		if (decisionsJson) {
+		const inactiveLessons = [];
+		if (values.decisions) {
 			const candidates = classificationCandidates(flairRows, principalMap, mapOptions);
 			const decisions = readDecisions(decisionsJson, candidates, { maxContentChars });
 			const scopeOverrides = new Map(
 				candidates.map((candidate) => [candidate.flairId, decisions.get(candidate.id).scopes]),
 			);
 			({ rows, summary } = mapFlairMemories(flairRows, principalMap, { ...mapOptions, scopeOverrides }));
-			lessonRows = rows
-				.filter((row) => decisions.get(row.id)?.lesson)
-				.map((row) => lessonRow(row, decisions.get(row.id).lesson));
+			lessonRows = [];
+			for (const row of rows) {
+				const lesson = decisions.get(row.id)?.lesson;
+				if (!lesson) continue;
+				const built = lessonRow(row, lesson);
+				if (row.status === 'active') lessonRows.push(built);
+				else inactiveLessons.push({ id: built.id, source: row.id, reason: 'source_not_active' });
+			}
 		} else {
 			({ rows, summary } = mapFlairMemories(flairRows, principalMap, mapOptions));
 		}
 		mappedSummary = summary;
-		const lessonCount = lessonRows && { lessons: { toImport: lessonRows.length } };
+		const lessonCount = lessonRows && { lessons: { toImport: lessonRows.length, skipped: inactiveLessons } };
 		if (values['dry-run']) {
 			stdout.write(JSON.stringify({ dryRun: true, summary, ...lessonCount }, null, '\t') + '\n');
 			return 0;
@@ -704,7 +718,7 @@ export async function run(argv, env, { stdout = process.stdout, stderr = process
 		const options = { target, authorization: targetAuthorization, batchSize, stderr };
 		sourceResult = await postBatches(rows, options);
 		const output = { dryRun: false, summary, result: sourceResult };
-		if (lessonRows) output.lessons = await importLessons(lessonRows, sourceResult, options);
+		if (lessonRows) output.lessons = await importLessons(lessonRows, inactiveLessons, sourceResult, options);
 		stdout.write(JSON.stringify(output, null, '\t') + '\n');
 		return 0;
 	} catch (error) {

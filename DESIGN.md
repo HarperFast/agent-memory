@@ -509,25 +509,29 @@ record flags the lesson (Provenance). The invariant: in this mode a non-private 
 as `global` only through an operator-reviewed decision, and every machine failure lands on
 `customer:unclassified`, never on `global`.
 
-- **Two runs**: `--classify --report <file>` proposes, writes the report, and contacts no target. The
-  operator edits the report; `--decisions <file>` imports with exactly what it says and makes no model
-  calls, so a re-run with the same file sends identical rows.
+- **Two runs**: `--classify --report <file>` proposes, writes the report, and contacts no target; a run
+  whose classifier fails on every row (a missing CLI or key) writes nothing. The operator edits the
+  report; `--decisions <file>` imports with exactly what it says and makes no model calls, so a re-run
+  with the same file sends identical rows.
 - **What is classified**: every row a plain import would send as `global`: `active`, `superseded` and
   `withdrawn` alike, because scopes outlive status. Private rows are never sent to the classifier.
 - **Labels**: one `customer:<slug>` per organization the classifier names. Names go through
   `--org-map` (alias → slug); an alias found literally in the row adds its organization even when the
-  model missed it. An unmapped name becomes `slugify(name)` and is listed for review. These fail closed to
-  `customer:unclassified`: a classifier error or an answer outside the schema, a customer-specific
-  answer with no organization, a name that yields no usable slug, a generated slug shared by two
-  different names or equal to a mapped slug (both would merge two customers' readers), and more than 16
-  organizations.
+  model missed it. An unmapped name becomes `slugify(name)` and is listed for review. A classifier error,
+  an answer outside the schema, or more than 16 organizations make the row `customer:unclassified` alone.
+  `customer:unclassified` replaces the label of a name with no usable slug, or of a generated slug shared
+  by two different names or equal to a mapped slug (either would merge two customers' readers); the
+  row keeps its other labels, because any one label grants read. It is also added when the model finds
+  customer detail but names no organization, even if an alias matched.
 - **Before links**: decided scopes enter `mapFlairMemories` before `supersedes` is resolved, so the
   reader rule above judges the labels actually sent: a customer successor of a `global` memory is
   dropped as `narrowing`.
 - **Binding**: each decision carries a fingerprint over every Flair field the mapping reads plus the
   resolved owner. A source row that changed since classification (content, tags, archive, expiry, links,
   owner) refuses the whole apply, and the decisions must cover exactly the rows that would be classified.
-  Decided scopes are `["global"]` or `customer:<slug>` labels, nothing else.
+  Decided scopes are `["global"]` or `customer:<slug>` labels, nothing else. A lesson needs a
+  customer-labeled row, must not name an organization the row lists, and is sent only for a row the
+  mapping leaves `active`.
 - **Lessons** (`--lessons`): drafted only for `active`, unexpired, customer-labeled rows; a lesson from a
   superseded or archived record would publish knowledge its author already replaced. The draft is
   dropped (and kept in the report with a reason) when it names a source organization or a mapped alias,
@@ -538,8 +542,10 @@ evidence: [{ kind: memory, ref: sourceId }], createdAt: source createdAt, validU
 - **Sources first**: every source batch commits before any lesson is sent, and a lesson is sent only if
   its source did not come back `conflict` and a super_user read shows it `active` (an `unchanged` result
   does not prove that; the import equality check ignores stored status). A source withdrawn in the target
-  between that read and the lesson batch is not caught; the import window already forbids edits.
-- **Backends** (`scripts/lib/model-backend.mjs`, shared with the other operator scripts): `claude`
+  between that read and the lesson batch is not caught; the import window already forbids edits. An
+  edited lesson comes back `conflict` and a removed one stays in the target: re-applying never withdraws
+  what an earlier apply published.
+- **Backends** (`scripts/lib/model-backend.mjs`, one interface for every backend): `claude`
   (default) runs `claude -p --safe-mode` with no tools, no MCP servers and no session persistence, the
   memory on stdin; `anthropic` calls the Messages API with `ANTHROPIC_API_KEY` at effort `medium`. Both
   return JSON-schema output that the script validates again, and a failure carries only a code.
