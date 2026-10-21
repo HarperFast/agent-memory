@@ -175,6 +175,71 @@ describe('MEMORY_RESOURCES static surface', () => {
 		);
 	});
 
+	it('routes GET candidates and POST supersedes, and answers 405 for the other verb', async () => {
+		const context = { user: superUser };
+		const id = 'mem-route-original';
+		const otherId = 'mem-route-replacement';
+		await MemoryItemResource.put(
+			queryTarget('', { id }),
+			{ title: 'alpha', content: 'alpha content for the route checks', visibility: 'shared' },
+			context,
+		);
+		await new Promise((resolve) => setTimeout(resolve, 2));
+		await MemoryItemResource.put(
+			queryTarget('', { id: otherId }),
+			{ title: 'alpha replaced', content: 'alpha content for the route checks, corrected', visibility: 'shared' },
+			context,
+		);
+		const candidates = await parse(
+			await MemoryActionResource.get(queryTarget('', { id: otherId, action: 'candidates' }), context),
+		);
+		assert.equal(candidates.status, 200);
+		assert.deepEqual(
+			candidates.body.candidates.map((candidate) => candidate.id),
+			[id],
+		);
+		const linked = await parse(
+			await MemoryActionResource.post(
+				queryTarget('', { id: otherId, action: 'supersedes' }),
+				{ ids: [id] },
+				{
+					...context,
+					headers: { 'if-match': '"1"' },
+				},
+			),
+		);
+		assert.equal(linked.status, 200, JSON.stringify(linked.body));
+		assert.deepEqual(linked.body.memory.supersedes, [id]);
+		assert.equal(linked.body.memory.revision, 2);
+		assert.equal(
+			(
+				await parse(
+					await MemoryActionResource.post(
+						queryTarget('', { id: otherId, action: 'supersedes' }),
+						{ ids: [id] },
+						context,
+					),
+				)
+			).status,
+			428,
+		);
+		for (const [verb, action] of [
+			['get', 'supersedes'],
+			['get', 'pin'],
+			['post', 'candidates'],
+		]) {
+			const target = queryTarget('', { id: otherId, action });
+			const response =
+				verb === 'get' ? MemoryActionResource.get(target, context) : MemoryActionResource.post(target, {}, context);
+			assert.equal((await parse(await response)).status, 405, `${verb} ${action}`);
+		}
+		assert.equal(
+			(await parse(await MemoryActionResource.get(queryTarget('', { id: otherId, action: 'explode' }), context)))
+				.status,
+			404,
+		);
+	});
+
 	it('consumes the HTTP entry context.authorize flag so internal table reads do not inherit Resource authorization', async () => {
 		const context = { user: { username: 'alice' }, authorize: true };
 		const searched = await parse(await MemoryResource.get(queryTarget('', { rest: '' }), context));

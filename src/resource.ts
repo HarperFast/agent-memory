@@ -7,6 +7,7 @@ import {
 	confirmMemory,
 	confirmScopeMemory,
 	getMemory,
+	linkSupersedes,
 	pinMemory,
 	putMemory,
 	unpinMemory,
@@ -16,6 +17,7 @@ import { MEMORY_MCP_METHODS, MEMORY_MCP_RESOURCES, MEMORY_MCP_TOOLS } from './mc
 import { resolvePrincipal } from './principal.ts';
 import type { Principal } from './scopes.ts';
 import { bootstrapMemories, parseBootstrapParams, parseSearchParams, searchMemories } from './search.ts';
+import { memoryCandidates } from './supersession.ts';
 
 function json(data: unknown, status = 200, extraHeaders?: Record<string, string>): Response {
 	return new Response(JSON.stringify(data), {
@@ -130,7 +132,7 @@ function scheduleFlushHeaders(context: any): void {
 	attempt(5);
 }
 
-const MEMORY_ACTIONS = ['pin', 'unpin', 'confirm', 'confirm-scope'];
+const MEMORY_ACTIONS = ['pin', 'unpin', 'confirm', 'confirm-scope', 'supersedes', 'candidates'];
 
 function rejectUnsupportedVerb(target: any): never {
 	if (target?.rest || target?.pathname) throw notFound();
@@ -298,6 +300,13 @@ export class MemoryItemResource extends MemoryEndpoint {
 export class MemoryActionResource extends MemoryEndpoint {
 	static path = '/Memory/:id/:action';
 
+	static async get(target: any, context: object) {
+		return handle('get', context, async (principal, ctx) => {
+			if (target?.action !== 'candidates') rejectUnsupportedVerb(target);
+			return json({ candidates: await memoryCandidates(String(target?.id ?? ''), principal, ctx) });
+		});
+	}
+
 	static async post(target: any, data: any, context: object) {
 		return handle('post', context, async (principal, ctx) => {
 			const id = String(target?.id ?? '');
@@ -311,8 +320,10 @@ export class MemoryActionResource extends MemoryEndpoint {
 					return json({ memory: await confirmMemory(id, input, principal, ctx) });
 				case 'confirm-scope':
 					return json({ memory: await confirmScopeMemory(id, input, principal, ctx) });
+				case 'supersedes':
+					return json({ memory: await linkSupersedes(id, input, principal, ctx) });
 				default:
-					throw notFound();
+					return rejectUnsupportedVerb(target);
 			}
 		});
 	}

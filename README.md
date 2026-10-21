@@ -107,6 +107,15 @@ Requires Harper 5.3.1 or later on RocksDB (the default).
    curl -u carol:pass -X PUT localhost:9926/Memory/<new-id> -H 'Content-Type: application/json' -d '{
      "title": "Disk saturation",
      "content": "Stalls above 20% iowait on the new kernel.", "scopes": ["customer:acme"], "supersedes": ["<id>"] }'
+
+   # or link two memories that already exist: the older ones this one may replace, then the link
+   curl -u carol:pass localhost:9926/Memory/<new-id>/candidates
+   curl -u carol:pass -X POST localhost:9926/Memory/<new-id>/supersedes -H 'Content-Type: application/json' \
+     -H 'If-Match: "1"' -d '{ "ids": ["<id>"] }'
+
+   # list every readable memory oldest first, 50 at a time: pass the last row's createdAt and id as the cursor
+   curl -u carol:pass 'localhost:9926/Memory/?order=created&limit=50'
+   curl -u carol:pass 'localhost:9926/Memory/?order=created&limit=50&after=2026-01-02T03:04:05.678Z,<last-id>'
    ```
 
 A memory the caller cannot read returns the same 404 as a missing one. `POST /Memory/import` bulk-loads
@@ -284,3 +293,39 @@ scopes. The `claude` classifier runs `claude -p` with your login and no tools, p
 project instructions, except hooks your administrator manages. If such a hook forwards prompts, use
 `--classifier anthropic`. Owners always read their own memories, so map no Flair agent to a fleet
 principal.
+
+## Supersession backfill
+
+Imported history rarely records which memory replaced which. `scripts/backfill-supersession.mjs` finds
+those pairs with the server's own supersession candidates, has a model judge each pair, and links only
+the pairs you approve. Run it from a checkout (Node 22+) on your own machine, as a `super_user` of the
+target; `--judge anthropic` also needs the checkout's dev dependencies (`npm ci`). Rules: [DESIGN.md](DESIGN.md#supersession-backfill-scriptsbackfill-supersessionmjs).
+
+```sh
+# 1. Report: judge every (newer, older) candidate pair; writes a new 0600 file, links nothing
+AGENT_MEMORY_USER=… AGENT_MEMORY_PASS=… node scripts/backfill-supersession.mjs \
+  --target https://app.example.com --report backfill-report.json
+
+# 2. Review: set "approve": true on each "supersedes" pair to link (or approve them all after reading them)
+jq '.pairs |= map(.approve = (.verdict == "supersedes"))' backfill-report.json > backfill-decisions.json
+
+# 3. Apply the approved pairs, newest replacement first; re-running links nothing new
+AGENT_MEMORY_USER=… AGENT_MEMORY_PASS=… node scripts/backfill-supersession.mjs \
+  --target https://app.example.com --apply backfill-decisions.json
+```
+
+| Option              | Meaning                                                                                                          |
+| ------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `--target <url>`    | Base URL of the app                                                                                              |
+| `--report <file>`   | Write the judged pairs to this new file (never overwritten)                                                      |
+| `--apply <file>`    | Link the approved `supersedes` pairs of an edited report                                                         |
+| `--judge <backend>` | `claude` (default: the local Claude Code CLI on your login, never an API key), `anthropic` (`ANTHROPIC_API_KEY`) |
+| `--model <id>`      | Model for the judge (default: the CLI's own default; `claude-opus-5-5` for `anthropic`)                          |
+| `--concurrency <n>` | Judge calls in flight, 1–16 (default 4)                                                                          |
+
+The report lists, per pair, both ids and titles, the similarity, the verdict and a one-sentence
+rationale, but no memory content; stdout and stderr carry only ids, counts and codes. Apply skips a pair
+whose memories changed since they were judged, or were withdrawn, and reports any link the server refused
+with its code. The `claude` judge runs the CLI with `--safe-mode`, so your CLAUDE.md, hooks and plugins
+never see the memories; if your machine has managed (policy) hooks that forward prompts, use
+`--judge anthropic`.

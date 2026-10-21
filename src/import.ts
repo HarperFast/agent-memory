@@ -19,6 +19,7 @@ import {
 	STATUS_ACTIVE,
 	STATUS_SUPERSEDED,
 	STATUS_WITHDRAWN,
+	SUPERSEDES_STORED_MAX_ITEMS,
 	toMemoryView,
 	VectorNeeded,
 	WITHDRAW_REASON_MAX_CHARS,
@@ -34,7 +35,6 @@ import { hasSinks, notifySinks } from './sinks.ts';
 const IMPORT_MAX_ROWS = 100;
 // Embedding providers cap the tokens in one request, so a batch's rows are embedded in calls of at most this size.
 const IMPORT_EMBED_CHARS = 100_000;
-const IMPORT_SUPERSEDES_MAX_ITEMS = 100;
 const ROW_FIELDS = [
 	'id',
 	'ownerId',
@@ -74,7 +74,7 @@ function validateRow(input: unknown, index: number) {
 		}
 		const status = row.status ?? STATUS_ACTIVE;
 		if (!STATUSES.includes(status)) throw badRequest(`status must be one of: ${STATUSES.join(', ')}`, 'invalid_status');
-		const supersedes = normalizeIds(row.supersedes, 'supersedes', IMPORT_SUPERSEDES_MAX_ITEMS);
+		const supersedes = normalizeIds(row.supersedes, 'supersedes', SUPERSEDES_STORED_MAX_ITEMS);
 		const supersededBy = row.supersededBy ?? null;
 		if (supersededBy !== null && !isMemoryId(supersededBy)) {
 			throw badRequest('supersededBy must be a memory id', 'invalid_supersededBy');

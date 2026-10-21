@@ -1,6 +1,7 @@
 import { beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { __test } from 'harper';
+import { importMemories } from '../dist/import.js';
 import { pinMemory, putMemory, unpinMemory, withdrawMemory } from '../dist/lifecycle.js';
 import { createPrincipal } from '../dist/scopes.js';
 import { applySettings, parseSettings } from '../dist/settings.js';
@@ -82,6 +83,37 @@ describe('parseSearchParams', () => {
 			'includeExpired=yes',
 			'watch=yes',
 			`q=${'x'.repeat(1001)}`,
+		]) {
+			assert.throws(
+				() => params(bad),
+				(error) => error.statusCode === 400,
+				bad,
+			);
+		}
+	});
+
+	it('parses the created-order cursor and refuses it with q or without order', () => {
+		const id = 'mem-cursor-row__';
+		assert.deepEqual(params(`order=created&after=2025-06-01T00:00:00.000Z,${id}&limit=50`), {
+			q: undefined,
+			tags: [],
+			scopes: [],
+			limit: 50,
+			includeSuperseded: false,
+			includeExpired: false,
+			flagged: false,
+			watch: false,
+			order: 'created',
+			after: { createdAt: new Date('2025-06-01T00:00:00.000Z'), id },
+		});
+		for (const bad of [
+			'order=updated',
+			'order=created&q=disk',
+			`after=2025-06-01T00:00:00.000Z,${id}`,
+			'order=created&after=2025-06-01T00:00:00.000Z',
+			'order=created&after=yesterday,mem-cursor-row__',
+			'order=created&after=2025-06-01T00:00:00.000Z,short',
+			`order=created&after=2025-06-01T00:00:00.000Z,${id},extra`,
 		]) {
 			assert.throws(
 				() => params(bad),
@@ -262,6 +294,77 @@ describe('searchMemories', () => {
 			comparator: 'equals',
 			value: 'local:small',
 		});
+	});
+});
+
+describe('created-order cursor', () => {
+	const at = '2025-06-01T00:00:00.000Z';
+	const rowId = (n) => `cursor-row-${String(n).padStart(2, '0')}`.padEnd(16, '_');
+	const walk = async (principal, query, limit) => {
+		const seen = [];
+		let after = '';
+		for (let page = 0; page < 20; page++) {
+			const memories = await searchMemories(params(`order=created&limit=${limit}${query}${after}`), principal, context);
+			assert.ok(memories.length <= limit);
+			seen.push(...memories.map((memory) => memory.id));
+			if (memories.length < limit) return seen;
+			const last = memories.at(-1);
+			after = `&after=${last.createdAt},${last.id}`;
+		}
+		throw new Error('walk did not end');
+	};
+
+	it('pages oldest first by createdAt then id, exactly limit rows a page, across a same-timestamp batch', async () => {
+		await importMemories(
+			{
+				rows: [
+					{ id: rowId(90), ownerId: 'alice', content: 'last', scopes: ['global'], createdAt: '2025-07-01T00:00:00Z' },
+					...[7, 3, 5, 1, 6, 2, 4].map((n) => ({
+						id: rowId(n),
+						ownerId: 'alice',
+						content: `same ${n}`,
+						scopes: ['global'],
+						createdAt: at,
+					})),
+					{ id: rowId(0), ownerId: 'alice', content: 'first', scopes: ['global'], createdAt: '2025-01-01T00:00:00Z' },
+				],
+			},
+			root,
+			context,
+		);
+		const expected = [0, 1, 2, 3, 4, 5, 6, 7, 90].map(rowId);
+		for (const limit of [1, 2, 3, 50]) assert.deepEqual(await walk(alice, '', limit), expected, `limit ${limit}`);
+		const search = __test.searchLog.at(-1).query;
+		assert.deepEqual(search.sort, { attribute: 'createdAt', next: { attribute: 'id' } });
+	});
+
+	it('pins the createdAt scan only for an unfiltered super_user walk', async () => {
+		const pinned = async (principal, query) => {
+			await searchMemories(params(`order=created${query}`), principal, context);
+			return __test.searchLog.at(-1).query.enforceExecutionOrder;
+		};
+		assert.equal(await pinned(root, ''), true);
+		assert.equal(await pinned(root, '&tag=ops'), false);
+		assert.equal(await pinned(root, '&scope=team:x'), false);
+		assert.equal(await pinned(root, '&flagged=true'), false);
+		assert.equal(await pinned(alice, ''), false);
+	});
+
+	it('keeps the readable-set and status conditions in the query', async () => {
+		await importMemories(
+			{
+				rows: [
+					{ id: rowId(1), ownerId: 'carol', content: 'secret', scopes: ['customer:x'], createdAt: at },
+					{ id: rowId(2), ownerId: 'alice', content: 'old', scopes: ['global'], createdAt: at },
+					{ id: rowId(3), ownerId: 'alice', content: 'new', scopes: ['global'], supersedes: [rowId(2)], createdAt: at },
+				],
+			},
+			root,
+			context,
+		);
+		assert.deepEqual(await walk(alice, '', 1), [rowId(3)]);
+		assert.deepEqual(await walk(alice, '&includeSuperseded=true', 1), [rowId(2), rowId(3)]);
+		assert.deepEqual(await walk(root, '&includeSuperseded=true', 1), [1, 2, 3].map(rowId));
 	});
 });
 

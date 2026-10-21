@@ -3,6 +3,7 @@ import { badRequest } from './errors.ts';
 import { recordWatches, WATCH_DEFAULT_TTL_SECONDS } from './events.ts';
 import {
 	BOOTSTRAP_PINNED_LIMIT,
+	isMemoryId,
 	memoryPinTable,
 	memoryTable,
 	STATUS_ACTIVE,
@@ -21,7 +22,7 @@ const QUERY_MAX_CHARS = 1000;
 // Both derived indexes apply commits after the fact; waiting for coverage of writes committed before the
 // search keeps a memory searchable from the moment its create returns. An index that is already current
 // does not wait.
-const INDEX_WAIT_MS = 5000;
+export const INDEX_WAIT_MS = 5000;
 const BOOTSTRAP_DEFAULT_BUDGET = 8000;
 const BOOTSTRAP_MAX_BUDGET = 100_000;
 const BOOTSTRAP_RECENT_LIMIT = 50;
@@ -66,6 +67,24 @@ export interface SearchParams {
 	includeExpired: boolean;
 	flagged?: boolean;
 	watch?: boolean;
+	order?: 'created';
+	after?: CreatedPosition;
+}
+
+export interface CreatedPosition {
+	createdAt: Date;
+	id: string;
+}
+
+// `<createdAt ISO>,<id>`: neither part can contain a comma.
+function parseCursor(value: string | null): CreatedPosition | undefined {
+	if (value === null || value === '') return undefined;
+	const [at, id, ...rest] = value.split(',');
+	const createdAt = new Date(at);
+	if (rest.length > 0 || !isMemoryId(id) || !at || Number.isNaN(createdAt.getTime())) {
+		throw badRequest('after must be "<createdAt>,<id>" from the last memory of the previous page', 'invalid_after');
+	}
+	return { createdAt, id };
 }
 
 function boundedInteger(value: string | null, field: string, fallback: number, max: number): number {
@@ -95,8 +114,15 @@ function booleanParam(params: URLSearchParams, name: string): boolean {
 export function parseSearchParams(params: URLSearchParams): SearchParams {
 	const scopes = params.getAll('scope');
 	if (!scopes.every(isScopeLabel)) throw badRequest('scope must be a scope label', 'invalid_scope_label');
-	return {
-		q: optionalQuery(params.get('q')),
+	const q = optionalQuery(params.get('q'));
+	const order = params.get('order');
+	if (order !== null && (order !== 'created' || q)) {
+		throw badRequest('order must be created, and applies only without q', 'invalid_order');
+	}
+	const after = parseCursor(params.get('after'));
+	if (after && !order) throw badRequest('after requires order=created', 'invalid_after');
+	const parsed: SearchParams = {
+		q,
 		tags: params.getAll('tag'),
 		scopes,
 		limit: boundedInteger(params.get('limit'), 'limit', SEARCH_DEFAULT_LIMIT, SEARCH_MAX_LIMIT),
@@ -105,6 +131,29 @@ export function parseSearchParams(params: URLSearchParams): SearchParams {
 		flagged: booleanParam(params, 'flagged'),
 		watch: booleanParam(params, 'watch'),
 	};
+	if (order) parsed.order = order;
+	if (after) parsed.after = after;
+	return parsed;
+}
+
+const EARLIEST = new Date(-8.64e15);
+
+export function createdOrderConditions(
+	comparator: 'less_than' | 'greater_than',
+	position: CreatedPosition,
+): Condition[] {
+	const { createdAt, id } = position;
+	return [
+		// A plain range on `createdAt` first, so Harper can scan its index from the cursor; an `or` cannot drive a scan.
+		{ attribute: 'createdAt', comparator: `${comparator}_equal`, value: createdAt },
+		{
+			operator: 'or',
+			conditions: [
+				{ attribute: 'createdAt', comparator, value: createdAt },
+				{ attribute: 'id', comparator, value: id },
+			],
+		},
+	];
 }
 
 export function unexpiredCondition(now: Date): Condition {
@@ -202,7 +251,28 @@ export async function searchMemories(
 	if (!params.q) {
 		const recent = await collect(
 			Memory.search(
-				{ conditions, sort: { attribute: 'updatedAt', descending: true }, select: VIEW_FIELDS, limit: params.limit },
+				params.order === 'created'
+					? {
+							conditions: [
+								...(params.after
+									? createdOrderConditions('greater_than', params.after)
+									: [{ attribute: 'createdAt', comparator: 'greater_than_equal', value: EARLIEST }]),
+								...conditions,
+							],
+							// A walk of everything (a super_user, no tag, scope or flagged filter) pins the createdAt range to drive the
+							// scan; a narrower listing lets Harper start from its most selective condition and sort the few rows.
+							enforceExecutionOrder:
+								principal.superUser && params.tags.length === 0 && params.scopes.length === 0 && !params.flagged,
+							sort: { attribute: 'createdAt', next: { attribute: 'id' } },
+							select: VIEW_FIELDS,
+							limit: params.limit,
+						}
+					: {
+							conditions,
+							sort: { attribute: 'updatedAt', descending: true },
+							select: VIEW_FIELDS,
+							limit: params.limit,
+						},
 				context,
 			),
 		);

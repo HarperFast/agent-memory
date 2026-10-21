@@ -155,9 +155,12 @@ export function canRead(record: ScopedRecord, principal: Principal): boolean {
 	return (record.scopes ?? []).some((label) => matches(principal.read, label));
 }
 
+export function canWrite(scopes: readonly string[], principal: Principal): boolean {
+	return principal.superUser || scopes.every((label) => matches(principal.write, label));
+}
+
 export function assertWritable(scopes: readonly string[], principal: Principal): void {
-	if (principal.superUser) return;
-	if (!scopes.every((label) => matches(principal.write, label))) {
+	if (!canWrite(scopes, principal)) {
 		throw memoryError(
 			'Principal is not permitted to write one or more of these scope labels',
 			403,

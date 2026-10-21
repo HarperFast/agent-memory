@@ -35,6 +35,21 @@ export function embedText(text, dimensions = 32) {
 	return vector;
 }
 
+const comparable = (value) => (value instanceof Date ? value.getTime() : value);
+const present = (value) => value !== null && value !== undefined;
+
+function compareBy(sort) {
+	return (a, b) => {
+		for (let order = sort; order; order = order.next) {
+			const x = comparable(a[order.attribute]);
+			const y = comparable(b[order.attribute]);
+			if (x < y) return order.descending ? 1 : -1;
+			if (x > y) return order.descending ? -1 : 1;
+		}
+		return 0;
+	};
+}
+
 function matchesCondition(record, condition) {
 	if (condition.conditions) {
 		const results = condition.conditions.map((child) => matchesCondition(record, child));
@@ -49,13 +64,19 @@ function matchesCondition(record, condition) {
 	const test = (value) => {
 		switch (comparator) {
 			case 'equals':
-				return value === condition.value;
+				return value instanceof Date || condition.value instanceof Date
+					? comparable(value) === comparable(condition.value)
+					: value === condition.value;
 			case 'not_equal':
 				return value !== condition.value;
 			case 'greater_than':
-				return value instanceof Date && condition.value instanceof Date
-					? value.getTime() > condition.value.getTime()
-					: value !== null && value !== undefined && value > condition.value;
+				return present(value) && comparable(value) > comparable(condition.value);
+			case 'less_than':
+				return present(value) && comparable(value) < comparable(condition.value);
+			case 'greater_than_equal':
+				return present(value) && comparable(value) >= comparable(condition.value);
+			case 'less_than_equal':
+				return present(value) && comparable(value) <= comparable(condition.value);
 			case 'gelt':
 				return value >= condition.value[0] && value < condition.value[1];
 			default:
@@ -195,8 +216,7 @@ class StubTable {
 				.map((record) => ({ ...record, $distance: cosineDistance(record[sort.attribute], sort.target) }))
 				.sort((a, b) => a.$distance - b.$distance);
 		} else if (sort?.attribute) {
-			const direction = sort.descending ? -1 : 1;
-			results.sort((a, b) => (a[sort.attribute] > b[sort.attribute] ? direction : -direction));
+			results.sort(compareBy(sort));
 		}
 		results = results.slice(query.offset ?? 0, (query.offset ?? 0) + (query.limit ?? Infinity));
 		// Projected as Harper does, so a reader that needs a field the query did not select sees it missing.
