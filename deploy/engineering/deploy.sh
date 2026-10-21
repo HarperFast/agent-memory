@@ -15,11 +15,14 @@ tarball="$work/$(node -e 'console.log(JSON.parse(require("fs").readFileSync(proc
 mkdir -p "$work/app/vendor"
 cp "$here/config.yaml" "$here/package.json" "$work/app/"
 cp "$tarball" "$work/app/vendor/harperfast-agent-memory.tgz"
-payload="$(tar -C "$work/app" -czf - . | base64 | tr -d '\n')"
-node -e 'process.stdout.write(JSON.stringify({operation:"deploy_component",project:"agent-memory-app",payload:process.argv[1],replicated:true,restart:true}))' "$payload" >"$work/op.json"
+tar -C "$work/app" -czf "$work/app.tgz" .
+# The payload is read from a file: as an argv string it exceeds Linux's 128 KiB per-argument limit.
+node -e 'process.stdout.write(JSON.stringify({operation:"deploy_component",project:"agent-memory-app",payload:require("fs").readFileSync(process.argv[1]).toString("base64"),replicated:true,restart:true}))' "$work/app.tgz" >"$work/op.json"
 
 echo "deploying $(basename "$tarball") via $HOST"
-scp -q -o ProxyJump=none "$work/op.json" "root@$HOST:/tmp/agent-memory-deploy-op.json"
-ssh -o ProxyJump=none "root@$HOST" "C=\$(docker ps --format '{{.Names}}' | grep -F '$MATCH' | head -1); \
-  docker exec -i \"\$C\" curl -s --unix-socket /home/harperdb/harper/operations-server http://localhost \
-  -H 'content-type: application/json' -d @- < /tmp/agent-memory-deploy-op.json; echo; rm -f /tmp/agent-memory-deploy-op.json"
+RESULT="$(ssh -o ProxyJump=none "root@$HOST" "C=\$(docker ps --format '{{.Names}}' | grep -F $(printf %q "$MATCH") | head -1); \
+  [ -n \"\$C\" ] || { echo 'no running agent-memory container' >&2; exit 1; }; \
+  docker exec -i \"\$C\" curl -sS --unix-socket /home/harperdb/harper/operations-server http://localhost \
+  -H 'content-type: application/json' -d @-" <"$work/op.json")"
+# The SSH session banner can precede the response; the operation's JSON is the last line.
+RESULT="$RESULT" node -e 'const r=JSON.parse(process.env.RESULT.trim().split("\n").pop()); console.log(JSON.stringify(r)); if (r.error) process.exit(1)'

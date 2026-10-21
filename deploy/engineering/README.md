@@ -11,7 +11,9 @@ host-manager injects the host's local vLLM as `models.embedding.default` (nomic-
   and writes its credentials to that machine's `~/.config/agent-memory/env` (mode 0600). The
   password is never printed.
 
-Root config set once per node (not part of the app): `mcp.application.mountPath: /mcp`.
+Root config set once per node (not part of the app): `mcp.application.mountPath: /mcp`, and
+`authentication.authorizeLocal: false` (the node sits behind a local TLS proxy, so loopback requests
+would otherwise be treated as `super_user`).
 
 Roles and their `ScopeGrant` rows:
 
