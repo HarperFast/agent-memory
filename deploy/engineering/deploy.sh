@@ -25,4 +25,6 @@ RESULT="$(ssh -o ProxyJump=none "root@$HOST" "C=\$(docker ps --format '{{.Names}
   docker exec -i \"\$C\" curl -sS --unix-socket /home/harperdb/harper/operations-server http://localhost \
   -H 'content-type: application/json' -d @-" <"$work/op.json")"
 # The SSH session banner can precede the response; the operation's JSON is the last line.
-RESULT="$RESULT" node -e 'const r=JSON.parse(process.env.RESULT.trim().split("\n").pop()); console.log(JSON.stringify(r)); if (r.error) process.exit(1)'
+# A peer that fails is reported only in replicated[], never as a top-level error.
+RESULT="$RESULT" node -e 'const r=JSON.parse(process.env.RESULT.trim().split("\n").pop()); console.log(JSON.stringify(r));
+if (r.error || (r.replicated ?? []).some((p) => p.status === "failed" || p.error)) process.exit(1)'
