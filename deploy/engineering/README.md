@@ -15,8 +15,8 @@ Root config set once per node (not part of the app): `mcp.application.mountPath:
 
 Roles and their `ScopeGrant` rows:
 
-| Role | Who | Read | Write |
-| --- | --- | --- | --- |
-| `eng` | engineers | `global`, `customer:*` | `global`, `customer:*` |
-| `eng-agents` | interactive agents | `global`, `customer:*` | `global`, `customer:*` |
-| `dispatch-worker` | fleet workers (separate users) | `global` | `global` |
+| Role              | Who                            | Read                   | Write                  |
+| ----------------- | ------------------------------ | ---------------------- | ---------------------- |
+| `eng`             | engineers                      | `global`, `customer:*` | `global`, `customer:*` |
+| `eng-agents`      | interactive agents             | `global`, `customer:*` | `global`, `customer:*` |
+| `dispatch-worker` | fleet workers (separate users) | `global`               | `global`               |
