@@ -1,0 +1,9 @@
+{
+	"name": "agent-memory-app",
+	"private": true,
+	"type": "module",
+	"description": "Harper engineering's shared agent-memory deployment. deploy.sh vendors the packed plugin.",
+	"dependencies": {
+		"@harperfast/agent-memory": "file:./vendor/harperfast-agent-memory.tgz"
+	}
+}
