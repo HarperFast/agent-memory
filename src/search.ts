@@ -186,6 +186,7 @@ function filterConditions(params: SearchParams, principal: Principal, now = new 
 const rejectedModels = new Set<string>();
 const EMBED_WARN_INTERVAL_MS = 60_000;
 let lastEmbedWarning = 0;
+let lastFullTextWarning = 0;
 
 export function isVectorDimensionMismatch(error: any): boolean {
 	return error?.statusCode === 400 && String(error?.message).startsWith('Search target has ');
@@ -208,6 +209,17 @@ function reportEmbedFailure(model: string, error: unknown): void {
 		`[agent-memory] query embedding failed for embeddingModel "${model}"; serving full-text results only`,
 		error,
 	);
+}
+
+function isFullTextQueryRejected(error: any): boolean {
+	return error?.statusCode === 400 && String(error?.message).startsWith("Full-text query on 'text' is invalid");
+}
+
+function reportFullTextRejected(): void {
+	const now = Date.now();
+	if (now - lastFullTextWarning < EMBED_WARN_INTERVAL_MS) return;
+	lastFullTextWarning = now;
+	logger.warn?.('[agent-memory] full-text query rejected (400); serving vector results only');
 }
 
 export async function collect(iterable: AsyncIterable<any>): Promise<any[]> {
@@ -289,12 +301,16 @@ export async function searchMemories(
 	}
 	const laneLimit = Math.min(params.limit * 2, 100);
 	let vector: ArrayLike<number> | undefined;
+	let embeddingFailed = false;
+	let embeddingError: unknown;
 	try {
 		[vector] = await models.embed(params.q, { model: embeddingModel, inputType: 'query' });
 	} catch (error) {
-		reportEmbedFailure(embeddingModel, error);
+		embeddingFailed = true;
+		embeddingError = error;
 	}
 	const vectorLane = async () => {
+		if (embeddingFailed) throw embeddingError;
 		if (!vector) return [];
 		const hits = await collect(
 			Memory.search(
@@ -311,14 +327,7 @@ export async function searchMemories(
 		rejectedModels.delete(embeddingModel);
 		return hits;
 	};
-	const [vectorHits, textHits] = await Promise.all([
-		vectorLane().catch((error) => {
-			// Harper rejects a query vector whose size differs from the index's as a client error; that means the
-			// configured model no longer matches the stored vectors, and full-text results are still good.
-			if (!isVectorDimensionMismatch(error)) throw error;
-			reportVectorLaneRejected(embeddingModel, error);
-			return [];
-		}),
+	const textLane = async () =>
 		collect(
 			Memory.search(
 				{
@@ -331,8 +340,24 @@ export async function searchMemories(
 				},
 				context,
 			),
-		),
-	]);
+		);
+	const [vectorResult, textResult] = await Promise.allSettled([vectorLane(), textLane()]);
+	if (vectorResult.status === 'rejected' && textResult.status === 'rejected') {
+		if (embeddingFailed || !isVectorDimensionMismatch(vectorResult.reason)) throw vectorResult.reason;
+		throw textResult.reason;
+	}
+	if (vectorResult.status === 'rejected') {
+		if (embeddingFailed) reportEmbedFailure(embeddingModel, vectorResult.reason);
+		else if (isVectorDimensionMismatch(vectorResult.reason)) {
+			reportVectorLaneRejected(embeddingModel, vectorResult.reason);
+		} else throw vectorResult.reason;
+	}
+	if (textResult.status === 'rejected') {
+		if (!isFullTextQueryRejected(textResult.reason)) throw textResult.reason;
+		reportFullTextRejected();
+	}
+	const vectorHits = vectorResult.status === 'fulfilled' ? vectorResult.value : [];
+	const textHits = textResult.status === 'fulfilled' ? textResult.value : [];
 	const ranked = fuse([assertReadable(vectorHits, principal), assertReadable(textHits, principal)]).slice(
 		0,
 		params.limit,

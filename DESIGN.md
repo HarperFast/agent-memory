@@ -442,13 +442,32 @@ lease, since a batch writes up to 100 rows and flags their citers inside one tra
 - `GET /Memory/?q=&tag=&scope=&limit=&includeSuperseded=&includeExpired=&watch=` — hybrid: HNSW over
   `embedding` (query embedded with the same model) and the `@fullText` index, fused with reciprocal
   rank fusion (k = 60, `2 × limit` per lane). If embedding the query string fails, search and bootstrap
-  fall back to the full-text lane and log a rate-limited warning. Both lanes carry the status, expiry (`validUntil` null
+  fall back to the full-text lane and log a rate-limited warning. A full-text query rejection (Harper's
+  400 `Full-text query on 'text' is invalid`) instead serves successful vector results, with a fixed
+  warning at most once per minute and no prompt or raw error in that warning. Empty successful results
+  count as a healthy lane; two failed lanes still error. Unexpected lane errors still propagate. When
+  both fail, an embedding failure or unexpected vector error takes precedence; a vector dimension
+  mismatch defers to the full-text error. This preserves a retryable embedding outage as 503. Lane
+  collection waits for both outcomes, including their existing index-wait bounds. Both lanes carry the status, expiry (`validUntil` null
   or `> now` unless `includeExpired=true`) and readable-scope conditions, including the customer-content
   quarantine. `scope=` narrows within the readable set; it never widens it. `flagged=true` adds the indexed
   `contentFlagged = true`, the review queue of a cleared reviewer (an uncleared caller sees only its own). Results include `supersededBy` when `includeSuperseded` is set,
   and `needsReview` under the Provenance visibility rule; withdrawn memories never appear. The vector lane has no distance cutoff, so it contributes the
   nearest readable memories whatever their distance. Passing `watch=true` records a `MemoryWatch` (with
   the default 1 h TTL) for every memory id returned in the result.
+- **Full-text query boundary** (observed locally on Harper 5.3.2, native fulltext 0.5.0):
+  `Array.from({ length: 65 }, (_, i) => 'w' + i).join(' ')` is only 249 characters but is rejected;
+  64 distinct analyzed terms succeed. Native `any` reports
+  `E_INVALID_ARGUMENT: search text produces more than 64 terms`; Harper hides that reason in its generic
+  400, which the resource would otherwise
+  normalize to 500. Period-separated terms also hit the limit; repeating one word 65 times does not.
+  Punctuation-only, single-letter, code-like and URL samples, and a single token up to 1000 characters
+  did not reject. `matches` uses `any`, so this reproduction is unrelated to prefix expansion.
+  The native runtime reports 64 query terms, 256 clauses and 65536 UTF-8 query bytes; the Memory index
+  has two text fields. Integration tests pin the 64/65 boundary and hook queries against the actual index.
+  Production's version was reported as 5.3.2, not independently inspected. Other error shapes fail closed;
+  [Harper #3447](https://github.com/HarperFast/harper/issues/3447) requests safe native diagnostics and
+  documentation of the budget.
 - `GET /Memory/?order=created&after=<createdAt>,<id>&limit=` — without `q`, lists oldest first by `createdAt`, then
   id, under the same status, expiry, tag, scope and readable-set conditions as a search. `after` is the last
   row of the previous page (`createdAt` as ISO, then id). The query leads with a plain `createdAt >= t` (a floor
@@ -770,8 +789,15 @@ needsReview, author, ownerId, scopes }` for all watched and injected memories in
   (`state.json` written via temp-file + `rename`), and updates the local read-through cache
   (`bootstrap-cache.json`). `startup` and `compact` reset `injectedIds` so bootstrap context is
   re-established; `resume` preserves `injectedIds`.
-- **Recall hook (`UserPromptSubmit`)**: truncates the submitted prompt to `QUERY_MAX_CHARS` (`1000`
-  characters) and calls `GET /Memory/?q=<prompt>&limit=<k>&watch=true` (`k` defaults to `5` via
+- **Recall hook (`UserPromptSubmit`)**: `buildRecallQuery` strips backtick/tilde fenced code blocks
+  (including an unclosed trailing fence) and URLs, normalizes Unicode with NFKC, truncates to
+  `QUERY_MAX_CHARS` (`1000` characters), then keeps at most 32 Unicode letter/number runs separated by
+  spaces. Splitting punctuation prevents code-like tokens from hiding many analyzed terms; 32 leaves
+  headroom under the measured 64-term budget. `eval-recall.mjs` uses the same builder. Empty sanitized
+  queries skip the network while still processing change notices. Code-only/URL-only prompts therefore
+  skip automatic recall; shortened text also changes embedding input, so ranking equivalence is not
+  promised. Other search clients keep their original query. The hook calls
+  `GET /Memory/?q=<query>&limit=<k>&watch=true` (`k` defaults to `5` via
   `AGENT_MEMORY_RECALL_LIMIT`, bounding per-prompt `MemoryWatch` upserts to `<= k` active hits; local RocksDB
   `eval-recall.mjs` benchmark with `watch=true`: `p50 ~ 4-8 ms`, `p95 ~ 10-18 ms`) under a single shared
   `AbortSignal` deadline (default `1500` ms via `AGENT_MEMORY_RECALL_TIMEOUT_MS`, clamped to `<= 2000` ms and

@@ -24,6 +24,14 @@ export function truncatePrompt(prompt) {
 	return text.slice(0, QUERY_MAX_CHARS);
 }
 
+export function buildRecallQuery(prompt) {
+	const text = String(prompt ?? '')
+		.replace(/(`{3,}|~{3,})[\s\S]*?(?:\1|$)/g, ' ')
+		.replace(/\b(?:https?:\/\/|ftp:\/\/|www\.)\S+/gi, ' ')
+		.normalize('NFKC');
+	return (truncatePrompt(text).match(/[\p{L}\p{N}]+/gu) ?? []).slice(0, 32).join(' ');
+}
+
 function buildChangeNotices(state, drainedEvents, recalledMemories = []) {
 	const notices = [];
 	const injectedSet = new Set(state.injectedIds);
@@ -332,7 +340,7 @@ export async function handleUserPromptSubmit(input = {}, options = {}) {
 
 	const sessionId = String(input.session_id || 'default');
 	const rawPrompt = input.prompt ?? input.user_prompt ?? '';
-	const query = truncatePrompt(rawPrompt);
+	const query = buildRecallQuery(rawPrompt);
 
 	const state = loadSessionState(config, sessionId);
 	if (state.corrupt) {

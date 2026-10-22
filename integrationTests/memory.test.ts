@@ -10,6 +10,7 @@ import { createHash } from 'node:crypto';
 import { setupHarperWithFixture, teardownHarper, type ContextWithHarper } from '@harperfast/integration-testing';
 import { getSessionPaths } from '../claude-plugin/lib/cache.mjs';
 import { resolveConfig } from '../claude-plugin/lib/config.mjs';
+import { buildRecallQuery, handleUserPromptSubmit } from '../claude-plugin/lib/hooks.mjs';
 import { classificationCandidates, parsePrincipalMap } from '../scripts/import-flair.mjs';
 import { lessonIdFor } from '../scripts/lib/customer-content.mjs';
 
@@ -1422,7 +1423,7 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 			!allToolNames.some((n) => n.endsWith('_Memory') || n.endsWith('_MemoryEvents') || n.endsWith('_MemoryMcp')),
 			`no generic table/resource tools should be auto-generated for Memory, MemoryEvents, or MemoryMcp: ${JSON.stringify(allToolNames)}`,
 		);
-		const toolNames = allToolNames.filter((n) => n !== 'get_MismatchProbe');
+		const toolNames = allToolNames.filter((n) => n !== 'get_MismatchProbe' && n !== 'get_FullTextProbe');
 		deepStrictEqual(
 			toolNames,
 			['confirm', 'confirm-scope', 'get', 'pin', 'recall', 'remember', 'revise', 'unpin', 'watch', 'withdraw'],
@@ -1858,6 +1859,99 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 			).catch(() => {});
 			await new Promise((r) => setTimeout(r, 150));
 			rmSync(tmpDir, { recursive: true, force: true });
+		}
+	});
+	async function fullTextProbe(q: string) {
+		const response = await fetch(`${ctx.harper.httpURL}/FullTextProbe/?q=${encodeURIComponent(q)}`, {
+			headers: { Authorization: basic(ctx.harper.admin.username, ctx.harper.admin.password) },
+		});
+		strictEqual(response.status, 200);
+		return response.json();
+	}
+
+	test('65 distinct full-text terms reject in Harper but search and bootstrap retain scoped vector results', async () => {
+		const terms = Array.from({ length: 65 }, (_, i) => `w${i}`);
+		deepStrictEqual(await fullTextProbe(terms.slice(0, 64).join(' ')), { statusCode: 200 });
+		deepStrictEqual(await fullTextProbe(terms.join(' ')), {
+			statusCode: 400,
+			queryRejected: true,
+		});
+		const stored = await create('alice', 'fts-visible', {
+			title: 'w0',
+			content: 'w0 recall boundary',
+			tags: ['fts-boundary'],
+		});
+		await create('bob', 'fts-private', { title: 'w0', content: 'w0 recall boundary', tags: ['fts-boundary'] });
+		for (let i = 0; i < 2; i++) {
+			const hits = await search('alice', `q=${encodeURIComponent(terms.join(' '))}&tag=fts-boundary`);
+			deepStrictEqual(
+				hits.map((hit) => hit.id),
+				[stored.id],
+			);
+		}
+		const boot = await call('alice', 'GET', `bootstrap?q=${encodeURIComponent(terms.join(' '))}`);
+		strictEqual(boot.status, 200, JSON.stringify(boot.body));
+		const logFile = join(ctx.harper.logDir ?? join(ctx.harper.dataRootDir, 'log'), 'hdb.log');
+		const deadline = Date.now() + 3000;
+		let warnings = 0;
+		do {
+			warnings = (
+				readFileSync(logFile, 'utf8').match(/full-text query rejected \(400\); serving vector results only/g) ?? []
+			).length;
+			if (warnings) break;
+			await new Promise((resolve) => setTimeout(resolve, 25));
+		} while (Date.now() < deadline);
+		strictEqual(warnings, 1, 'full-text degradation logs once per interval');
+	});
+
+	test('embedding failure plus a rejected full-text query remains a retryable error', async () => {
+		const q = 'EMBED-FAIL ' + Array.from({ length: 65 }, (_, i) => `w${i}`).join(' ');
+		const response = await call('alice', 'GET', `?q=${encodeURIComponent(q)}`);
+		strictEqual(response.status, 503, JSON.stringify(response.body));
+		strictEqual(response.body.code, 'unavailable');
+	});
+
+	test('the recall hook sends bounded queries that the real full-text index accepts', async () => {
+		const tmp = mkdtempSync(join(tmpdir(), 'agent-memory-bounded-recall-'));
+		const config = resolveConfig({
+			AGENT_MEMORY_URL: ctx.harper.httpURL,
+			AGENT_MEMORY_TOKEN: basic('alice', PASSWORD),
+			AGENT_MEMORY_CACHE_DIR: tmp,
+		});
+		await create('alice', 'fts-hook', { title: 'w0', content: 'w0 bounded hook recall' });
+		try {
+			const prompts = [
+				Array.from({ length: 65 }, (_, i) => `w${i}`).join(' '),
+				'w0 ```js\nsecret();\n``` https://example.com/private ' +
+					Array.from({ length: 65 }, (_, i) => `code${i}`).join('.'),
+				'w0 ' + Array.from({ length: 65 }, (_, i) => `記憶${i}`).join(''),
+				'w0 ' + 'abc123def camelCase snake_case Ｃａｃｈｅ ﷺ '.repeat(65),
+			];
+			for (const [i, prompt] of prompts.entries()) {
+				let requested = false;
+				const result = await handleUserPromptSubmit(
+					{ session_id: `bounded-${i}`, prompt },
+					{
+						config,
+						spawnFollower: false,
+						fetchImpl: async (url: string, options: RequestInit) => {
+							requested = true;
+							const q = new URL(url).searchParams.get('q')!;
+							strictEqual(q, buildRecallQuery(prompt));
+							ok(q.length <= 1000);
+							ok(q.split(' ').length <= 32);
+							deepStrictEqual(await fullTextProbe(q), { statusCode: 200 });
+							const response = await fetch(url, options);
+							strictEqual(response.status, 200);
+							return response;
+						},
+					},
+				);
+				ok(requested);
+				strictEqual(result.hookSpecificOutput?.hookEventName, 'UserPromptSubmit');
+			}
+		} finally {
+			rmSync(tmp, { recursive: true, force: true });
 		}
 	});
 });

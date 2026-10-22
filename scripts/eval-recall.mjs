@@ -9,7 +9,7 @@ import {
 	resolveConfig,
 	validateBaseUrl,
 } from '../claude-plugin/lib/config.mjs';
-import { truncatePrompt } from '../claude-plugin/lib/hooks.mjs';
+import { buildRecallQuery } from '../claude-plugin/lib/hooks.mjs';
 
 export function parseDatasetJsonl(content) {
 	const rows = [];
@@ -107,7 +107,7 @@ export async function evaluateRecallDataset(rows, { baseUrl, authorization, k, t
 	let errors = 0;
 
 	for (const row of rows) {
-		const query = truncatePrompt(row.prompt);
+		const query = buildRecallQuery(row.prompt);
 		const watchParam = watch ? '&watch=true' : '';
 		const url = `${baseUrl}/Memory/?q=${encodeURIComponent(query)}&limit=${encodeURIComponent(k)}${watchParam}`;
 		const start = performance.now();
@@ -116,15 +116,17 @@ export async function evaluateRecallDataset(rows, { baseUrl, authorization, k, t
 		let errorMsg;
 
 		try {
-			const response = await fetchImpl(url, {
-				method: 'GET',
-				headers: {
-					Accept: 'application/json',
-					Authorization: authorization,
-				},
-				redirect: 'error',
-				signal: AbortSignal.timeout(timeoutMs),
-			});
+			const response = query
+				? await fetchImpl(url, {
+						method: 'GET',
+						headers: {
+							Accept: 'application/json',
+							Authorization: authorization,
+						},
+						redirect: 'error',
+						signal: AbortSignal.timeout(timeoutMs),
+					})
+				: Response.json({ memories: [] });
 
 			if (!response.ok) {
 				await response.text();
