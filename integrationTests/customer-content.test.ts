@@ -262,7 +262,7 @@ suite('@harperfast/agent-memory customer-content check over HTTP', (ctx: Context
 		deepStrictEqual(Object.keys(flaggedWrite.contentFlag).sort(), ['kind', 'since', 'source']);
 		strictEqual(
 			flaggedWrite.quarantineNote,
-			'This memory is quarantined from readers without customer clearance until it has been reviewed.',
+			'This memory is quarantined from readers without customer clearance while its customer-content flag remains set.',
 		);
 		deepStrictEqual(
 			await tool('fleet', session, 'get', { id: named }),

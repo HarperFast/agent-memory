@@ -59,7 +59,7 @@ const SEARCH_MAX_LIMIT = 50;
 const SEARCH_DEFAULT_LIMIT = 10;
 const QUERY_MAX_CHARS = 1000;
 const QUARANTINE_NOTE =
-	'This memory is quarantined from readers without customer clearance until it has been reviewed.';
+	'This memory is quarantined from readers without customer clearance while its customer-content flag remains set.';
 
 function writeResult(result: {
 	id: string;

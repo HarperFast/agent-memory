@@ -558,7 +558,8 @@ as REST:
   - `remember` — create a memory (`PUT`; generates a UUID when `id` is omitted, or idempotently retries an
     identical create). `remember` and `revise` return the stored `scopes`, `status`, `needsReview` and
     `contentFlag` beside `{ id, revision, created, candidates }`; flagged writes also include a fixed
-    `quarantineNote` explaining that readers without customer clearance cannot read the memory until review.
+    `quarantineNote` explaining that readers without customer clearance cannot read the memory while its
+    customer-content flag remains set.
   - `revise` — revise an existing memory (`PUT` with required `revision` mapped to `If-Match: "<revision>"`).
   - `recall` — hybrid search (`q`, `tags`/`tag`, `scopes`/`scope`, `limit`, `includeSuperseded`,
     `includeExpired`, `flagged`, and optional `watch: true` to watch every returned id).
