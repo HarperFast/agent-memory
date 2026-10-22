@@ -29,7 +29,7 @@ export function buildRecallQuery(prompt) {
 	const text = String(prompt ?? '')
 		.slice(0, 32_000)
 		.normalize('NFKC')
-		.split('\n')
+		.split(/\r\n?|\n/)
 		.filter((line) => {
 			const marker = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
 			if (fence) {

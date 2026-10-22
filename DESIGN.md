@@ -448,7 +448,7 @@ lease, since a batch writes up to 100 rows and flags their citers inside one tra
   count as a healthy lane; two failed lanes still error. Unexpected lane errors still propagate. When
   both fail, unexpected vector errors take precedence; an embedding failure takes precedence over a
   recognized query rejection, but not an unexpected full-text error. A vector dimension mismatch
-  defers to the full-text error. This preserves a retryable embedding outage as 503. Lane
+  defers to the full-text error while retaining its model-rejection diagnostic. This preserves a retryable embedding outage as 503. Lane
   collection waits for both outcomes, including their existing index-wait bounds. Both lanes carry the status, expiry (`validUntil` null
   or `> now` unless `includeExpired=true`) and readable-scope conditions, including the customer-content
   quarantine. `scope=` narrows within the readable set; it never widens it. `flagged=true` adds the indexed

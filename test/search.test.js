@@ -278,10 +278,13 @@ describe('searchMemories', () => {
 	});
 
 	it('fails when both lanes reject, including embedding, dimension mismatch and unexpected vector errors', async () => {
-		const { databases, models } = await import('harper');
+		const { databases, models, logger } = await import('harper');
 		const Memory = databases.memory.Memory;
 		const search = Memory.search;
 		const embed = models.embed;
+		const logError = logger.error;
+		const errors = [];
+		logger.error = (...args) => errors.push(args);
 		const textError = Object.assign(new Error("Full-text query on 'text' is invalid"), { statusCode: 400 });
 		const mismatch = Object.assign(new Error('Search target has 64 dimensions'), { statusCode: 400 });
 		const unavailable = Object.assign(new Error('embedding provider unavailable'), { upstreamStatus: 503 });
@@ -305,9 +308,12 @@ describe('searchMemories', () => {
 					(error) => error === (vectorError === mismatch ? textError : vectorError),
 				);
 			}
+			assert.equal(errors.length, 1);
+			assert.match(errors[0][0], /vector search rejected/);
 		} finally {
 			Memory.search = search;
 			models.embed = embed;
+			logger.error = logError;
 		}
 	});
 

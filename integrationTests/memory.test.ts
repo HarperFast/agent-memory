@@ -91,6 +91,7 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 				join(dirname(require.resolve('harper')), 'bin', 'harper.js'),
 			// Harper otherwise treats a credential-less loopback request as super_user.
 			config: {
+				threads: { count: 1 },
 				logging: { stdStreams: true },
 				authentication: { authorizeLocal: false },
 				mcp: { application: { mountPath: '/mcp' } },

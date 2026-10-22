@@ -196,10 +196,7 @@ export function isVectorDimensionMismatch(error: any): boolean {
 export function reportVectorLaneRejected(model: string, error: Error): void {
 	if (rejectedModels.has(model)) return;
 	rejectedModels.add(model);
-	logger.error?.(
-		`[agent-memory] vector search rejected for embeddingModel "${model}"; serving full-text results only`,
-		error,
-	);
+	logger.error?.(`[agent-memory] vector search rejected for embeddingModel "${model}"`, error);
 }
 
 function reportEmbedFailure(model: string, error: unknown): void {
@@ -313,7 +310,7 @@ export async function searchMemories(
 	}
 	const vectorLane = async () => {
 		if (embeddingFailed) throw embeddingError;
-		if (!vector) throw embeddingError;
+		if (!vector) throw new Error('Query embedding returned no vector');
 		const hits = await collect(
 			Memory.search(
 				{
@@ -345,6 +342,9 @@ export async function searchMemories(
 		);
 	const [vectorResult, textResult] = await Promise.allSettled([vectorLane(), textLane()]);
 	if (vectorResult.status === 'rejected' && textResult.status === 'rejected') {
+		if (!embeddingFailed && isVectorDimensionMismatch(vectorResult.reason)) {
+			reportVectorLaneRejected(embeddingModel, vectorResult.reason);
+		}
 		if (embeddingFailed && !isFullTextQueryRejected(textResult.reason)) throw textResult.reason;
 		if (embeddingFailed || !isVectorDimensionMismatch(vectorResult.reason)) throw vectorResult.reason;
 		throw textResult.reason;

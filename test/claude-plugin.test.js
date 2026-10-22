@@ -489,6 +489,8 @@ describe('UserPromptSubmit recall hook, deduplication, timeout, and fail-safe', 
 		);
 		assert.equal(buildRecallQuery('before\n~~~js\nsecret\n~~~\nafter'), 'before after');
 		assert.equal(buildRecallQuery('disk\n```unclosed secret'), 'disk');
+		assert.equal(buildRecallQuery('Check:\r\n```js\r\nconst s = \"secretToken\";\r\n```\r\nWhy?'), 'Check Why');
+		assert.equal(buildRecallQuery('Check:\r~~~js\rsecretToken\r~~~\rWhy?'), 'Check Why');
 		assert.equal(
 			buildRecallQuery('Check:\n```js\nconst s = "```secretToken";\n```\nWhy did disk recall fail?'),
 			'Check Why did disk recall fail',
