@@ -105,9 +105,11 @@ export async function evaluateRecallDataset(rows, { baseUrl, authorization, k, t
 	const latencies = [];
 	let timeouts = 0;
 	let errors = 0;
+	let skipped = 0;
 
 	for (const row of rows) {
 		const query = buildRecallQuery(row.prompt);
+		if (!query) skipped++;
 		const watchParam = watch ? '&watch=true' : '';
 		const url = `${baseUrl}/Memory/?q=${encodeURIComponent(query)}&limit=${encodeURIComponent(k)}${watchParam}`;
 		const start = performance.now();
@@ -138,8 +140,8 @@ export async function evaluateRecallDataset(rows, { baseUrl, authorization, k, t
 					returnedIds = body.memories.map((m) => String(m?.id ?? '')).filter(Boolean);
 				}
 			}
-			const elapsed = Number((performance.now() - start).toFixed(2));
-			latencies.push(elapsed);
+			const elapsed = query ? Number((performance.now() - start).toFixed(2)) : 0;
+			if (query) latencies.push(elapsed);
 
 			const recall = computeRecallAtK(returnedIds, row.expectedIds, k);
 			results.push({
@@ -188,6 +190,7 @@ export async function evaluateRecallDataset(rows, { baseUrl, authorization, k, t
 		timeouts,
 		timeoutRate,
 		errors,
+		skipped,
 		latencyMs,
 		results,
 	};

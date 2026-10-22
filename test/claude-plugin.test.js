@@ -482,14 +482,29 @@ describe('SessionStart bootstrap hook and read-through cache', () => {
 
 describe('UserPromptSubmit recall hook, deduplication, timeout, and fail-safe', () => {
 	it('bounds recall terms after removing fences, URLs and code punctuation', async () => {
-		const { buildRecallQuery = truncatePrompt } = await import('../claude-plugin/lib/hooks.mjs');
+		const { buildRecallQuery } = await import('../claude-plugin/lib/hooks.mjs');
 		assert.equal(
-			buildRecallQuery('Explain ```js\nthrow secret\n``` disk https://example.com/a?b=c pressure'),
+			buildRecallQuery('Explain\n```js\nthrow secret\n```\ndisk https://example.com/a?b=c pressure'),
 			'Explain disk pressure',
 		);
-		assert.equal(buildRecallQuery('before ~~~js\nsecret\n~~~ after'), 'before after');
-		assert.equal(buildRecallQuery('disk ```unclosed secret'), 'disk');
+		assert.equal(buildRecallQuery('before\n~~~js\nsecret\n~~~\nafter'), 'before after');
+		assert.equal(buildRecallQuery('disk\n```unclosed secret'), 'disk');
+		assert.equal(
+			buildRecallQuery('Check:\n```js\nconst s = "```secretToken";\n```\nWhy did disk recall fail?'),
+			'Check Why did disk recall fail',
+		);
+		assert.equal(buildRecallQuery('before\n````js\n``` inner code\n`````\nafter'), 'before after');
+		assert.ok(
+			buildRecallQuery(
+				'  File "app.py", line 10\n    x = foo(bar)\n        ~~~^^^^^\nValueError: disk quota exceeded\nHow do I fix this?',
+			).includes('ValueError disk quota exceeded'),
+		);
+		assert.equal(buildRecallQuery('wrap it in ``` blocks and continue'), 'wrap it in blocks and continue');
+		assert.equal(buildRecallQuery('-'.repeat(1000) + ' disk pressure'), 'disk pressure');
+		assert.equal(buildRecallQuery('-'.repeat(32_000) + ' disk pressure'), '');
+
 		assert.equal(buildRecallQuery('www.example.com/foo !!!'), '');
+		assert.equal(buildRecallQuery('ｈｔｔｐｓ://example.com/private !!!'), '');
 		assert.equal(
 			buildRecallQuery('foo.bar() => abc123def camelCase snake_case'),
 			'foo bar abc123def camelCase snake case',
@@ -504,7 +519,7 @@ describe('UserPromptSubmit recall hook, deduplication, timeout, and fail-safe', 
 	});
 
 	it('uses the bounded query in the hook and skips empty sanitized queries', async () => {
-		const { buildRecallQuery = truncatePrompt } = await import('../claude-plugin/lib/hooks.mjs');
+		const { buildRecallQuery } = await import('../claude-plugin/lib/hooks.mjs');
 		const tmp = makeTempDir();
 		try {
 			const config = resolveConfig({
@@ -514,7 +529,7 @@ describe('UserPromptSubmit recall hook, deduplication, timeout, and fail-safe', 
 			});
 			let fetched = 0;
 			const prompt =
-				'disk ```js\nsecret\n``` https://example.com ' + Array.from({ length: 65 }, (_, i) => `w${i}`).join(' ');
+				'disk\n```js\nsecret\n```\nhttps://example.com ' + Array.from({ length: 65 }, (_, i) => `w${i}`).join(' ');
 			const fetchImpl = async (url) => {
 				fetched++;
 				assert.equal(new URL(url).searchParams.get('q'), buildRecallQuery(prompt));
@@ -1311,7 +1326,7 @@ describe('scripts/import-claude-memory.mjs', () => {
 describe('scripts/eval-recall.mjs', () => {
 	it('evaluates bounded hook queries and records empty sanitized prompts as misses without listing memories', async () => {
 		const prompt =
-			'disk https://example.com ```js\nsecret\n``` ' + Array.from({ length: 65 }, (_, i) => `w${i}`).join('.');
+			'disk https://example.com\n```js\nsecret\n```\n' + Array.from({ length: 65 }, (_, i) => `w${i}`).join('.');
 		let requests = 0;
 		const summary = await evaluateRecallDataset(
 			[
@@ -1335,6 +1350,9 @@ describe('scripts/eval-recall.mjs', () => {
 		assert.equal(requests, 1);
 		assert.equal(summary.recallAtK, 0.5);
 		assert.equal(summary.errors, 0);
+		assert.equal(summary.skipped, 1);
+		assert.equal(summary.results[1].latencyMs, 0);
+		assert.equal(summary.latencyMs.min, summary.results[0].latencyMs);
 	});
 
 	it('computes recall@k, hitRate, timeoutRate, and latency percentiles over a JSONL dataset with watch=true by default', async () => {

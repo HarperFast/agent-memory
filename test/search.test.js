@@ -335,6 +335,49 @@ describe('searchMemories', () => {
 		}
 	});
 
+	it('preserves an unexpected full-text failure during an embedding outage', async () => {
+		const { databases, models } = await import('harper');
+		const search = databases.memory.Memory.search;
+		const embed = models.embed;
+		const textError = new Error('full-text storage failed');
+		models.embed = async () => {
+			throw Object.assign(new Error('embedding rate limited'), { upstreamStatus: 429 });
+		};
+		databases.memory.Memory.search = () => {
+			throw textError;
+		};
+		try {
+			await assert.rejects(searchMemories(params('q=disk'), alice, context), (error) => error === textError);
+		} finally {
+			databases.memory.Memory.search = search;
+			models.embed = embed;
+		}
+	});
+
+	it('counts an empty embedding response as a failed vector lane', async () => {
+		const stored = await create(alice, 'disk empty embedding');
+		const { databases, models } = await import('harper');
+		const search = databases.memory.Memory.search;
+		const embed = models.embed;
+		try {
+			for (const vectors of [[], [undefined], [[]]]) {
+				models.embed = async () => vectors;
+				databases.memory.Memory.search = search;
+				assert.deepEqual(
+					(await searchMemories(params('q=disk'), alice, context)).map((hit) => hit.id),
+					[stored.id],
+				);
+				databases.memory.Memory.search = () => {
+					throw Object.assign(new Error("Full-text query on 'text' is invalid"), { statusCode: 400 });
+				};
+				await assert.rejects(searchMemories(params('q=disk'), alice, context), /Query embedding returned no vector/);
+			}
+		} finally {
+			databases.memory.Memory.search = search;
+			models.embed = embed;
+		}
+	});
+
 	it('serves full-text results when query embedding fails', async () => {
 		const stored = await create(alice, 'disk outage', { content: 'disk pressure during embedder outage' });
 		const { models } = await import('harper');

@@ -1922,9 +1922,9 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 		try {
 			const prompts = [
 				Array.from({ length: 65 }, (_, i) => `w${i}`).join(' '),
-				'w0 ```js\nsecret();\n``` https://example.com/private ' +
+				'w0\n```js\nconst s = \"```secretToken\";\n```\nhttps://example.com/private ' +
 					Array.from({ length: 65 }, (_, i) => `code${i}`).join('.'),
-				'w0 ' + Array.from({ length: 65 }, (_, i) => `記憶${i}`).join(''),
+				'w0 ' + Array.from({ length: 100 }, (_, i) => String.fromCodePoint(0x4e00 + i)).join(''),
 				'w0 ' + 'abc123def camelCase snake_case Ｃａｃｈｅ ﷺ '.repeat(65),
 			];
 			for (const [i, prompt] of prompts.entries()) {

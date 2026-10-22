@@ -184,10 +184,11 @@ function filterConditions(params: SearchParams, principal: Principal, now = new 
 }
 
 const rejectedModels = new Set<string>();
-const EMBED_WARN_INTERVAL_MS = 60_000;
+const LANE_WARN_INTERVAL_MS = 60_000;
 let lastEmbedWarning = 0;
 let lastFullTextWarning = 0;
 
+// Harper's fixed-dimension HNSW index rejects incompatible query vectors; full-text remains usable.
 export function isVectorDimensionMismatch(error: any): boolean {
 	return error?.statusCode === 400 && String(error?.message).startsWith('Search target has ');
 }
@@ -203,7 +204,7 @@ export function reportVectorLaneRejected(model: string, error: Error): void {
 
 function reportEmbedFailure(model: string, error: unknown): void {
 	const now = Date.now();
-	if (now - lastEmbedWarning < EMBED_WARN_INTERVAL_MS) return;
+	if (now - lastEmbedWarning < LANE_WARN_INTERVAL_MS) return;
 	lastEmbedWarning = now;
 	logger.warn?.(
 		`[agent-memory] query embedding failed for embeddingModel "${model}"; serving full-text results only`,
@@ -217,7 +218,7 @@ function isFullTextQueryRejected(error: any): boolean {
 
 function reportFullTextRejected(): void {
 	const now = Date.now();
-	if (now - lastFullTextWarning < EMBED_WARN_INTERVAL_MS) return;
+	if (now - lastFullTextWarning < LANE_WARN_INTERVAL_MS) return;
 	lastFullTextWarning = now;
 	logger.warn?.('[agent-memory] full-text query rejected (400); serving vector results only');
 }
@@ -305,13 +306,14 @@ export async function searchMemories(
 	let embeddingError: unknown;
 	try {
 		[vector] = await models.embed(params.q, { model: embeddingModel, inputType: 'query' });
+		if (!vector?.length) throw new Error('Query embedding returned no vector');
 	} catch (error) {
 		embeddingFailed = true;
 		embeddingError = error;
 	}
 	const vectorLane = async () => {
 		if (embeddingFailed) throw embeddingError;
-		if (!vector) return [];
+		if (!vector) throw embeddingError;
 		const hits = await collect(
 			Memory.search(
 				{
@@ -343,6 +345,7 @@ export async function searchMemories(
 		);
 	const [vectorResult, textResult] = await Promise.allSettled([vectorLane(), textLane()]);
 	if (vectorResult.status === 'rejected' && textResult.status === 'rejected') {
+		if (embeddingFailed && !isFullTextQueryRejected(textResult.reason)) throw textResult.reason;
 		if (embeddingFailed || !isVectorDimensionMismatch(vectorResult.reason)) throw vectorResult.reason;
 		throw textResult.reason;
 	}

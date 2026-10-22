@@ -444,10 +444,11 @@ lease, since a batch writes up to 100 rows and flags their citers inside one tra
   rank fusion (k = 60, `2 × limit` per lane). If embedding the query string fails, search and bootstrap
   fall back to the full-text lane and log a rate-limited warning. A full-text query rejection (Harper's
   400 `Full-text query on 'text' is invalid`) instead serves successful vector results, with a fixed
-  warning at most once per minute and no prompt or raw error in that warning. Empty successful results
+  warning at most once per minute per worker thread and no prompt or raw error in that warning. Empty successful results
   count as a healthy lane; two failed lanes still error. Unexpected lane errors still propagate. When
-  both fail, an embedding failure or unexpected vector error takes precedence; a vector dimension
-  mismatch defers to the full-text error. This preserves a retryable embedding outage as 503. Lane
+  both fail, unexpected vector errors take precedence; an embedding failure takes precedence over a
+  recognized query rejection, but not an unexpected full-text error. A vector dimension mismatch
+  defers to the full-text error. This preserves a retryable embedding outage as 503. Lane
   collection waits for both outcomes, including their existing index-wait bounds. Both lanes carry the status, expiry (`validUntil` null
   or `> now` unless `includeExpired=true`) and readable-scope conditions, including the customer-content
   quarantine. `scope=` narrows within the readable set; it never widens it. `flagged=true` adds the indexed
@@ -789,13 +790,14 @@ needsReview, author, ownerId, scopes }` for all watched and injected memories in
   (`state.json` written via temp-file + `rename`), and updates the local read-through cache
   (`bootstrap-cache.json`). `startup` and `compact` reset `injectedIds` so bootstrap context is
   re-established; `resume` preserves `injectedIds`.
-- **Recall hook (`UserPromptSubmit`)**: `buildRecallQuery` strips backtick/tilde fenced code blocks
-  (including an unclosed trailing fence) and URLs, normalizes Unicode with NFKC, truncates to
-  `QUERY_MAX_CHARS` (`1000` characters), then keeps at most 32 Unicode letter/number runs separated by
-  spaces. Splitting punctuation prevents code-like tokens from hiding many analyzed terms; 32 leaves
+- **Recall hook (`UserPromptSubmit`)**: `buildRecallQuery` inspects at most the first 32000 prompt characters,
+  normalizes Unicode with NFKC, then strips line-delimited backtick/tilde fenced code blocks (including
+  an unclosed trailing fence) and URLs. Inline fence markers and diagnostic underlines remain prose;
+  markers inside a code line do not close a block. It keeps at most 32 Unicode letter/number runs,
+  joins them with spaces and truncates to `QUERY_MAX_CHARS` (`1000` characters) without a dangling surrogate. Splitting punctuation prevents code-like tokens from hiding many analyzed terms; 32 leaves
   headroom under the measured 64-term budget. `eval-recall.mjs` uses the same builder. Empty sanitized
   queries skip the network while still processing change notices. Code-only/URL-only prompts therefore
-  skip automatic recall; shortened text also changes embedding input, so ranking equivalence is not
+  skip automatic recall, as does a prompt whose first 32000 characters contain no usable prose; shortened text also changes embedding input, so ranking equivalence is not
   promised. Other search clients keep their original query. The hook calls
   `GET /Memory/?q=<query>&limit=<k>&watch=true` (`k` defaults to `5` via
   `AGENT_MEMORY_RECALL_LIMIT`, bounding per-prompt `MemoryWatch` upserts to `<= k` active hits; local RocksDB
@@ -866,9 +868,9 @@ needsReview, author, ownerId, scopes }` for all watched and injected memories in
     converting `[[name]]` wikilinks to `{ kind: 'memory', ref }` evidence via a two-pass `PUT /Memory/<id>`
     write (`If-Match` on pass 2 when forward/cyclic links exist).
   - `scripts/eval-recall.mjs`: evaluates a JSONL dataset of `{ prompt, expectedIds }` against the recall
-    hook's exact search query (`GET /Memory/?q=<prompt>&limit=<k>&watch=true` by default; `--no-watch` to opt
-    out), reporting `recall@k`, hit rate, timeout rate, and full-response latency percentiles (`min`, `p50`,
-    `p95`, `max`, `mean` ms).
+    hook's exact search query (`GET /Memory/?q=<query>&limit=<k>&watch=true` by default; `--no-watch` to opt
+    out), reporting `recall@k`, hit rate, timeout rate, skipped-query count, and requested-response latency percentiles (`min`, `p50`,
+    `p95`, `max`, `mean` ms), excluding skipped queries from the latency distribution.
 
 ## Not in v0
 

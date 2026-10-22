@@ -25,11 +25,29 @@ export function truncatePrompt(prompt) {
 }
 
 export function buildRecallQuery(prompt) {
+	let fence;
 	const text = String(prompt ?? '')
-		.replace(/(`{3,}|~{3,})[\s\S]*?(?:\1|$)/g, ' ')
-		.replace(/\b(?:https?:\/\/|ftp:\/\/|www\.)\S+/gi, ' ')
-		.normalize('NFKC');
-	return (truncatePrompt(text).match(/[\p{L}\p{N}]+/gu) ?? []).slice(0, 32).join(' ');
+		.slice(0, 32_000)
+		.normalize('NFKC')
+		.split('\n')
+		.filter((line) => {
+			const marker = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+			if (fence) {
+				if (marker && marker[1][0] === fence[0] && marker[1].length >= fence.length && /^\s*$/.test(marker[2])) {
+					fence = undefined;
+				}
+				return false;
+			}
+			if (marker && (marker[1][0] !== '`' || !marker[2].includes('`'))) {
+				fence = marker[1];
+				return false;
+			}
+			return true;
+		})
+		.join(' ')
+		.replace(/\b(?:https?:\/\/|ftp:\/\/|www\.)\S+/gi, ' ');
+	const query = (text.match(/[\p{L}\p{N}]+/gu) ?? []).slice(0, 32).join(' ');
+	return truncatePrompt(query).replace(/[\uD800-\uDBFF]$/, '');
 }
 
 function buildChangeNotices(state, drainedEvents, recalledMemories = []) {
