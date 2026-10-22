@@ -58,6 +58,29 @@ const RECALL_FIELDS = [
 const SEARCH_MAX_LIMIT = 50;
 const SEARCH_DEFAULT_LIMIT = 10;
 const QUERY_MAX_CHARS = 1000;
+const QUARANTINE_NOTE =
+	'This memory is quarantined from readers without customer clearance until it has been reviewed.';
+
+function writeResult(result: {
+	id: string;
+	revision: number;
+	created: boolean;
+	candidates: unknown[];
+	memory: Record<string, unknown>;
+}) {
+	const { id, revision, created, candidates, memory } = result;
+	return {
+		id,
+		revision,
+		created,
+		candidates,
+		scopes: memory.scopes,
+		status: memory.status,
+		contentFlag: memory.contentFlag,
+		...(memory.contentFlag ? { quarantineNote: QUARANTINE_NOTE } : {}),
+		needsReview: memory.needsReview,
+	};
+}
 
 const EVIDENCE_ITEM_SCHEMA = {
 	type: 'object',
@@ -357,14 +380,8 @@ export const MEMORY_MCP_METHODS = {
 			const payload = rejectUnknownFields(params, REMEMBER_FIELDS, 'remember');
 			const { id: rawId, ...body } = payload;
 			const id = rawId === undefined || rawId === null ? randomUUID() : rawId;
-			const {
-				id: memoryId,
-				revision,
-				created,
-				memory,
-				candidates,
-			} = await putMemory(id, body, principal, mcpLifecycleContext(ctx));
-			return { id: memoryId, revision, created, candidates, contentFlag: memory.contentFlag };
+			const result = await putMemory(id, body, principal, mcpLifecycleContext(ctx));
+			return writeResult(result);
 		});
 	},
 
@@ -382,14 +399,8 @@ export const MEMORY_MCP_METHODS = {
 				throw memoryError('If-Match header is required to revise an existing memory', 428, 'if_match_required');
 			}
 			const ifMatch = formatRevision(revision);
-			const {
-				id: memoryId,
-				revision: nextRevision,
-				created,
-				memory,
-				candidates,
-			} = await putMemory(id, body, principal, mcpLifecycleContext(ctx, ifMatch));
-			return { id: memoryId, revision: nextRevision, created, candidates, contentFlag: memory.contentFlag };
+			const result = await putMemory(id, body, principal, mcpLifecycleContext(ctx, ifMatch));
+			return writeResult(result);
 		});
 	},
 

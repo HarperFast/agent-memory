@@ -245,6 +245,25 @@ suite('@harperfast/agent-memory customer-content check over HTTP', (ctx: Context
 		deepStrictEqual((await search('owner', 'flagged=true')).sort(), [addressed, hosted, named].sort());
 
 		const session = await mcpSession('fleet');
+		const ownerSession = await mcpSession('owner');
+		const flaggedWriteId = memId('mcp-flagged-write');
+		const flaggedWrite = JSON.parse(
+			(
+				await tool('owner', ownerSession, 'remember', {
+					id: flaggedWriteId,
+					title: 'MCP flagged write',
+					content: 'Zorblax replication is scheduled for Tuesday',
+					visibility: 'shared',
+				})
+			).content[0].text,
+		);
+		strictEqual(flaggedWrite.status, 'active');
+		deepStrictEqual(flaggedWrite.scopes, ['global']);
+		deepStrictEqual(Object.keys(flaggedWrite.contentFlag).sort(), ['kind', 'since', 'source']);
+		strictEqual(
+			flaggedWrite.quarantineNote,
+			'This memory is quarantined from readers without customer clearance until it has been reviewed.',
+		);
 		deepStrictEqual(
 			await tool('fleet', session, 'get', { id: named }),
 			await tool('fleet', session, 'get', { id: memId('mcp-missing') }),

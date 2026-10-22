@@ -982,7 +982,16 @@ describe('MCP tools and custom resource on MemoryMcpResource', () => {
 			{ id: explicitId, title: 'explicit', content: 'initial content', visibility: 'shared' },
 			aliceCtx,
 		);
-		assert.deepEqual(created, { id: explicitId, revision: 1, created: true, candidates: [], contentFlag: null });
+		assert.deepEqual(created, {
+			id: explicitId,
+			revision: 1,
+			created: true,
+			candidates: [],
+			scopes: ['global'],
+			status: 'active',
+			contentFlag: null,
+			needsReview: null,
+		});
 
 		const retry = await resource.mcpRemember(
 			{ id: explicitId, title: 'explicit', content: 'initial content', visibility: 'shared' },
@@ -999,7 +1008,16 @@ describe('MCP tools and custom resource on MemoryMcpResource', () => {
 		);
 
 		const revised = await resource.mcpRevise({ id: explicitId, revision: 1, content: 'revised via mcp' }, aliceCtx);
-		assert.deepEqual(revised, { id: explicitId, revision: 2, created: false, candidates: [], contentFlag: null });
+		assert.deepEqual(revised, {
+			id: explicitId,
+			revision: 2,
+			created: false,
+			candidates: [],
+			scopes: ['global'],
+			status: 'active',
+			contentFlag: null,
+			needsReview: null,
+		});
 
 		await assert.rejects(
 			() => resource.mcpRevise({ id: explicitId, revision: 1, content: 'stale' }, aliceCtx),
