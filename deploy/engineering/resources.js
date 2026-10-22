@@ -15,5 +15,5 @@ models.registerBackend(
 			const output = await models.embed(texts, { model: 'default', signal: opts?.signal });
 			return { status: 'completed', output };
 		},
-	})
+	}),
 );
