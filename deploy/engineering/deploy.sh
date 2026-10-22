@@ -13,7 +13,7 @@ trap 'rm -rf "$work"' EXIT
 (cd "$repo" && npm run build >/dev/null && npm pack --pack-destination "$work" --json >"$work/pack.json")
 tarball="$work/$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1]))[0].filename)' "$work/pack.json")"
 mkdir -p "$work/app/vendor"
-cp "$here/config.yaml" "$here/package.json" "$work/app/"
+cp "$here/config.yaml" "$here/package.json" "$here/resources.js" "$work/app/"
 cp "$tarball" "$work/app/vendor/harperfast-agent-memory.tgz"
 tar -C "$work/app" -czf "$work/app.tgz" .
 # The payload is read from a file: as an argv string it exceeds Linux's 128 KiB per-argument limit.

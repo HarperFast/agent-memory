@@ -2,8 +2,12 @@
 # The plugin brings its tables, resources and MCP surface; identity is Harper users and roles.
 # models.embedding.default / models.generative.default come from the GPU host's local vLLM
 # (injected into the root config by host-manager), so the plugin's "default" model names resolve there.
+jsResource:
+  files: 'resources.js'
+
 '@harperfast/agent-memory':
   package: '@harperfast/agent-memory'
+  embeddingModel: nomic-prefixed
   mcp: true
   supersession:
     mode: suggest
