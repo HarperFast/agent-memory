@@ -10,7 +10,7 @@ Shared, permissioned, live memory for agents and people, as a Harper plugin.
 - Customer-content flag: a `global` write that names a configured customer, or matches a configured host pattern, is committed but readable only by its owner and `customer:*` readers until a reviewer rescopes or confirms it; an optional model check runs after commit
 - Live updates: Level 1 real-time subscriptions on `/Memory` and `/Memory/<id>` (SSE, WebSocket) with delivery-time read checks, and Level 2 watches (`POST /Memory/watch`, `watch=true` on search/bootstrap) delivered with own `needsReview` flags on `/MemoryEvents`
 - MCP surface (`mcp: true`): `remember`, `revise`, `recall`, `get`, `withdraw`, `pin`, `unpin`, `confirm`, `confirm-scope`, `watch` tools and `memory:///{id}` resource
-- Extension points: `registerMemorySink` runs inside the lifecycle transaction for apps that mirror memories elsewhere, `setPrincipalResolver` maps app-defined identities
+- Extension points: `registerMemorySink` runs inside the lifecycle transaction for apps that mirror memories elsewhere, `setPrincipalResolver` maps app-defined identities, and `resolvePrincipal` / `canReadLabels` let other components authorize with the same identity and grants
 
 Status: pre-release (v0). Design and contracts: [DESIGN.md](DESIGN.md).
 
@@ -124,7 +124,7 @@ rows with preserved owners and timestamps (`super_user` only); see [DESIGN.md](D
 ## Extension points
 
 ```js
-import { registerMemorySink, setPrincipalResolver } from '@harperfast/agent-memory';
+import { canReadLabels, registerMemorySink, resolvePrincipal, setPrincipalResolver } from '@harperfast/agent-memory';
 
 // Runs inside the lifecycle transaction. Writes through `context` to a table declared in the `memory`
 // database (`@table(database: "memory")`) commit or roll back with the memory; a table in another database
@@ -141,7 +141,18 @@ registerMemorySink({
 
 // Map your own credentials to a principal; `next()` is the default Harper-user resolution.
 setPrincipalResolver(async (context, next) => (await lookUpAgentKey(context)) ?? next());
+
+// Authorize your own records with the same identity and grants. The principal is frozen:
+// { id, superUser, source, read: ['user:alice', 'global', 'customer:*'], write: [...] }
+// Rejects with statusCode 401 (code 'principal_required') when there is no caller.
+const principal = await resolvePrincipal(context);
+const visible = records.filter((record) => canReadLabels(principal, record.scopes));
 ```
+
+`read` and `write` list the effective grant patterns: `user:<id>`, exact labels and namespace wildcards, with
+role and user grants merged and patterns that grant nothing dropped. A super_user's lists do not enumerate its
+access; check `superUser`, or let `canReadLabels` do it. `canReadLabels` is the label rule only (any label
+matches), and accepts only a principal `resolvePrincipal` returned. Contract: [DESIGN.md](DESIGN.md#extension-points).
 
 ## Claude Code plugin
 

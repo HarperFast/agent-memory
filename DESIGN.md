@@ -85,6 +85,9 @@ authentication of its own and has no credential tables.
   `setPrincipalResolver((context, next) => …)` that returns `{ id, grants: { read, write }, superUser?,
 source? }`, or `undefined` for unauthenticated. `next()` is the default Harper-user resolution, so a
   resolver can handle its own credentials and defer the rest. This exists for migration.
+- Other components on the same instance (harper-eye, Reflex) authorize with this identity and these grants
+  rather than their own: `resolvePrincipal` and `canReadLabels` (see Extension points) are the composition
+  contract, and the plugin's own routes run on the same two functions.
 
 Principal ids must not contain whitespace, `:` or `*`, and are capped at 122 characters, so that
 `user:<id>` fits a 128-character scope label.
@@ -591,6 +594,23 @@ as REST:
   `PUT` retry calls no sink. harper-eye uses it for the interim Reflex source-row handoff until memory is a
   Reflex lane.
 - `setPrincipalResolver(fn)` — see Identity.
+- `resolvePrincipal(context)` — the caller behind a request context, resolved exactly as the plugin's own routes
+  resolve it (custom resolver, else the Harper user and its `ScopeGrant` rows, read on every call). It resolves
+  to a frozen `{ id, superUser, source, read, write }`. `read` and `write` are frozen lists of the effective
+  grant patterns: `user:<id>` first, then exact labels, then namespace wildcards (`customer:*`), role and user
+  rows merged. A pattern that grants nothing is not listed: invalid, in the `user` namespace, past the 256 cap,
+  or inside a granted wildcard (`customer:acme` under `customer:*`). `superUser: true` reads and writes every
+  label, and its lists do not say so: check the flag. It rejects with a `MemoryError` (`statusCode` 401, `code`
+  `principal_required`) when there is no caller, 400 for an id that cannot form `user:<id>`, and with the
+  original error when a grant read or the custom resolver fails. It reads grants in a context of its own, so it
+  neither checks nor clears the caller's pending `authorize` flag. A principal is a snapshot: a caller that
+  keeps one past its request keeps revoked grants with it.
+- `canReadLabels(principal, labels)` — rule 1's label test: `true` when any label matches a read pattern
+  (exact, or in a wildcard's namespace; a wildcard never covers bare `global`), or the principal is super_user.
+  Non-string labels match nothing. It does not apply the memory-only rules (owner, withdrawn, content flag);
+  `canRead` applies those and then delegates here. It accepts only a principal `resolvePrincipal` returned (a
+  `TypeError` otherwise): the compiled matcher is cached privately against the frozen lists
+  (`src/scopes.ts` `matcherOf`), so a JSON copy can derive scopes for another system but never authorizes here.
 - Options (`config.yaml` under the plugin's key): `urlPath`, `mcp` (default `false`), `embeddingModel`
   (default `default`), `limits.{contentChars, titleChars}` (default 20000 / 200), and
   `supersession.{mode, similarity, judge}` (`off | suggest | auto`, default `suggest`; 0.82; none; `auto`

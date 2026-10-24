@@ -3,7 +3,13 @@ import { MEMORY_RESOURCES, MemoryMcpResource } from './resource.ts';
 import { applySettings, parseSettings } from './settings.ts';
 
 export { registerMemorySink, type MemorySink } from './sinks.ts';
-export { setPrincipalResolver, type PrincipalResolver, type PrincipalResolution } from './principal.ts';
+export {
+	resolvePrincipal,
+	setPrincipalResolver,
+	type PrincipalResolver,
+	type PrincipalResolution,
+} from './principal.ts';
+export { canReadLabels, type Principal } from './scopes.ts';
 
 function routePathFor(basePath: string, resource: { path: string }): string {
 	return resource.path.replace(/^\/Memory(?=\/|$|(?:Events|Mcp)\b)/, basePath);

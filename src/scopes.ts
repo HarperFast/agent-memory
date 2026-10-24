@@ -34,12 +34,18 @@ export interface ScopeMatcher {
 	readonly namespaces: ReadonlySet<string>;
 }
 
+/**
+ * `read` and `write` are the effective grant patterns: `user:<id>` first, then exact labels, then namespace
+ * wildcards (`customer:*`). A pattern that grants nothing (invalid, in the `user` namespace, past
+ * MAX_GRANT_PATTERNS, or inside a granted wildcard) is not listed. A super_user's lists do not enumerate its
+ * access; `superUser` does.
+ */
 export interface Principal {
 	readonly id: string;
 	readonly superUser: boolean;
 	readonly source: string;
-	readonly read: ScopeMatcher;
-	readonly write: ScopeMatcher;
+	readonly read: readonly string[];
+	readonly write: readonly string[];
 }
 
 export interface ScopedRecord {
@@ -112,8 +118,27 @@ function inWildcard(namespaces: ReadonlySet<string>, label: string): boolean {
 	return colon !== -1 && namespaces.has(label.slice(0, colon));
 }
 
-export function matches(matcher: ScopeMatcher, label: string): boolean {
+function covers(matcher: ScopeMatcher, label: string): boolean {
 	return matcher.exact.has(label) || inWildcard(matcher.namespaces, label);
+}
+
+// Keyed by the frozen lists createPrincipal builds, so only a principal it built is accepted as authorization.
+const listMatchers = new WeakMap<readonly string[], ScopeMatcher>();
+
+function patternList(matcher: ScopeMatcher): readonly string[] {
+	const patterns = Object.freeze([...matcher.exact, ...[...matcher.namespaces].map((namespace) => `${namespace}:*`)]);
+	listMatchers.set(patterns, matcher);
+	return patterns;
+}
+
+function matcherOf(patterns: readonly string[]): ScopeMatcher {
+	const matcher = listMatchers.get(patterns);
+	if (!matcher) throw new TypeError('Expected a principal returned by resolvePrincipal');
+	return matcher;
+}
+
+export function matches(patterns: readonly string[], label: string): boolean {
+	return covers(matcherOf(patterns), label);
 }
 
 export function createPrincipal(input: PrincipalInput, onRejectedPattern?: (pattern: unknown) => void): Principal {
@@ -125,19 +150,31 @@ export function createPrincipal(input: PrincipalInput, onRejectedPattern?: (patt
 		id,
 		superUser: input.superUser === true,
 		source: input.source || 'harper',
-		read: read.matcher,
-		write: write.matcher,
+		read: patternList(read.matcher),
+		write: patternList(write.matcher),
 	});
 }
 
 /** Cleared for customer content: an exact `customer:<org>` grant does not clear, since a flag can name any customer. */
 export function readsCustomerContent(principal: Principal): boolean {
-	return principal.superUser || principal.read.namespaces.has(CUSTOMER_NAMESPACE);
+	return principal.superUser || matcherOf(principal.read).namespaces.has(CUSTOMER_NAMESPACE);
 }
 
 /** Ownership alone never qualifies: an owner can read its own flagged memory without customer clearance. */
 export function reviewsCustomerContent(principal: Principal): boolean {
-	return readsCustomerContent(principal) && (principal.superUser || principal.write.namespaces.has(CUSTOMER_NAMESPACE));
+	return (
+		readsCustomerContent(principal) &&
+		(principal.superUser || matcherOf(principal.write).namespaces.has(CUSTOMER_NAMESPACE))
+	);
+}
+
+/**
+ * Rule 1's label test: any of `labels` matches a read pattern, or the principal is super_user. Ownership,
+ * withdrawal and the customer-content quarantine are memory rules that `canRead` adds on top.
+ */
+export function canReadLabels(principal: Principal, labels: readonly string[]): boolean {
+	const matcher = matcherOf(principal.read);
+	return principal.superUser || labels.some((label) => typeof label === 'string' && covers(matcher, label));
 }
 
 export function isCustomerScope(label: string): boolean {
@@ -152,11 +189,12 @@ export function canRead(record: ScopedRecord, principal: Principal): boolean {
 	if (principal.superUser || record.ownerId === principal.id) return true;
 	if (record.status === 'withdrawn') return false;
 	if (record.contentFlag && !readsCustomerContent(principal)) return false;
-	return (record.scopes ?? []).some((label) => matches(principal.read, label));
+	return canReadLabels(principal, record.scopes ?? []);
 }
 
 export function canWrite(scopes: readonly string[], principal: Principal): boolean {
-	return principal.superUser || scopes.every((label) => matches(principal.write, label));
+	const matcher = matcherOf(principal.write);
+	return principal.superUser || scopes.every((label) => covers(matcher, label));
 }
 
 export function assertWritable(scopes: readonly string[], principal: Principal): void {
@@ -228,10 +266,11 @@ export function anyOf(conditions: Condition[]): Condition {
  */
 export function readableConditions(principal: Principal): Condition[] {
 	if (principal.superUser) return [];
+	const { exact, namespaces } = matcherOf(principal.read);
 	const owned: Condition = { attribute: 'ownerId', comparator: 'equals', value: principal.id };
 	const labels: Condition[] = [owned];
-	for (const label of principal.read.exact) labels.push({ attribute: 'scopes', comparator: 'equals', value: label });
-	for (const namespace of principal.read.namespaces) {
+	for (const label of exact) labels.push({ attribute: 'scopes', comparator: 'equals', value: label });
+	for (const namespace of namespaces) {
 		labels.push({ attribute: 'scopes', comparator: 'gelt', value: [`${namespace}:`, `${namespace};`] });
 	}
 	if (readsCustomerContent(principal)) return [anyOf(labels)];
