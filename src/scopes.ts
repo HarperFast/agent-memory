@@ -122,23 +122,35 @@ function covers(matcher: ScopeMatcher, label: string): boolean {
 	return matcher.exact.has(label) || inWildcard(matcher.namespaces, label);
 }
 
-// Keyed by the frozen lists createPrincipal builds, so only a principal it built is accepted as authorization.
-const listMatchers = new WeakMap<readonly string[], ScopeMatcher>();
+// Module-private and non-enumerable, so a JSON, spread or hand-built copy of a principal carries no matcher and
+// cannot authorize.
+const MATCHER = Symbol('matcher');
+const MATCHERS = Symbol('matchers');
 
-function patternList(matcher: ScopeMatcher): readonly string[] {
-	const patterns = Object.freeze([...matcher.exact, ...[...matcher.namespaces].map((namespace) => `${namespace}:*`)]);
-	listMatchers.set(patterns, matcher);
-	return patterns;
+interface CompiledList {
+	readonly [MATCHER]?: ScopeMatcher;
 }
 
-function matcherOf(patterns: readonly string[]): ScopeMatcher {
-	const matcher = listMatchers.get(patterns);
-	if (!matcher) throw new TypeError('Expected a principal returned by resolvePrincipal');
-	return matcher;
+interface CompiledPrincipal {
+	readonly [MATCHERS]?: { readonly read: ScopeMatcher; readonly write: ScopeMatcher };
+}
+
+function patternList(matcher: ScopeMatcher): readonly string[] {
+	const patterns = [...matcher.exact, ...[...matcher.namespaces].map((namespace) => `${namespace}:*`)];
+	Object.defineProperty(patterns, MATCHER, { value: matcher });
+	return Object.freeze(patterns);
+}
+
+function matchersOf(principal: Principal): { readonly read: ScopeMatcher; readonly write: ScopeMatcher } {
+	const matchers = (principal as CompiledPrincipal)[MATCHERS];
+	if (!matchers) throw new TypeError('Expected a principal returned by resolvePrincipal');
+	return matchers;
 }
 
 export function matches(patterns: readonly string[], label: string): boolean {
-	return covers(matcherOf(patterns), label);
+	const matcher = (patterns as CompiledList)[MATCHER];
+	if (!matcher) throw new TypeError('Expected the pattern list of a principal returned by resolvePrincipal');
+	return covers(matcher, label);
 }
 
 export function createPrincipal(input: PrincipalInput, onRejectedPattern?: (pattern: unknown) => void): Principal {
@@ -146,25 +158,27 @@ export function createPrincipal(input: PrincipalInput, onRejectedPattern?: (patt
 	const read = compileMatcher(input.grants?.read, id);
 	const write = compileMatcher(input.grants?.write, id);
 	if (onRejectedPattern) for (const pattern of [...read.rejected, ...write.rejected]) onRejectedPattern(pattern);
-	return Object.freeze({
+	const principal = {
 		id,
 		superUser: input.superUser === true,
 		source: input.source || 'harper',
 		read: patternList(read.matcher),
 		write: patternList(write.matcher),
-	});
+	};
+	Object.defineProperty(principal, MATCHERS, { value: { read: read.matcher, write: write.matcher } });
+	return Object.freeze(principal);
 }
 
 /** Cleared for customer content: an exact `customer:<org>` grant does not clear, since a flag can name any customer. */
 export function readsCustomerContent(principal: Principal): boolean {
-	return principal.superUser || matcherOf(principal.read).namespaces.has(CUSTOMER_NAMESPACE);
+	return principal.superUser || matchersOf(principal).read.namespaces.has(CUSTOMER_NAMESPACE);
 }
 
 /** Ownership alone never qualifies: an owner can read its own flagged memory without customer clearance. */
 export function reviewsCustomerContent(principal: Principal): boolean {
 	return (
 		readsCustomerContent(principal) &&
-		(principal.superUser || matcherOf(principal.write).namespaces.has(CUSTOMER_NAMESPACE))
+		(principal.superUser || matchersOf(principal).write.namespaces.has(CUSTOMER_NAMESPACE))
 	);
 }
 
@@ -173,8 +187,8 @@ export function reviewsCustomerContent(principal: Principal): boolean {
  * withdrawal and the customer-content quarantine are memory rules that `canRead` adds on top.
  */
 export function canReadLabels(principal: Principal, labels: readonly string[]): boolean {
-	const matcher = matcherOf(principal.read);
-	return principal.superUser || labels.some((label) => typeof label === 'string' && covers(matcher, label));
+	const { read } = matchersOf(principal);
+	return principal.superUser || labels.some((label) => typeof label === 'string' && covers(read, label));
 }
 
 export function isCustomerScope(label: string): boolean {
@@ -193,8 +207,8 @@ export function canRead(record: ScopedRecord, principal: Principal): boolean {
 }
 
 export function canWrite(scopes: readonly string[], principal: Principal): boolean {
-	const matcher = matcherOf(principal.write);
-	return principal.superUser || scopes.every((label) => covers(matcher, label));
+	const { write } = matchersOf(principal);
+	return principal.superUser || scopes.every((label) => covers(write, label));
 }
 
 export function assertWritable(scopes: readonly string[], principal: Principal): void {
@@ -266,7 +280,7 @@ export function anyOf(conditions: Condition[]): Condition {
  */
 export function readableConditions(principal: Principal): Condition[] {
 	if (principal.superUser) return [];
-	const { exact, namespaces } = matcherOf(principal.read);
+	const { exact, namespaces } = matchersOf(principal).read;
 	const owned: Condition = { attribute: 'ownerId', comparator: 'equals', value: principal.id };
 	const labels: Condition[] = [owned];
 	for (const label of exact) labels.push({ attribute: 'scopes', comparator: 'equals', value: label });

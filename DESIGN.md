@@ -608,9 +608,9 @@ as REST:
 - `canReadLabels(principal, labels)` — rule 1's label test: `true` when any label matches a read pattern
   (exact, or in a wildcard's namespace; a wildcard never covers bare `global`), or the principal is super_user.
   Non-string labels match nothing. It does not apply the memory-only rules (owner, withdrawn, content flag);
-  `canRead` applies those and then delegates here. It accepts only a principal `resolvePrincipal` returned (a
-  `TypeError` otherwise): the compiled matcher is cached privately against the frozen lists
-  (`src/scopes.ts` `matcherOf`), so a JSON copy can derive scopes for another system but never authorizes here.
+  `canRead` applies those and then delegates here. It accepts only a principal `resolvePrincipal` returned: the
+  compiled matchers ride on it under a module-private, non-enumerable symbol (`src/scopes.ts` `matchersOf`), so a
+  JSON, spread or hand-built copy throws a `TypeError`. A JSON copy can still derive scopes for another system.
 - Options (`config.yaml` under the plugin's key): `urlPath`, `mcp` (default `false`), `embeddingModel`
   (default `default`), `limits.{contentChars, titleChars}` (default 20000 / 200), and
   `supersession.{mode, similarity, judge}` (`off | suggest | auto`, default `suggest`; 0.82; none; `auto`

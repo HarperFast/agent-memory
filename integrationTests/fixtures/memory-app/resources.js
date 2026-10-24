@@ -74,8 +74,8 @@ setPrincipalResolver((context, next) =>
 		: next(),
 );
 
-// A host component authorizing its own records with the plugin's grants. A static verb, like the plugin's own routes,
-// so Harper's entry `authorize` flag is still pending while it resolves the caller.
+// A static verb, like the plugin's own routes, so Harper's entry `authorize` flag is still pending while a host
+// component resolves the caller.
 export class PrincipalProbe extends Resource {
 	static async get(target, context) {
 		const principal = await resolvePrincipal(context);

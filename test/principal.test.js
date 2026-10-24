@@ -208,6 +208,8 @@ describe('canReadLabels', () => {
 			() => canReadLabels({ id: 'x', superUser: true, source: 'forged', read: [], write: [] }, ['global']),
 			TypeError,
 		);
-		assert.ok(canReadLabels({ ...pat }, ['global']), 'a copy that keeps the resolved lists is the same principal');
+		assert.throws(() => canReadLabels({ ...pat }, ['global']), TypeError);
+		assert.throws(() => canReadLabels({ ...pat, superUser: true }, ['customer:any']), TypeError);
+		assert.throws(() => canReadLabels(structuredClone(pat), ['global']), TypeError);
 	});
 });
