@@ -168,10 +168,12 @@ describe('canReadLabels', () => {
 		assert.ok(canReadLabels(await principalWith(['global']), ['global']));
 	});
 
-	it('ignores labels that are not strings', async () => {
+	it('ignores labels that are not strings, and treats a missing label list as no labels', async () => {
 		const pat = await principalWith(['team:a']);
 		assert.ok(!canReadLabels(pat, [null, 42, undefined]));
 		assert.ok(canReadLabels(pat, [null, 'team:a']));
+		for (const labels of [undefined, null, 'team:a']) assert.ok(!canReadLabels(pat, labels));
+		assert.ok(canReadLabels(await resolvePrincipal(superUser), undefined), 'super_user reads unlabeled records');
 	});
 
 	it('agrees with canRead on every active, unflagged record the principal does not own', async () => {
@@ -211,5 +213,7 @@ describe('canReadLabels', () => {
 		assert.throws(() => canReadLabels({ ...pat }, ['global']), TypeError);
 		assert.throws(() => canReadLabels({ ...pat, superUser: true }, ['customer:any']), TypeError);
 		assert.throws(() => canReadLabels(structuredClone(pat), ['global']), TypeError);
+		assert.throws(() => canReadLabels({ ...pat, read: pat.write }, ['global']), TypeError);
+		assert.throws(() => canReadLabels(Object.create(pat, { superUser: { value: true } }), ['customer:any']), TypeError);
 	});
 });

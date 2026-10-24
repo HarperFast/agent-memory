@@ -122,8 +122,8 @@ function covers(matcher: ScopeMatcher, label: string): boolean {
 	return matcher.exact.has(label) || inWildcard(matcher.namespaces, label);
 }
 
-// Module-private and non-enumerable, so a JSON, spread or hand-built copy of a principal carries no matcher and
-// cannot authorize.
+// Own, non-enumerable properties: a JSON, spread, prototype-derived or hand-built copy of a principal carries no
+// matcher and cannot authorize.
 const MATCHER = Symbol('matcher');
 const MATCHERS = Symbol('matchers');
 
@@ -142,9 +142,8 @@ function patternList(matcher: ScopeMatcher): readonly string[] {
 }
 
 function matchersOf(principal: Principal): { readonly read: ScopeMatcher; readonly write: ScopeMatcher } {
-	const matchers = (principal as CompiledPrincipal)[MATCHERS];
-	if (!matchers) throw new TypeError('Expected a principal returned by resolvePrincipal');
-	return matchers;
+	if (!Object.hasOwn(principal, MATCHERS)) throw new TypeError('Expected a principal returned by resolvePrincipal');
+	return (principal as CompiledPrincipal)[MATCHERS]!;
 }
 
 export function matches(patterns: readonly string[], label: string): boolean {
@@ -183,12 +182,13 @@ export function reviewsCustomerContent(principal: Principal): boolean {
 }
 
 /**
- * Rule 1's label test: any of `labels` matches a read pattern, or the principal is super_user. Ownership,
- * withdrawal and the customer-content quarantine are memory rules that `canRead` adds on top.
+ * Rule 1's label test: any of `labels` matches a read pattern, or the principal is super_user. Missing labels match
+ * nothing. Ownership, withdrawal and the customer-content quarantine are memory rules that `canRead` adds on top.
  */
-export function canReadLabels(principal: Principal, labels: readonly string[]): boolean {
+export function canReadLabels(principal: Principal, labels: readonly string[] | null | undefined): boolean {
 	const { read } = matchersOf(principal);
-	return principal.superUser || labels.some((label) => typeof label === 'string' && covers(read, label));
+	if (principal.superUser) return true;
+	return Array.isArray(labels) && labels.some((label) => typeof label === 'string' && covers(read, label));
 }
 
 export function isCustomerScope(label: string): boolean {
@@ -203,7 +203,7 @@ export function canRead(record: ScopedRecord, principal: Principal): boolean {
 	if (principal.superUser || record.ownerId === principal.id) return true;
 	if (record.status === 'withdrawn') return false;
 	if (record.contentFlag && !readsCustomerContent(principal)) return false;
-	return canReadLabels(principal, record.scopes ?? []);
+	return canReadLabels(principal, record.scopes);
 }
 
 export function canWrite(scopes: readonly string[], principal: Principal): boolean {
