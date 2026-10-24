@@ -147,9 +147,10 @@ function matchersOf(principal: Principal): { readonly read: ScopeMatcher; readon
 }
 
 export function matches(patterns: readonly string[], label: string): boolean {
-	const matcher = (patterns as CompiledList)[MATCHER];
-	if (!matcher) throw new TypeError('Expected the pattern list of a principal returned by resolvePrincipal');
-	return covers(matcher, label);
+	if (!Object.hasOwn(patterns, MATCHER)) {
+		throw new TypeError('Expected the pattern list of a principal returned by resolvePrincipal');
+	}
+	return covers((patterns as CompiledList)[MATCHER]!, label);
 }
 
 export function createPrincipal(input: PrincipalInput, onRejectedPattern?: (pattern: unknown) => void): Principal {
