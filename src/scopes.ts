@@ -34,12 +34,18 @@ export interface ScopeMatcher {
 	readonly namespaces: ReadonlySet<string>;
 }
 
+/**
+ * `read` and `write` are the effective grant patterns: `user:<id>` first, then exact labels, then namespace
+ * wildcards (`customer:*`). A pattern that grants nothing (invalid, in the `user` namespace, past
+ * MAX_GRANT_PATTERNS, or inside a granted wildcard) is not listed. A super_user's lists do not enumerate its
+ * access; `superUser` does.
+ */
 export interface Principal {
 	readonly id: string;
 	readonly superUser: boolean;
 	readonly source: string;
-	readonly read: ScopeMatcher;
-	readonly write: ScopeMatcher;
+	readonly read: readonly string[];
+	readonly write: readonly string[];
 }
 
 export interface ScopedRecord {
@@ -112,8 +118,39 @@ function inWildcard(namespaces: ReadonlySet<string>, label: string): boolean {
 	return colon !== -1 && namespaces.has(label.slice(0, colon));
 }
 
-export function matches(matcher: ScopeMatcher, label: string): boolean {
+function covers(matcher: ScopeMatcher, label: string): boolean {
 	return matcher.exact.has(label) || inWildcard(matcher.namespaces, label);
+}
+
+// Own, non-enumerable properties: a JSON, spread, prototype-derived or hand-built copy of a principal carries no
+// matcher and cannot authorize.
+const MATCHER = Symbol('matcher');
+const MATCHERS = Symbol('matchers');
+
+interface CompiledList {
+	readonly [MATCHER]?: ScopeMatcher;
+}
+
+interface CompiledPrincipal {
+	readonly [MATCHERS]?: { readonly read: ScopeMatcher; readonly write: ScopeMatcher };
+}
+
+function patternList(matcher: ScopeMatcher): readonly string[] {
+	const patterns = [...matcher.exact, ...[...matcher.namespaces].map((namespace) => `${namespace}:*`)];
+	Object.defineProperty(patterns, MATCHER, { value: matcher });
+	return Object.freeze(patterns);
+}
+
+function matchersOf(principal: Principal): { readonly read: ScopeMatcher; readonly write: ScopeMatcher } {
+	if (!Object.hasOwn(principal, MATCHERS)) throw new TypeError('Expected a principal returned by resolvePrincipal');
+	return (principal as CompiledPrincipal)[MATCHERS]!;
+}
+
+export function matches(patterns: readonly string[], label: string): boolean {
+	if (!Object.hasOwn(patterns, MATCHER)) {
+		throw new TypeError('Expected the pattern list of a principal returned by resolvePrincipal');
+	}
+	return covers((patterns as CompiledList)[MATCHER]!, label);
 }
 
 export function createPrincipal(input: PrincipalInput, onRejectedPattern?: (pattern: unknown) => void): Principal {
@@ -121,23 +158,38 @@ export function createPrincipal(input: PrincipalInput, onRejectedPattern?: (patt
 	const read = compileMatcher(input.grants?.read, id);
 	const write = compileMatcher(input.grants?.write, id);
 	if (onRejectedPattern) for (const pattern of [...read.rejected, ...write.rejected]) onRejectedPattern(pattern);
-	return Object.freeze({
+	const principal = {
 		id,
 		superUser: input.superUser === true,
 		source: input.source || 'harper',
-		read: read.matcher,
-		write: write.matcher,
-	});
+		read: patternList(read.matcher),
+		write: patternList(write.matcher),
+	};
+	Object.defineProperty(principal, MATCHERS, { value: { read: read.matcher, write: write.matcher } });
+	return Object.freeze(principal);
 }
 
 /** Cleared for customer content: an exact `customer:<org>` grant does not clear, since a flag can name any customer. */
 export function readsCustomerContent(principal: Principal): boolean {
-	return principal.superUser || principal.read.namespaces.has(CUSTOMER_NAMESPACE);
+	return principal.superUser || matchersOf(principal).read.namespaces.has(CUSTOMER_NAMESPACE);
 }
 
 /** Ownership alone never qualifies: an owner can read its own flagged memory without customer clearance. */
 export function reviewsCustomerContent(principal: Principal): boolean {
-	return readsCustomerContent(principal) && (principal.superUser || principal.write.namespaces.has(CUSTOMER_NAMESPACE));
+	return (
+		readsCustomerContent(principal) &&
+		(principal.superUser || matchersOf(principal).write.namespaces.has(CUSTOMER_NAMESPACE))
+	);
+}
+
+/**
+ * Rule 1's label test: any of `labels` matches a read pattern, or the principal is super_user. Missing labels match
+ * nothing. Ownership, withdrawal and the customer-content quarantine are memory rules that `canRead` adds on top.
+ */
+export function canReadLabels(principal: Principal, labels: readonly string[] | null | undefined): boolean {
+	const { read } = matchersOf(principal);
+	if (principal.superUser) return true;
+	return Array.isArray(labels) && labels.some((label) => typeof label === 'string' && covers(read, label));
 }
 
 export function isCustomerScope(label: string): boolean {
@@ -152,11 +204,12 @@ export function canRead(record: ScopedRecord, principal: Principal): boolean {
 	if (principal.superUser || record.ownerId === principal.id) return true;
 	if (record.status === 'withdrawn') return false;
 	if (record.contentFlag && !readsCustomerContent(principal)) return false;
-	return (record.scopes ?? []).some((label) => matches(principal.read, label));
+	return canReadLabels(principal, record.scopes);
 }
 
 export function canWrite(scopes: readonly string[], principal: Principal): boolean {
-	return principal.superUser || scopes.every((label) => matches(principal.write, label));
+	const { write } = matchersOf(principal);
+	return principal.superUser || scopes.every((label) => covers(write, label));
 }
 
 export function assertWritable(scopes: readonly string[], principal: Principal): void {
@@ -228,10 +281,11 @@ export function anyOf(conditions: Condition[]): Condition {
  */
 export function readableConditions(principal: Principal): Condition[] {
 	if (principal.superUser) return [];
+	const { exact, namespaces } = matchersOf(principal).read;
 	const owned: Condition = { attribute: 'ownerId', comparator: 'equals', value: principal.id };
 	const labels: Condition[] = [owned];
-	for (const label of principal.read.exact) labels.push({ attribute: 'scopes', comparator: 'equals', value: label });
-	for (const namespace of principal.read.namespaces) {
+	for (const label of exact) labels.push({ attribute: 'scopes', comparator: 'equals', value: label });
+	for (const namespace of namespaces) {
 		labels.push({ attribute: 'scopes', comparator: 'gelt', value: [`${namespace}:`, `${namespace};`] });
 	}
 	if (readsCustomerContent(principal)) return [anyOf(labels)];

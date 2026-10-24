@@ -1,4 +1,4 @@
-import { registerMemorySink, setPrincipalResolver } from '@harperfast/agent-memory';
+import { canReadLabels, registerMemorySink, resolvePrincipal, setPrincipalResolver } from '@harperfast/agent-memory';
 
 // Deterministic embedding model for the integration suite: a hashed bag of words, so two texts are close
 // exactly when they share words. Registered as the plugin's default `embeddingModel`.
@@ -73,6 +73,16 @@ setPrincipalResolver((context, next) =>
 		? { id: 'agent-erin', grants: { read: ['global'], write: ['global'] }, source: 'fixture-resolver' }
 		: next(),
 );
+
+// A static verb, like the plugin's own routes, so Harper's entry `authorize` flag is still pending while a host
+// component resolves the caller.
+export class PrincipalProbe extends Resource {
+	static async get(target, context) {
+		const principal = await resolvePrincipal(context);
+		const labels = target.get('labels')?.split(',') ?? [];
+		return { principal, canRead: canReadLabels(principal, labels), authorizePending: context.authorize === true };
+	}
+}
 
 // Runs a vector query whose size differs from the index's, as a model switch would; search's fallback to
 // full-text depends on Harper answering it with a 400 starting with "Search target has ".

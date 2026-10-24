@@ -38,10 +38,12 @@ async function resolveHarperUser(context: any): Promise<PrincipalResolution | un
 	if (typeof user?.username !== 'string') return undefined;
 	if (user.role?.permission?.super_user === true) return { id: user.username, superUser: true };
 	const roleName = user.role?.role;
-	// Read on every request rather than cached, so revoking a grant takes effect immediately.
+	// Read on every request rather than cached, so revoking a grant takes effect immediately. Each read gets its own
+	// context: without one Harper takes the caller's, checks its user against ScopeGrant while its `authorize` is
+	// pending, and clears that flag before the caller's own read.
 	const [roleGrant, userGrant] = await Promise.all([
-		typeof roleName === 'string' ? grantRows().get(`role:${roleName}`) : undefined,
-		grantRows().get(`user:${user.username}`),
+		typeof roleName === 'string' ? grantRows().get(`role:${roleName}`, { authorize: false }) : undefined,
+		grantRows().get(`user:${user.username}`, { authorize: false }),
 	]);
 	return {
 		id: user.username,
@@ -63,6 +65,11 @@ function warnRejectedPattern(pattern: unknown): void {
 	logger.warn?.(`[agent-memory] ignoring invalid scope grant pattern ${key}`);
 }
 
+/**
+ * The caller behind a request context: the custom resolver's answer, else the Harper user and its `ScopeGrant`
+ * rows. Rejects with a 401 `principal_required` MemoryError when there is no caller; a failed grant read or a
+ * throwing resolver rejects with its own error.
+ */
 export async function resolvePrincipal(context: any): Promise<Principal> {
 	const resolution = resolver
 		? await resolver(context, () => resolveHarperUser(context))

@@ -494,6 +494,77 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 		strictEqual((await call('erin', 'GET', alicePrivate.id)).status, 404);
 	});
 
+	test('a host component resolves its caller with the exported principal API and filters its own records', async () => {
+		const probe = async (user: string | undefined, labels: string[]) => {
+			const response = await fetch(`${ctx.harper.httpURL}/PrincipalProbe?labels=${labels.join(',')}`, {
+				headers: {
+					Accept: 'application/json',
+					...(user && {
+						Authorization:
+							user === 'admin' ? basic(ctx.harper.admin.username, ctx.harper.admin.password) : basic(user, PASSWORD),
+					}),
+				},
+			});
+			const text = await response.text();
+			return { status: response.status, body: response.ok ? JSON.parse(text) : text };
+		};
+		const expectProbe = async (user: string, labels: string[], principal: object, canRead: boolean) => {
+			const { status, body } = await probe(user, labels);
+			strictEqual(status, 200, JSON.stringify(body));
+			deepStrictEqual(body, { principal, canRead, authorizePending: true });
+		};
+
+		const carol = {
+			id: 'carol',
+			superUser: false,
+			source: 'harper',
+			read: ['user:carol', 'global', 'customer:x'],
+			write: ['user:carol', 'global', 'customer:x'],
+		};
+		await expectProbe('carol', ['customer:x'], carol, true);
+		await expectProbe('carol', ['customer:y', 'team:q'], carol, false);
+		const dave = {
+			id: 'dave',
+			superUser: false,
+			source: 'harper',
+			read: ['user:dave', 'global', 'customer:*'],
+			write: ['user:dave', 'global'],
+		};
+		await expectProbe('dave', ['team:q', 'customer:y'], dave, true);
+		await expectProbe('dave', ['user:alice'], dave, false);
+		const erin = {
+			id: 'agent-erin',
+			superUser: false,
+			source: 'fixture-resolver',
+			read: ['user:agent-erin', 'global'],
+			write: ['user:agent-erin', 'global'],
+		};
+		await expectProbe('erin', ['global'], erin, true);
+		const admin = (await probe('admin', ['customer:z'])).body;
+		strictEqual(admin.principal.superUser, true);
+		strictEqual(admin.canRead, true);
+		strictEqual((await probe(undefined, ['global'])).status, 401);
+
+		const withTeam = { id: 'bob', superUser: false, source: 'harper', read: ['user:bob', 'global', 'team:probe'] };
+		await operation({
+			operation: 'upsert',
+			database: 'memory',
+			table: 'ScopeGrant',
+			records: [{ id: 'user:bob', read: ['team:probe'] }],
+		});
+		try {
+			await expectProbe('bob', ['team:probe'], { ...withTeam, write: ['user:bob', 'global'] }, true);
+		} finally {
+			await operation({ operation: 'delete', database: 'memory', table: 'ScopeGrant', ids: ['user:bob'] });
+		}
+		await expectProbe(
+			'bob',
+			['team:probe'],
+			{ ...withTeam, read: ['user:bob', 'global'], write: ['user:bob', 'global'] },
+			false,
+		);
+	});
+
 	test('bootstrap: pinned, then recent, then relevant, packed into the character budget', async () => {
 		const pinned = await create('bob', 'pinned', {
 			title: 'pin',
