@@ -19,9 +19,9 @@ jobs:
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
           node-version: '22'
-          cache: 'npm'
+          # No dependency cache: this job builds the published tarball.
+          package-manager-cache: false
 
-      # Prereleases go to `next` so they don't move `latest`.
       - name: Check tag matches package version
         id: version
         env:
@@ -42,8 +42,7 @@ jobs:
       - run: npm run format:check
       - run: npm test
 
-      # A release can be cut from a commit test.yml never ran on. The integration suite loads the exact tarball
-      # that gets published inside a real Harper.
+      # A release can be cut from a commit test.yml never ran on, so the tarball to publish is tested here.
       - run: mkdir package && npm pack --pack-destination package
       - run: node scripts/install-fixtures.js package/*.tgz
       - run: npm run test:integration

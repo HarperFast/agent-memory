@@ -240,12 +240,18 @@ npm run test:integration    # boots Harper with the fixture and exercises the HT
    publishing (no token). Prerelease versions (`0.2.0-beta.1`) publish to the `next` dist-tag; others to
    `latest`.
 
-npm trusted publishing is configured per package on npmjs.com (Trusted Publisher: `HarperFast/agent-memory`,
-`release.yml`, environment `Release`), so a package that does not exist yet cannot use it: the first version is
-published manually by an npm org owner, with `npm ci && npm publish --access public` in a clean checkout of the `v0.1.0`
-tag. Publishing the `v0.1.0` GitHub release afterwards runs the workflow, whose publish step then fails because
-the version already exists; that one failure is expected. A new trusted-publisher configuration expires unless it completes a
-publish within 2 days, so add it shortly before the next release. Provenance requires a public repository.
+npm trusted publishing is configured per package on npmjs.com, so a package that does not exist yet cannot use
+it. Bootstrap:
+
+1. An npm org owner publishes the first version by hand: `npm ci && npm publish --access public` in a clean
+   checkout of the `v0.1.0` tag (no provenance for this version).
+2. Publishing the `v0.1.0` GitHub release runs the workflow; its publish step fails, which is expected for this
+   one release.
+3. Shortly before the next release, add a Trusted Publisher on npmjs.com: `HarperFast/agent-memory`,
+   `release.yml`, environment `Release`, with direct `npm publish` allowed (new configurations default to
+   `npm stage publish` only). A configuration expires unless it completes a publish within 2 days.
+
+Provenance requires a public repository.
 
 ## Import
 

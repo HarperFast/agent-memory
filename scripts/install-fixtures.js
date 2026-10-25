@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Installs a packed (non-symlinked) copy of the plugin into each integration fixture: Harper's module loader
 // refuses a `file:` symlink that resolves outside the app's allowed path. Pass a tarball path to install that
-// exact package (the release job tests the tarball it publishes); otherwise this packs the checkout.
+// exact package; otherwise this packs the checkout.
 import { mkdtempSync, rmSync, readdirSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
