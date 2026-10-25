@@ -12,7 +12,17 @@ Shared, permissioned, live memory for agents and people, as a Harper plugin.
 - MCP surface (`mcp: true`): `remember`, `revise`, `recall`, `get`, `withdraw`, `pin`, `unpin`, `confirm`, `confirm-scope`, `watch` tools and `memory:///{id}` resource
 - Extension points: `registerMemorySink` runs inside the lifecycle transaction for apps that mirror memories elsewhere, `setPrincipalResolver` maps app-defined identities, and `resolvePrincipal` / `canReadLabels` let other components authorize with the same identity and grants
 
-Status: pre-release (v0). Design and contracts: [DESIGN.md](DESIGN.md).
+Status: v0 (0.x releases may change contracts; see [CHANGELOG.md](CHANGELOG.md)). Design and contracts:
+[DESIGN.md](DESIGN.md).
+
+## Install
+
+```sh
+npm install @harperfast/agent-memory
+```
+
+`harper` (5.3.1 or later) is a peer dependency: the host app provides it. Enable the plugin under its package
+name in the host app's `config.yaml`, as in step 1 below.
 
 ## Quick start
 
@@ -219,6 +229,15 @@ npm test                    # build + unit tests (in-memory harper stub)
 npm run install:fixtures    # pack the plugin into the integration fixture app
 npm run test:integration    # boots Harper with the fixture and exercises the HTTP surface
 ```
+
+## Releasing
+
+1. Open a PR that bumps `version` in `package.json` (and `package-lock.json`) and moves the `CHANGELOG.md`
+   entry from Unreleased to that version and date.
+2. After it merges, publish a GitHub release tagged `vX.Y.Z` from `main`. The
+   [release workflow](.github/workflows/release.yml) runs the unit and integration tests and publishes to npm
+   with provenance through trusted publishing (no token). Tags with a `-` (`v0.2.0-beta.1`) publish to the
+   `next` dist-tag; others to `latest`.
 
 ## Import
 

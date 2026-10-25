@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Installs a packed (non-symlinked) copy of the plugin into each integration fixture: Harper's module loader
-// refuses a `file:` symlink that resolves outside the app's allowed path.
+// refuses a `file:` symlink that resolves outside the app's allowed path. `npm pack` builds dist/ via prepack.
 import { mkdtempSync, rmSync, readdirSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -14,8 +14,6 @@ function run(command, args, cwd) {
 	const result = spawnSync(command, args, { cwd, stdio: 'inherit', timeout: 120_000 });
 	if (result.status !== 0) throw new Error(`${command} ${args.join(' ')} failed in ${cwd} (exit ${result.status})`);
 }
-
-run('npm', ['run', 'build'], repoRoot);
 
 const packDir = mkdtempSync(join(tmpdir(), 'agent-memory-fixture-pack-'));
 try {
