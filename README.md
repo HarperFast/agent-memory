@@ -232,12 +232,18 @@ npm run test:integration    # boots Harper with the fixture and exercises the HT
 
 ## Releasing
 
-1. Open a PR that bumps `version` in `package.json` (and `package-lock.json`) and moves the `CHANGELOG.md`
-   entry from Unreleased to that version and date.
-2. After it merges, publish a GitHub release tagged `vX.Y.Z` from `main`. The
-   [release workflow](.github/workflows/release.yml) runs the unit and integration tests and publishes to npm
-   with provenance through trusted publishing (no token). Tags with a `-` (`v0.2.0-beta.1`) publish to the
-   `next` dist-tag; others to `latest`.
+1. Open a PR that bumps `version` in `package.json` (and `package-lock.json`) and adds a dated `CHANGELOG.md`
+   entry for that version.
+2. After it merges, publish a GitHub release tagged `v<version>` from `main`. The
+   [release workflow](.github/workflows/release.yml) refuses a tag that does not match `package.json`, runs the
+   unit and integration tests, and publishes the tested tarball to npm with provenance through trusted
+   publishing (no token). Prerelease versions (`0.2.0-beta.1`) publish to the `next` dist-tag; others to
+   `latest`.
+
+npm trusted publishing is configured per package on npmjs.com (Trusted Publisher: `HarperFast/agent-memory`,
+`release.yml`, environment `Release`), so a package that does not exist yet cannot use it: the first version is
+published manually by an npm org owner. A new trusted-publisher configuration expires unless it completes a
+publish within 2 days, so add it shortly before the next release. Provenance requires a public repository.
 
 ## Import
 

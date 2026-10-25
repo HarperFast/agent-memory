@@ -34,7 +34,7 @@
 	],
 	"scripts": {
 		"build": "tsc",
-		"prepack": "tsc --sourceMap false",
+		"prepack": "node -e \"fs.rmSync('dist', { recursive: true, force: true })\" && tsc --sourceMap false",
 		"test": "npm run build && node --import ./test/helpers/harper-mock.mjs --test \"test/**/*.test.js\"",
 		"install:fixtures": "node scripts/install-fixtures.js",
 		"test:integration": "harper-integration-test-run \"integrationTests/**/*.test.ts\"",

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Installs a packed (non-symlinked) copy of the plugin into each integration fixture: Harper's module loader
-// refuses a `file:` symlink that resolves outside the app's allowed path. `npm pack` builds dist/ via prepack.
+// refuses a `file:` symlink that resolves outside the app's allowed path.
 import { mkdtempSync, rmSync, readdirSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -22,7 +22,7 @@ try {
 		encoding: 'utf8',
 		timeout: 120_000,
 	});
-	if (pack.status !== 0) throw new Error(`npm pack failed (exit ${pack.status}): ${pack.stderr}`);
+	if (pack.status !== 0) throw new Error(`npm pack failed (exit ${pack.status}): ${pack.stdout}${pack.stderr}`);
 	const tarball = join(packDir, JSON.parse(pack.stdout)[0].filename);
 	for (const entry of readdirSync(fixturesDir, { withFileTypes: true })) {
 		if (!entry.isDirectory()) continue;

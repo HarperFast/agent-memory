@@ -13,7 +13,7 @@ First npm release. Requires Harper 5.3.1 or later (`harper` peer dependency) on 
 
 - **`Memory` resource** (REST at `urlPath`, default `/Memory`): client-chosen ids, create, revise, withdraw,
   pin/unpin, hybrid search (vector + full-text, reciprocal rank fusion), `bootstrap` session context within a
-  token budget, and `super_user` bulk `import`. The `memory` database tables (`Memory`, `MemoryPin`,
+  character budget, and `super_user` bulk `import`. The `memory` database tables (`Memory`, `MemoryPin`,
   `ScopeGrant`, `MemoryWatch`) are not exported; the resource is the only reader and writer.
 - **Scopes and grants:** `global`, `user:<id>`, `customer:<id>` and `team:<id>` labels. Every user reads and
   writes `user:<self>`; other labels come from `ScopeGrant` rows keyed `role:<role>` or `user:<username>`,
