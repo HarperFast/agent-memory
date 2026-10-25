@@ -242,7 +242,9 @@ npm run test:integration    # boots Harper with the fixture and exercises the HT
 
 npm trusted publishing is configured per package on npmjs.com (Trusted Publisher: `HarperFast/agent-memory`,
 `release.yml`, environment `Release`), so a package that does not exist yet cannot use it: the first version is
-published manually by an npm org owner. A new trusted-publisher configuration expires unless it completes a
+published manually by an npm org owner, with `npm ci && npm publish --access public` in a clean checkout of the `v0.1.0`
+tag. Publishing the `v0.1.0` GitHub release afterwards runs the workflow, whose publish step then fails because
+the version already exists; that one failure is expected. A new trusted-publisher configuration expires unless it completes a
 publish within 2 days, so add it shortly before the next release. Provenance requires a public repository.
 
 ## Import
