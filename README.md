@@ -12,7 +12,17 @@ Shared, permissioned, live memory for agents and people, as a Harper plugin.
 - MCP surface (`mcp: true`): `remember`, `revise`, `recall`, `get`, `withdraw`, `pin`, `unpin`, `confirm`, `confirm-scope`, `watch` tools and `memory:///{id}` resource
 - Extension points: `registerMemorySink` runs inside the lifecycle transaction for apps that mirror memories elsewhere, `setPrincipalResolver` maps app-defined identities, and `resolvePrincipal` / `canReadLabels` let other components authorize with the same identity and grants
 
-Status: pre-release (v0). Design and contracts: [DESIGN.md](DESIGN.md).
+Status: v0 (0.x releases may change contracts; see [CHANGELOG.md](CHANGELOG.md)). Design and contracts:
+[DESIGN.md](DESIGN.md).
+
+## Install
+
+```sh
+npm install @harperfast/agent-memory
+```
+
+`harper` (5.3.1 or later) is a peer dependency: the host app provides it. Enable the plugin under its package
+name in the host app's `config.yaml`, as in step 1 below.
 
 ## Quick start
 
@@ -219,6 +229,29 @@ npm test                    # build + unit tests (in-memory harper stub)
 npm run install:fixtures    # pack the plugin into the integration fixture app
 npm run test:integration    # boots Harper with the fixture and exercises the HTTP surface
 ```
+
+## Releasing
+
+1. Open a PR that bumps `version` in `package.json` (and `package-lock.json`) and adds a dated `CHANGELOG.md`
+   entry for that version.
+2. After it merges, publish a GitHub release tagged `v<version>` from `main`. The
+   [release workflow](.github/workflows/release.yml) refuses a tag that does not match `package.json`, runs the
+   unit and integration tests, and publishes the tested tarball to npm with provenance through trusted
+   publishing (no token). Prerelease versions (`0.2.0-beta.1`) publish to the `next` dist-tag; others to
+   `latest`.
+
+npm trusted publishing is configured per package on npmjs.com, so a package that does not exist yet cannot use
+it. Bootstrap:
+
+1. An npm org owner publishes the first version by hand: `npm ci && npm publish --access public` in a clean
+   checkout of the `v0.1.0` tag (no provenance for this version).
+2. Publishing the `v0.1.0` GitHub release runs the workflow; its publish step fails, which is expected for this
+   one release.
+3. Shortly before the next release, add a Trusted Publisher on npmjs.com: `HarperFast/agent-memory`,
+   `release.yml`, environment `Release`, with direct `npm publish` allowed (new configurations default to
+   `npm stage publish` only). A configuration expires unless it completes a publish within 2 days.
+
+Provenance requires a public repository.
 
 ## Import
 

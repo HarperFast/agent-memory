@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // Installs a packed (non-symlinked) copy of the plugin into each integration fixture: Harper's module loader
-// refuses a `file:` symlink that resolves outside the app's allowed path.
+// refuses a `file:` symlink that resolves outside the app's allowed path. Pass a tarball path to install that
+// exact package; otherwise this packs the checkout.
 import { mkdtempSync, rmSync, readdirSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -15,17 +16,15 @@ function run(command, args, cwd) {
 	if (result.status !== 0) throw new Error(`${command} ${args.join(' ')} failed in ${cwd} (exit ${result.status})`);
 }
 
-run('npm', ['run', 'build'], repoRoot);
-
-const packDir = mkdtempSync(join(tmpdir(), 'agent-memory-fixture-pack-'));
+const packDir = process.argv[2] ? undefined : mkdtempSync(join(tmpdir(), 'agent-memory-fixture-pack-'));
 try {
-	const pack = spawnSync('npm', ['pack', '--pack-destination', packDir, '--json'], {
-		cwd: repoRoot,
-		encoding: 'utf8',
-		timeout: 120_000,
-	});
-	if (pack.status !== 0) throw new Error(`npm pack failed (exit ${pack.status}): ${pack.stderr}`);
-	const tarball = join(packDir, JSON.parse(pack.stdout)[0].filename);
+	let tarball;
+	if (packDir) {
+		run('npm', ['pack', '--pack-destination', packDir], repoRoot);
+		tarball = join(packDir, readdirSync(packDir)[0]);
+	} else {
+		tarball = resolve(process.argv[2]);
+	}
 	for (const entry of readdirSync(fixturesDir, { withFileTypes: true })) {
 		if (!entry.isDirectory()) continue;
 		const fixturePath = join(fixturesDir, entry.name);
@@ -34,5 +33,5 @@ try {
 		run('npm', ['install', '--no-save', '--ignore-scripts', '--legacy-peer-deps', tarball], fixturePath);
 	}
 } finally {
-	rmSync(packDir, { recursive: true, force: true });
+	if (packDir) rmSync(packDir, { recursive: true, force: true });
 }

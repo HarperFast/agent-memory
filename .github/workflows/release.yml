@@ -1,0 +1,88 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  # Everything that runs dependency code (install scripts, tests, Harper) stays in this job, which has no
+  # id-token: code here cannot mint an npm publish token.
+  verify:
+    name: Test and pack
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      dist-tag: ${{ steps.version.outputs.dist-tag }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: '22'
+          # No dependency cache: this job builds the published tarball.
+          package-manager-cache: false
+
+      - name: Check tag matches package version
+        id: version
+        env:
+          TAG_NAME: ${{ github.event.release.tag_name }}
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+          if [[ "$TAG_NAME" != "v$VERSION" ]]; then
+            echo "::error::release tag $TAG_NAME does not match package.json version v$VERSION"
+            exit 1
+          fi
+          if [[ "$VERSION" == *-* ]]; then
+            echo "dist-tag=next" >> "$GITHUB_OUTPUT"
+          else
+            echo "dist-tag=latest" >> "$GITHUB_OUTPUT"
+          fi
+
+      - run: npm ci
+      - run: npm run format:check
+      - run: npm test
+
+      # A release can be cut from a commit test.yml never ran on, so the tarball to publish is tested here.
+      - run: mkdir package && npm pack --pack-destination package
+      - run: node scripts/install-fixtures.js package/*.tgz
+      - run: npm run test:integration
+        timeout-minutes: 10
+        env:
+          HARPER_INTEGRATION_TEST_LOG_DIR: /tmp/harper-test-logs
+      - if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: harper-logs-release
+          path: /tmp/harper-test-logs
+          retention-days: 7
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: package
+          path: package/*.tgz
+          retention-days: 7
+
+  publish:
+    name: Publish to npm
+    needs: verify
+    runs-on: ubuntu-latest
+    environment: Release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      # Trusted publishing (OIDC) requires npm >= 11.5.1; the Node 22 runner ships npm 10.x.
+      - run: npm install -g npm@11.21.1
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: package
+
+      # Auth is npm trusted publishing (OIDC) via id-token: no NODE_AUTH_TOKEN/secret. Configured at
+      # npmjs.com: Trusted Publisher -> HarperFast/agent-memory, release.yml, Release environment.
+      - run: npm publish ./*.tgz --provenance --access public --tag "${{ needs.verify.outputs.dist-tag }}"

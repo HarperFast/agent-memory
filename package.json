@@ -1,8 +1,21 @@
 {
 	"name": "@harperfast/agent-memory",
-	"version": "0.0.0",
-	"private": true,
-	"description": "Shared, permissioned, live memory for agents and people \u2014 a Harper plugin",
+	"version": "0.1.0",
+	"description": "Shared, permissioned, live memory for agents and people — a Harper plugin",
+	"license": "Apache-2.0",
+	"author": {
+		"name": "HarperDB, Inc.",
+		"email": "opensource@harperdb.io",
+		"url": "https://harper.fast/"
+	},
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/HarperFast/agent-memory.git"
+	},
+	"bugs": {
+		"url": "https://github.com/HarperFast/agent-memory/issues"
+	},
+	"homepage": "https://github.com/HarperFast/agent-memory#readme",
 	"type": "module",
 	"main": "dist/index.js",
 	"exports": {
@@ -11,13 +24,17 @@
 	},
 	"files": [
 		"dist/",
+		"!dist/**/*.map",
 		"schema/",
 		"config.yaml",
 		"README.md",
-		"DESIGN.md"
+		"DESIGN.md",
+		"CHANGELOG.md",
+		"LICENSE"
 	],
 	"scripts": {
 		"build": "tsc",
+		"prepack": "node -e \"fs.rmSync('dist', { recursive: true, force: true })\" && tsc --sourceMap false",
 		"test": "npm run build && node --import ./test/helpers/harper-mock.mjs --test \"test/**/*.test.js\"",
 		"install:fixtures": "node scripts/install-fixtures.js",
 		"test:integration": "harper-integration-test-run \"integrationTests/**/*.test.ts\"",
@@ -37,5 +54,8 @@
 	},
 	"engines": {
 		"node": ">=22"
+	},
+	"publishConfig": {
+		"access": "public"
 	}
 }
