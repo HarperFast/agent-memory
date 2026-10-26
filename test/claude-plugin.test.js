@@ -481,6 +481,73 @@ describe('SessionStart bootstrap hook and read-through cache', () => {
 });
 
 describe('UserPromptSubmit recall hook, deduplication, timeout, and fail-safe', () => {
+	it('bounds recall terms after removing fences, URLs and code punctuation', async () => {
+		const { buildRecallQuery } = await import('../claude-plugin/lib/hooks.mjs');
+		assert.equal(
+			buildRecallQuery('Explain\n```js\nthrow secret\n```\ndisk https://example.com/a?b=c pressure'),
+			'Explain disk pressure',
+		);
+		assert.equal(buildRecallQuery('before\n~~~js\nsecret\n~~~\nafter'), 'before after');
+		assert.equal(buildRecallQuery('disk\n```unclosed secret'), 'disk');
+		assert.equal(buildRecallQuery('Check:\r\n```js\r\nconst s = \"secretToken\";\r\n```\r\nWhy?'), 'Check Why');
+		assert.equal(buildRecallQuery('Check:\r~~~js\rsecretToken\r~~~\rWhy?'), 'Check Why');
+		assert.equal(
+			buildRecallQuery('Check:\n```js\nconst s = "```secretToken";\n```\nWhy did disk recall fail?'),
+			'Check Why did disk recall fail',
+		);
+		assert.equal(buildRecallQuery('before\n````js\n``` inner code\n`````\nafter'), 'before after');
+		assert.ok(
+			buildRecallQuery(
+				'  File "app.py", line 10\n    x = foo(bar)\n        ~~~^^^^^\nValueError: disk quota exceeded\nHow do I fix this?',
+			).includes('ValueError disk quota exceeded'),
+		);
+		assert.equal(buildRecallQuery('wrap it in ``` blocks and continue'), 'wrap it in blocks and continue');
+		assert.equal(buildRecallQuery('-'.repeat(1000) + ' disk pressure'), 'disk pressure');
+		assert.equal(buildRecallQuery('-'.repeat(32_000) + ' disk pressure'), '');
+
+		assert.equal(buildRecallQuery('www.example.com/foo !!!'), '');
+		assert.equal(buildRecallQuery('ｈｔｔｐｓ://example.com/private !!!'), '');
+		assert.equal(
+			buildRecallQuery('foo.bar() => abc123def camelCase snake_case'),
+			'foo bar abc123def camelCase snake case',
+		);
+		assert.equal(buildRecallQuery('Ｃａｃｈｅ 記憶 café'), 'Cache 記憶 café');
+		assert.equal(buildRecallQuery(null), '');
+		assert.equal(buildRecallQuery('!!! * ? ()'), '');
+		const triggering = Array.from({ length: 65 }, (_, i) => `w${i}`).join('.');
+		assert.equal(buildRecallQuery(triggering), Array.from({ length: 32 }, (_, i) => `w${i}`).join(' '));
+		assert.ok(buildRecallQuery(('longword'.repeat(10) + ' ').repeat(40)).length <= QUERY_MAX_CHARS);
+		assert.doesNotThrow(() => encodeURIComponent(buildRecallQuery('𐐀'.repeat(501))));
+	});
+
+	it('uses the bounded query in the hook and skips empty sanitized queries', async () => {
+		const { buildRecallQuery } = await import('../claude-plugin/lib/hooks.mjs');
+		const tmp = makeTempDir();
+		try {
+			const config = resolveConfig({
+				AGENT_MEMORY_URL: 'https://memory.example.com',
+				AGENT_MEMORY_TOKEN: 'tok',
+				AGENT_MEMORY_CACHE_DIR: tmp,
+			});
+			let fetched = 0;
+			const prompt =
+				'disk\n```js\nsecret\n```\nhttps://example.com ' + Array.from({ length: 65 }, (_, i) => `w${i}`).join(' ');
+			const fetchImpl = async (url) => {
+				fetched++;
+				assert.equal(new URL(url).searchParams.get('q'), buildRecallQuery(prompt));
+				return Response.json({ memories: [] });
+			};
+			await handleUserPromptSubmit({ session_id: 'bounded', prompt }, { config, fetchImpl });
+			assert.equal(fetched, 1);
+			for (const prompt of ['```js\nsecret\n```', 'https://example.com/foo', '!!!']) {
+				await handleUserPromptSubmit({ session_id: 'bounded', prompt }, { config, fetchImpl });
+			}
+			assert.equal(fetched, 1);
+		} finally {
+			rmSync(tmp, { recursive: true, force: true });
+		}
+	});
+
 	it('truncates >1000 char prompts, passes watch=true, and skips already-injected IDs', async () => {
 		const tmp = makeTempDir();
 		try {
@@ -1259,6 +1326,37 @@ describe('scripts/import-claude-memory.mjs', () => {
 });
 
 describe('scripts/eval-recall.mjs', () => {
+	it('evaluates bounded hook queries and records empty sanitized prompts as misses without listing memories', async () => {
+		const prompt =
+			'disk https://example.com\n```js\nsecret\n```\n' + Array.from({ length: 65 }, (_, i) => `w${i}`).join('.');
+		let requests = 0;
+		const summary = await evaluateRecallDataset(
+			[
+				{ prompt, expectedIds: ['mem_1'] },
+				{ prompt: '```js\nsecret\n```', expectedIds: ['mem_2'] },
+			],
+			{
+				baseUrl: 'https://memory.example.com',
+				authorization: 'Bearer tok',
+				k: 5,
+				timeoutMs: 1000,
+				fetchImpl: async (url) => {
+					requests++;
+					const query = new URL(url).searchParams.get('q');
+					assert.equal(query.split(' ').length, 32);
+					assert.ok(!query.includes('secret') && !query.includes('example'));
+					return Response.json({ memories: [{ id: 'mem_1' }] });
+				},
+			},
+		);
+		assert.equal(requests, 1);
+		assert.equal(summary.recallAtK, 0.5);
+		assert.equal(summary.errors, 0);
+		assert.equal(summary.skipped, 1);
+		assert.equal(summary.results[1].latencyMs, 0);
+		assert.equal(summary.latencyMs.min, summary.results[0].latencyMs);
+	});
+
 	it('computes recall@k, hitRate, timeoutRate, and latency percentiles over a JSONL dataset with watch=true by default', async () => {
 		const tmp = makeTempDir();
 		try {

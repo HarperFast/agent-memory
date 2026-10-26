@@ -232,6 +232,158 @@ describe('searchMemories', () => {
 		);
 	});
 
+	it('serves scoped vector results for synchronous and iterated full-text query rejections, warning once per minute', async () => {
+		const stored = await create(alice, 'disk fallback');
+		await create(bob, 'disk private');
+		const { databases, logger } = await import('harper');
+		const Memory = databases.memory.Memory;
+		const search = Memory.search;
+		const warn = logger.warn;
+		const dateNow = Date.now;
+		const start = dateNow() + 60_001;
+		let now = start;
+		let synchronous = true;
+		const warnings = [];
+		const rejection = Object.assign(new Error("Full-text query on 'text' is invalid"), { statusCode: 400 });
+		Memory.search = function (query, ctx) {
+			if (query.conditions?.some((condition) => condition.attribute === 'text')) {
+				if (synchronous) throw rejection;
+				return (async function* () {
+					yield { ...stored, id: 'partial-must-be-dropped' };
+					throw rejection;
+				})();
+			}
+			return search.call(this, query, ctx);
+		};
+		logger.warn = (...args) => warnings.push(args);
+		Date.now = () => now;
+		try {
+			for (const offset of [0, 59_999, 60_000]) {
+				now = start + offset;
+				const hits = await searchMemories(params('q=disk'), alice, context);
+				assert.deepEqual(
+					hits.map((hit) => hit.id),
+					[stored.id],
+				);
+				synchronous = false;
+			}
+			assert.equal(warnings.length, 2);
+			assert.match(warnings[0][0], /full-text.*serving vector results only/);
+			assert.equal(warnings[0].length, 1, 'do not log raw query errors or prompt text');
+		} finally {
+			Memory.search = search;
+			logger.warn = warn;
+			Date.now = dateNow;
+		}
+	});
+
+	it('fails when both lanes reject, including embedding, dimension mismatch and unexpected vector errors', async () => {
+		const { databases, models, logger } = await import('harper');
+		const Memory = databases.memory.Memory;
+		const search = Memory.search;
+		const embed = models.embed;
+		const logError = logger.error;
+		const errors = [];
+		logger.error = (...args) => errors.push(args);
+		const textError = Object.assign(new Error("Full-text query on 'text' is invalid"), { statusCode: 400 });
+		const mismatch = Object.assign(new Error('Search target has 64 dimensions'), { statusCode: 400 });
+		const unavailable = Object.assign(new Error('embedding provider unavailable'), { upstreamStatus: 503 });
+		try {
+			for (const vectorError of [mismatch, new Error('backend down'), unavailable]) {
+				models.embed =
+					vectorError === unavailable
+						? async () => {
+								throw unavailable;
+							}
+						: embed;
+				Memory.search = function (query) {
+					if (query.sort?.target)
+						return (async function* () {
+							throw vectorError;
+						})();
+					throw textError;
+				};
+				await assert.rejects(
+					searchMemories(params('q=disk'), alice, context),
+					(error) => error === (vectorError === mismatch ? textError : vectorError),
+				);
+			}
+			assert.equal(errors.length, 1);
+			assert.match(errors[0][0], /vector search rejected/);
+		} finally {
+			Memory.search = search;
+			models.embed = embed;
+			logger.error = logError;
+		}
+	});
+
+	it('accepts an empty successful vector lane, but propagates unrelated full-text failures', async () => {
+		const Memory = (await import('harper')).databases.memory.Memory;
+		const search = Memory.search;
+		let textError = Object.assign(new Error("Full-text query on 'text' is invalid"), { statusCode: 400 });
+		Memory.search = function (query, ctx) {
+			if (query.sort?.target) return search.call(this, query, ctx);
+			throw textError;
+		};
+		try {
+			assert.deepEqual(await searchMemories(params('q=disk'), alice, context), []);
+			for (const error of [
+				Object.assign(new Error('invalid scope condition'), { statusCode: 400 }),
+				Object.assign(new Error("Full-text query on 'other' is invalid"), { statusCode: 400 }),
+				Object.assign(new Error("Full-text query on 'text' is invalid"), { statusCode: 503 }),
+				new Error('storage failed'),
+			]) {
+				textError = error;
+				await assert.rejects(searchMemories(params('q=disk'), alice, context), (caught) => caught === error);
+			}
+		} finally {
+			Memory.search = search;
+		}
+	});
+
+	it('preserves an unexpected full-text failure during an embedding outage', async () => {
+		const { databases, models } = await import('harper');
+		const search = databases.memory.Memory.search;
+		const embed = models.embed;
+		const textError = new Error('full-text storage failed');
+		models.embed = async () => {
+			throw Object.assign(new Error('embedding rate limited'), { upstreamStatus: 429 });
+		};
+		databases.memory.Memory.search = () => {
+			throw textError;
+		};
+		try {
+			await assert.rejects(searchMemories(params('q=disk'), alice, context), (error) => error === textError);
+		} finally {
+			databases.memory.Memory.search = search;
+			models.embed = embed;
+		}
+	});
+
+	it('counts an empty embedding response as a failed vector lane', async () => {
+		const stored = await create(alice, 'disk empty embedding');
+		const { databases, models } = await import('harper');
+		const search = databases.memory.Memory.search;
+		const embed = models.embed;
+		try {
+			for (const vectors of [[], [undefined], [[]]]) {
+				models.embed = async () => vectors;
+				databases.memory.Memory.search = search;
+				assert.deepEqual(
+					(await searchMemories(params('q=disk'), alice, context)).map((hit) => hit.id),
+					[stored.id],
+				);
+				databases.memory.Memory.search = () => {
+					throw Object.assign(new Error("Full-text query on 'text' is invalid"), { statusCode: 400 });
+				};
+				await assert.rejects(searchMemories(params('q=disk'), alice, context), /Query embedding returned no vector/);
+			}
+		} finally {
+			databases.memory.Memory.search = search;
+			models.embed = embed;
+		}
+	});
+
 	it('serves full-text results when query embedding fails', async () => {
 		const stored = await create(alice, 'disk outage', { content: 'disk pressure during embedder outage' });
 		const { models } = await import('harper');

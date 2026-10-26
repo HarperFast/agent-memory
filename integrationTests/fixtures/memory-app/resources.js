@@ -105,6 +105,25 @@ export class MismatchProbe extends Resource {
 	}
 }
 
+export class FullTextProbe extends Resource {
+	static loadAsInstance = false;
+	async get(target) {
+		try {
+			for await (const _ of databases.memory.Memory.search({
+				conditions: [{ attribute: 'text', comparator: 'matches', value: target.get('q') }],
+				select: ['id'],
+				limit: 1,
+			}));
+			return { statusCode: 200 };
+		} catch (error) {
+			return {
+				statusCode: error?.statusCode,
+				queryRejected: String(error?.message) === "Full-text query on 'text' is invalid",
+			};
+		}
+	}
+}
+
 // Reproduces the exact request mutations performed by `@harperfast/oauth` `mcp` mode (`withMCPAuth` and
 // `OAuthResource` with `optional: true`) to verify whether they populate `context.user` on Harper core's
 // native `/mcp` endpoint (HarperFast/oauth#279).

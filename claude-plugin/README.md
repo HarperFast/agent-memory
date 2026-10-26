@@ -43,7 +43,7 @@ Configure your Harper endpoint and user-bound credential:
 - `AGENT_MEMORY_RECALL_BUDGET`: character budget for `UserPromptSubmit` recall injection (default `2000`).
 - `AGENT_MEMORY_RECALL_TIMEOUT_MS`: hard timeout in ms for `UserPromptSubmit` recall request (default `1500`).
 - `AGENT_MEMORY_RECALL_LIMIT`: maximum memories fetched per prompt (default `5`, max `50`).
-- `AGENT_MEMORY_RECALL=off`: disable per-prompt `UserPromptSubmit` recall (prompts are otherwise truncated to `1000` characters and sent as `GET /Memory/?q=<prompt>`, which may appear in server/proxy access logs and be sent to the server's embedding provider).
+- `AGENT_MEMORY_RECALL=off`: disable per-prompt `UserPromptSubmit` recall. With recall enabled, queries inspect the first `32000` prompt characters, normalize Unicode, strip fenced code blocks and URLs, and keep at most `1000` characters and `32` letter/number terms before being sent as `GET /Memory/?q=<query>`. Queries may appear in server/proxy access logs and be sent to the server's embedding provider. Code-only, URL-only and punctuation-only prompts skip recall.
 - `AGENT_MEMORY_DISABLE_FOLLOWER=1`: disable the per-session detached `/MemoryEvents` SSE follower.
 
 ## Memory Routing

@@ -24,6 +24,32 @@ export function truncatePrompt(prompt) {
 	return text.slice(0, QUERY_MAX_CHARS);
 }
 
+export function buildRecallQuery(prompt) {
+	let fence;
+	const text = String(prompt ?? '')
+		.slice(0, 32_000)
+		.normalize('NFKC')
+		.split(/\r\n?|\n/)
+		.filter((line) => {
+			const marker = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+			if (fence) {
+				if (marker && marker[1][0] === fence[0] && marker[1].length >= fence.length && /^\s*$/.test(marker[2])) {
+					fence = undefined;
+				}
+				return false;
+			}
+			if (marker && (marker[1][0] !== '`' || !marker[2].includes('`'))) {
+				fence = marker[1];
+				return false;
+			}
+			return true;
+		})
+		.join(' ')
+		.replace(/\b(?:https?:\/\/|ftp:\/\/|www\.)\S+/gi, ' ');
+	const query = (text.match(/[\p{L}\p{N}]+/gu) ?? []).slice(0, 32).join(' ');
+	return truncatePrompt(query).replace(/[\uD800-\uDBFF]$/, '');
+}
+
 function buildChangeNotices(state, drainedEvents, recalledMemories = []) {
 	const notices = [];
 	const injectedSet = new Set(state.injectedIds);
@@ -332,7 +358,7 @@ export async function handleUserPromptSubmit(input = {}, options = {}) {
 
 	const sessionId = String(input.session_id || 'default');
 	const rawPrompt = input.prompt ?? input.user_prompt ?? '';
-	const query = truncatePrompt(rawPrompt);
+	const query = buildRecallQuery(rawPrompt);
 
 	const state = loadSessionState(config, sessionId);
 	if (state.corrupt) {
