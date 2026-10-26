@@ -233,10 +233,17 @@ export async function run(
 			conflict: imported.conflict,
 			conflicts: imported.conflicts,
 		};
-		const verified = await compareRows(toRequest, intended, stderr);
+		let verified;
+		let recheck;
+		try {
+			verified = await compareRows(toRequest, intended, stderr);
+			// A write, or a model's content verdict, that landed on the source after it was read is not in the copy.
+			recheck = await compareRows(fromRequest, intended, stderr, true);
+		} catch (error) {
+			stdout.write(JSON.stringify(report, null, '\t') + '\n');
+			throw error;
+		}
 		report.verified = verified;
-		// A write, or a model's content verdict, that landed on the source after it was read is not in the copy.
-		const recheck = await compareRows(fromRequest, intended, stderr, true);
 		report.sourceChanged = { new: recheck.foreign, changed: recheck.mismatched, gone: recheck.missing };
 		const empty = (...lists) => lists.every((list) => list.length === 0);
 		const complete =

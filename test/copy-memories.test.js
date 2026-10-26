@@ -37,7 +37,6 @@ const view = (tag, overrides = {}) => ({
 	...overrides,
 });
 
-// Two fake instances: each serves its `memories` through the list (honoring the cursor) and records imports.
 function fakeInstance() {
 	const instance = {
 		memories: [],
