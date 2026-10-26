@@ -1528,6 +1528,10 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 		const created = JSON.parse(rememberRes.body.result.content[0].text);
 		strictEqual(created.id, rememberId);
 		strictEqual(created.revision, 1);
+		deepStrictEqual(created.scopes, ['global']);
+		strictEqual(created.status, 'active');
+		strictEqual(created.needsReview, null);
+		strictEqual(created.contentFlag, null);
 
 		// revise
 		const reviseRes = await mcpCall(
@@ -1547,6 +1551,10 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 		);
 		const revised = JSON.parse(reviseRes.body.result.content[0].text);
 		strictEqual(revised.revision, 2);
+		deepStrictEqual(revised.scopes, ['global']);
+		strictEqual(revised.status, 'active');
+		strictEqual(revised.needsReview, null);
+		strictEqual(revised.contentFlag, null);
 
 		// get & resources/read
 		const getRes = await mcpCall('bob', 'tools/call', { name: 'get', arguments: { id: rememberId } }, bobSession);
