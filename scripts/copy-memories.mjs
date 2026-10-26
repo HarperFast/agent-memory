@@ -5,8 +5,8 @@ import { assertSafeUrl, isEntryPoint, UsageError } from './lib/cli.mjs';
 import { createClient, memoryPages, postBatches } from './lib/memory-api.mjs';
 
 const MAX_BATCH_SIZE = 100;
-// The whole source is held to order it successor-first; past this many title and content characters the copy
-// refuses before it writes anything.
+// The whole source is held to order it successor-first; past this many characters of row JSON the copy refuses
+// before it writes anything.
 const MAX_BUFFERED_CHARS = 256 * 1024 * 1024;
 const FROM_AUTHORIZATION = 'AGENT_MEMORY_FROM_AUTHORIZATION';
 const TO_AUTHORIZATION = 'AGENT_MEMORY_TO_AUTHORIZATION';
@@ -109,7 +109,7 @@ async function readSource(request, { maxBufferedChars, stderr }) {
 	let chars = 0;
 	for await (const page of memoryPages(request, { includeWithdrawn: true })) {
 		for (const view of page) {
-			chars += (view.title?.length ?? 0) + String(view.content).length;
+			chars += JSON.stringify(view).length;
 			if (chars > maxBufferedChars) {
 				throw new Error(`the source holds more than ${maxBufferedChars} characters of memories; nothing was written`);
 			}

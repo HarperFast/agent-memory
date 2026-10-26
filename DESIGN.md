@@ -777,7 +777,7 @@ broader reads (labels are copied verbatim; that precondition is documented, not 
 
 - **Read**: the whole source through the created-order cursor with `includeSuperseded`, `includeExpired` and
   `includeWithdrawn`, refusing a page that does not acknowledge `includeWithdrawn`. Held in memory to order it,
-  up to 256 Mi title and content characters, past which it refuses before writing.
+  up to 256 Mi characters of row JSON, past which it refuses before writing.
 - **Row**: the view's import fields (`contentFlag` and `needsReview` included), never the embedding: the target
   re-embeds with its own model. Not carried, because import cannot set them: `revision`, `author` / `lastEditor`,
   `confirmed`, `scopeConfirmed` (the target's own pattern check may flag the row again, which fails closed),
