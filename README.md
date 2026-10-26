@@ -21,12 +21,12 @@ Status: v0 (0.x releases may change contracts; see [CHANGELOG.md](CHANGELOG.md))
 npm install @harperfast/agent-memory
 ```
 
-`harper` (5.3.1 or later) is a peer dependency: the host app provides it. Enable the plugin under its package
-name in the host app's `config.yaml`, as in step 1 below.
+`harper` (`^5.3.1`: 5.3.1 or later within 5.x) is a peer dependency: the host app provides it. Enable the plugin
+under its package name in the host app's `config.yaml`, as in step 1 below.
 
 ## Quick start
 
-Requires Harper 5.3.1 or later on RocksDB (the default).
+Requires Harper 5.3.1 or later within 5.x, on RocksDB (the default).
 
 1. Add the plugin and an embedding model to the host app. The plugin embeds with the model named by
    `embeddingModel` (default `default`), so any Harper embedding backend works:

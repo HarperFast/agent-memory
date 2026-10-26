@@ -4,6 +4,14 @@ All notable changes to `@harperfast/agent-memory` are documented here. The forma
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-10-26
+
+### Changed
+
+- The `harper` peer dependency is now `^5.3.1` (was `>=5.3.1`). Harper 6, which the plugin has not been tested
+  against, is outside the declared range, so npm reports a peer conflict for it. Harper 5.3.1 or later within 5.x
+  is supported, as before.
+
 ## [0.1.0] - 2026-10-24
 
 First npm release. Requires Harper 5.3.1 or later (`harper` peer dependency) on RocksDB. Design and contracts:
@@ -34,4 +42,5 @@ First npm release. Requires Harper 5.3.1 or later (`harper` peer dependency) on 
   `setPrincipalResolver` (map app-defined identities), and `resolvePrincipal` / `canReadLabels` (authorize
   other components with the same identity and grants).
 
+[0.1.1]: https://github.com/HarperFast/agent-memory/releases/tag/v0.1.1
 [0.1.0]: https://github.com/HarperFast/agent-memory/releases/tag/v0.1.0
