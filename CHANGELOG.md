@@ -8,8 +8,9 @@ All notable changes to `@harperfast/agent-memory` are documented here. The forma
 
 ### Changed
 
-- The `harper` peer dependency is now `^5.3.1` (was `>=5.3.1`), so npm no longer accepts Harper 6, which the
-  plugin has not been tested against. Harper 5.3.1 or later within 5.x is supported, as before.
+- The `harper` peer dependency is now `^5.3.1` (was `>=5.3.1`). Harper 6, which the plugin has not been tested
+  against, is outside the declared range, so npm reports a peer conflict for it. Harper 5.3.1 or later within 5.x
+  is supported, as before.
 
 ## [0.1.0] - 2026-10-24
 
