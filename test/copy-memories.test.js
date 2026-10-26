@@ -335,6 +335,29 @@ describe('run', () => {
 		}
 	});
 
+	it('fails when the source changed after it was read, such as a late model verdict', async () => {
+		seed(2);
+		const handle = target.handle;
+		target.handle = async (request, response) => {
+			await handle(request, response);
+			if (request.method === 'POST') {
+				source.memories[1].contentFlag = {
+					kind: 'possible-customer-detail',
+					since: '2025-03-01T00:00:00.000Z',
+					source: 'model',
+				};
+			}
+		};
+		try {
+			const result = await cli(['--from', sourceUrl, '--to', targetUrl]);
+			assert.equal(result.code, 1);
+			assert.deepEqual(result.report.verified.mismatched, []);
+			assert.deepEqual(result.report.sourceChanged.changed, [{ id: source.memories[1].id, fields: ['contentFlag'] }]);
+		} finally {
+			target.handle = handle;
+		}
+	});
+
 	it('takes credentials from the environment only', async () => {
 		let result = await cli(['--from', sourceUrl, '--to', targetUrl], { env: {} });
 		assert.equal(result.code, 2);

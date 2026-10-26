@@ -239,7 +239,7 @@ describe('importMemories', () => {
 			await importMemories(
 				{
 					rows: [
-						row(1, { scopes: ['global'], contentFlag: { ...flag, labels: ['customer:x'] } }),
+						row(1, { scopes: ['global'], contentFlag: { ...flag, labels: ['customer:x', 'zorb-host'] } }),
 						row(2, { needsReview: review }),
 						row(3, { contentFlag: null, needsReview: null }),
 					],
@@ -248,7 +248,7 @@ describe('importMemories', () => {
 				context,
 			);
 			const flagged = rows().get(idOf(1));
-			assert.deepEqual(flagged.contentFlag, { ...flag, labels: ['customer:x'] });
+			assert.deepEqual(flagged.contentFlag, { ...flag, labels: ['customer:x', 'zorb-host'] });
 			assert.equal(flagged.contentFlagged, true);
 			const reviewed = rows().get(idOf(2));
 			assert.deepEqual(reviewed.needsReview, review);

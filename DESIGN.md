@@ -790,9 +790,13 @@ broader reads (labels are copied verbatim; that precondition is documented, not 
   batch can change the status of a stored row it supersedes, so only a target holding nothing but this copy keeps
   both from hiding a difference. A target row may carry a content flag the source row lacks (its own check
   matched), never lack one.
-- **Verify**: after the batches, the same comparison over the whole target; exit 0 only when every source row is
-  present and matches. A re-run of an interrupted copy passes the check and imports the rest; the rows already
-  there come back `unchanged`.
+- **Verify**: after the batches, the same comparison over the whole target, then an exact one over the whole source
+  again (a write or a model's content verdict that landed after the read, up to 30 s after its write, would
+  otherwise be lost while the copy reported success); exit 0 only when both match. A re-run of an interrupted copy
+  passes the check and imports the rest; the rows already there come back `unchanged`.
+- **One target node**: successor-first order relies on each batch seeing the earlier ones, so `--to` names one node;
+  through a balancer over several, a predecessor could reach a node its replacement has not replicated to and be
+  stored `active`.
 - **Output**: ids, counts, scope labels and codes; credentials come from `AGENT_MEMORY_FROM_AUTHORIZATION` and
   `AGENT_MEMORY_TO_AUTHORIZATION`, never argv.
 

@@ -364,9 +364,12 @@ node scripts/copy-memories.mjs --from https://test.example.com --to https://app.
 | `--batch-size <n>` | Rows per import request, 1–100 (default 100)           |
 | `--dry-run`        | Read only                                              |
 
-- **Stop writers first.** Copy at cutover, with no agent writing to either app. A memory written to the source
-  during the walk can be missed (re-run to pick it up); one revised on the source after a copy makes the next run
-  refuse rather than overwrite.
+- **Stop writers first.** Copy at cutover, with no agent writing to either app, and wait 30 seconds after the last
+  write so any pending customer-content model check has ruled. After the copy, the script reads the source again
+  and fails if anything changed since it was read (`sourceChanged`). A memory missing from the copy is picked up by a
+  re-run; one that changed on the source after it was copied makes the next run refuse rather than overwrite.
+- **One target node.** `--to` must reach a single Harper node, not a load balancer over several: each batch relies
+  on the previous ones being visible, which replication lag between nodes does not guarantee.
 - **The target must hold only this copy.** Before writing, the script compares every target memory with the source
   and refuses if the target has a memory of its own or one that differs. Exit status is 0 only when the final
   comparison matches.

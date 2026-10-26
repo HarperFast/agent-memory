@@ -203,6 +203,7 @@ suite('@harperfast/agent-memory copy between two instances', (ctx: ContextWithHa
 			scopes: ['customer:zorblax'],
 		});
 		await put('alice', 'pattern-flag', shared('Zorblax saw replication lag'));
+		await put('alice', 'host-flag', shared('replica db1.zorbcloud.test fell behind'));
 		await put('alice', 'model-flag', shared('incident write-up MODEL-SAYS-CUSTOMER'));
 		await eventually(
 			() => call('source', 'admin', 'GET', memId('model-flag')),
@@ -227,7 +228,8 @@ suite('@harperfast/agent-memory copy between two instances', (ctx: ContextWithHa
 		strictEqual(dryRun.report.source.memories, sourceRows.size);
 		strictEqual(dryRun.report.source.byStatus.withdrawn, 1);
 		strictEqual(dryRun.report.source.byScope['user:alice'], 1);
-		strictEqual(dryRun.report.source.contentFlagged, 2);
+		strictEqual(dryRun.report.source.contentFlagged, 3);
+		deepStrictEqual(sourceRows.get(memId('host-flag')).contentFlag.labels, ['zorb-host']);
 		strictEqual((await listAll('target')).size, 0, 'a dry run writes nothing');
 
 		const first = await runCopy([
@@ -252,7 +254,7 @@ suite('@harperfast/agent-memory copy between two instances', (ctx: ContextWithHa
 		strictEqual(targetRows.get(memId('cites-h')).needsReview, null, 'an answered review is not raised again');
 
 		// The target checks nothing, so only the carried flags keep these from global readers.
-		for (const tag of ['pattern-flag', 'model-flag']) {
+		for (const tag of ['pattern-flag', 'host-flag', 'model-flag']) {
 			strictEqual((await call('target', 'fleet', 'GET', memId(tag))).status, 404, tag);
 			strictEqual((await call('target', 'dave', 'GET', memId(tag))).status, 200, tag);
 		}

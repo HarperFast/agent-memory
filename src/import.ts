@@ -25,7 +25,7 @@ import {
 	WITHDRAW_REASON_MAX_CHARS,
 	withLockPlan,
 } from './lifecycle.ts';
-import { checkedText, matchCustomerContent } from './patterns.ts';
+import { checkedText, HOST_LABEL, matchCustomerContent } from './patterns.ts';
 import { activeDependentIds, CLEARED_REVIEW, flagDependents, reviewFlagFor, type ReviewFlag } from './provenance.ts';
 import { CONTENT_FLAG_KIND, type ContentFlag, contentFlagFields, decideContentFlag } from './quarantine.ts';
 import { isScopeLabel, MAX_SCOPES_PER_MEMORY, requirePrincipalId, type Principal } from './scopes.ts';
@@ -82,7 +82,9 @@ function carriedContentFlag(value: unknown, scopes: readonly string[]): ContentF
 		throw invalid();
 	}
 	if (labels === undefined) return { kind, since: at, source };
-	if (!Array.isArray(labels) || labels.length > MAX_SCOPES_PER_MEMORY || !labels.every(isScopeLabel)) throw invalid();
+	// A flag lists a `customer:` label per matched name and the configured label of each matched host rule.
+	const isFlagLabel = (label: unknown) => isScopeLabel(label) || (typeof label === 'string' && HOST_LABEL.test(label));
+	if (!Array.isArray(labels) || !labels.every(isFlagLabel)) throw invalid();
 	return { kind, since: at, source, labels: [...labels] };
 }
 

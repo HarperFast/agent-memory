@@ -7,7 +7,7 @@ import { createClient, memoryPages, postBatches } from './lib/memory-api.mjs';
 const MAX_BATCH_SIZE = 100;
 // The whole source is held to order it successor-first; past this many title and content characters the copy
 // refuses before it writes anything.
-export const MAX_BUFFERED_CHARS = 256 * 1024 * 1024;
+const MAX_BUFFERED_CHARS = 256 * 1024 * 1024;
 const FROM_AUTHORIZATION = 'AGENT_MEMORY_FROM_AUTHORIZATION';
 const TO_AUTHORIZATION = 'AGENT_MEMORY_TO_AUTHORIZATION';
 const OPTIONAL_FIELDS = [
@@ -19,7 +19,6 @@ const OPTIONAL_FIELDS = [
 	'contentFlag',
 	'needsReview',
 ];
-// Every field the import row carries, compared between source and target; contentFlag is compared separately.
 const COMPARED_FIELDS = [
 	'ownerId',
 	'title',
@@ -37,7 +36,6 @@ const COMPARED_FIELDS = [
 	'needsReview',
 ];
 
-/** The import row that recreates a memory view on another instance. Server-owned state import cannot set is left out. */
 export function toImportRow(view) {
 	const row = {
 		id: view.id,
@@ -57,13 +55,13 @@ export function toImportRow(view) {
 const same = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
 
 /**
- * The fields where a target row differs from the row the copy intends. A target may carry a content flag the source
- * row lacks (its own check matched more), never lack one the source row has.
+ * The fields where a row differs from the row the copy intends. Unless `exact`, the row may carry a content flag the
+ * intended row lacks (the target's own check matched more), never lack one.
  */
-export function differences(intended, view) {
+export function differences(intended, view, exact = false) {
 	const actual = toImportRow(view);
 	const fields = COMPARED_FIELDS.filter((field) => !same(intended[field], actual[field]));
-	if (intended.contentFlag && !same(intended.contentFlag, actual.contentFlag)) fields.push('contentFlag');
+	if ((exact || intended.contentFlag) && !same(intended.contentFlag, actual.contentFlag)) fields.push('contentFlag');
 	return fields;
 }
 
@@ -130,8 +128,7 @@ async function readSource(request, { maxBufferedChars, stderr }) {
 	return { rows, summary };
 }
 
-/** Compares every target row with the intended rows: `missing` are intended ids the target lacks. */
-async function compareTarget(request, intended, stderr) {
+async function compareRows(request, intended, stderr, exact = false) {
 	const foreign = [];
 	const mismatched = [];
 	const seen = new Set();
@@ -143,10 +140,10 @@ async function compareTarget(request, intended, stderr) {
 				continue;
 			}
 			seen.add(view.id);
-			const fields = differences(row, view);
+			const fields = differences(row, view, exact);
 			if (fields.length > 0) mismatched.push({ id: view.id, fields });
 		}
-		stderr.write(`compared ${seen.size + foreign.length} target memories\n`);
+		stderr.write(`compared ${seen.size + foreign.length} memories\n`);
 	}
 	const missing = [...intended.keys()].filter((id) => !seen.has(id));
 	return { present: seen.size, missing, foreign, mismatched };
@@ -210,7 +207,7 @@ export async function run(
 		}
 
 		const toRequest = createClient(to, toAuthorization);
-		const preflight = await compareTarget(toRequest, intended, stderr);
+		const preflight = await compareRows(toRequest, intended, stderr);
 		report.preflight = { present: preflight.present, foreign: preflight.foreign, mismatched: preflight.mismatched };
 		if (preflight.foreign.length > 0 || preflight.mismatched.length > 0) {
 			report.refused = 'the target holds memories that are not this copy of the source; nothing was written';
@@ -236,14 +233,17 @@ export async function run(
 			conflict: imported.conflict,
 			conflicts: imported.conflicts,
 		};
-		const verified = await compareTarget(toRequest, intended, stderr);
+		const verified = await compareRows(toRequest, intended, stderr);
 		report.verified = verified;
+		// A write, or a model's content verdict, that landed on the source after it was read is not in the copy.
+		const recheck = await compareRows(fromRequest, intended, stderr, true);
+		report.sourceChanged = { new: recheck.foreign, changed: recheck.mismatched, gone: recheck.missing };
+		const empty = (...lists) => lists.every((list) => list.length === 0);
 		const complete =
 			imported.conflict === 0 &&
-			verified.missing.length === 0 &&
-			verified.foreign.length === 0 &&
-			verified.mismatched.length === 0;
-		if (!complete) report.incomplete = 'the target does not match the source; see verified';
+			empty(verified.missing, verified.foreign, verified.mismatched) &&
+			empty(recheck.missing, recheck.foreign, recheck.mismatched);
+		if (!complete) report.incomplete = 'the target does not match the source; see verified and sourceChanged';
 		stdout.write(JSON.stringify(report, null, '\t') + '\n');
 		return complete ? 0 : 1;
 	} catch (error) {

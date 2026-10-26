@@ -2,7 +2,7 @@
 // content.
 import { ERROR_CODE, failureCode } from './cli.mjs';
 
-export const PAGE_SIZE = 50;
+const PAGE_SIZE = 50;
 const REQUEST_TIMEOUT_MS = 60_000;
 // An import batch embeds up to 100 rows before it commits.
 const IMPORT_TIMEOUT_MS = 300_000;
@@ -94,10 +94,6 @@ async function errorDetail(response, rows) {
 	}
 }
 
-/**
- * Sends rows to `POST /Memory/import` in order, `batchSize` at a time. Every batch commits whole or not at all, so a
- * failure reports how far the run got and a re-run resumes.
- */
 export async function postBatches(rows, { target, authorization, batchSize, stderr, label = 'batch' }) {
 	const url = `${target}/Memory/import`;
 	const result = { created: 0, unchanged: 0, conflict: 0, conflicts: [], dependsOnConflict: [] };
