@@ -3,7 +3,7 @@ import { anyOf, canRead, readsCustomerContent, type Principal } from './scopes.t
 
 export type ReviewCause = 'superseded' | 'withdrawn';
 
-interface ReviewFlag {
+export interface ReviewFlag {
 	since: string;
 	cause: ReviewCause;
 	sourceId: string;

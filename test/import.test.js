@@ -225,4 +225,96 @@ describe('importMemories', () => {
 			unregister();
 		}
 	});
+
+	describe('carried review and quarantine state', () => {
+		const flag = { kind: 'possible-customer-detail', since: '2025-03-01T00:00:00.000Z', source: 'model' };
+		const review = {
+			since: '2025-04-01T00:00:00.000Z',
+			cause: 'superseded',
+			sourceId: idOf(9),
+			replacementId: idOf(8),
+		};
+
+		it('stores a carried contentFlag and needsReview on a created row, with their indexed mirrors', async () => {
+			await importMemories(
+				{
+					rows: [
+						row(1, { scopes: ['global'], contentFlag: { ...flag, labels: ['customer:x'] } }),
+						row(2, { needsReview: review }),
+						row(3, { contentFlag: null, needsReview: null }),
+					],
+				},
+				root,
+				context,
+			);
+			const flagged = rows().get(idOf(1));
+			assert.deepEqual(flagged.contentFlag, { ...flag, labels: ['customer:x'] });
+			assert.equal(flagged.contentFlagged, true);
+			const reviewed = rows().get(idOf(2));
+			assert.deepEqual(reviewed.needsReview, review);
+			assert.equal(reviewed.needsReviewSince.toISOString(), review.since);
+			const plain = rows().get(idOf(3));
+			assert.equal(plain.contentFlag, null);
+			assert.equal(plain.needsReview, null);
+		});
+
+		it('keeps a carried flag where the target check would not flag, and a carried review over a batch transition', async () => {
+			applySettings(parseSettings({ customerContentCheck: { mode: 'off' } }));
+			await importMemories(
+				{
+					rows: [
+						row(5, { scopes: ['global'] }),
+						row(6, { scopes: ['global'], evidence: [{ kind: 'memory', ref: idOf(5) }] }),
+					],
+				},
+				root,
+				context,
+			);
+			await importMemories(
+				{
+					rows: [
+						row(1, { scopes: ['global'], contentFlag: flag }),
+						row(7, { scopes: ['global'], supersedes: [idOf(5)] }),
+						row(8, { scopes: ['global'], evidence: [{ kind: 'memory', ref: idOf(5) }], needsReview: review }),
+					],
+				},
+				root,
+				context,
+			);
+			assert.deepEqual(rows().get(idOf(1)).contentFlag, flag);
+			assert.equal(rows().get(idOf(6)).needsReview.sourceId, idOf(5), 'a stored citer is still flagged');
+			assert.deepEqual(rows().get(idOf(8)).needsReview, review);
+		});
+
+		it('leaves an existing row alone and keeps carried state out of the unchanged comparison', async () => {
+			await importMemories({ rows: [row(1, { scopes: ['global'] })] }, root, context);
+			const { results } = await importMemories(
+				{ rows: [row(1, { scopes: ['global'], contentFlag: flag, needsReview: review })] },
+				root,
+				context,
+			);
+			assert.deepEqual(results, [{ id: idOf(1), result: 'unchanged' }]);
+			assert.equal(rows().get(idOf(1)).contentFlag, null);
+			assert.equal(rows().get(idOf(1)).needsReview, null);
+		});
+
+		it('rejects malformed carried state with the row index, before writing anything', async () => {
+			const bad = [
+				[{ contentFlag: flag }, 'invalid_contentFlag'],
+				[{ scopes: ['global'], contentFlag: { ...flag, kind: 'other' } }, 'invalid_contentFlag'],
+				[{ scopes: ['global'], contentFlag: { ...flag, source: 'judge' } }, 'invalid_contentFlag'],
+				[{ scopes: ['global'], contentFlag: { ...flag, since: 'soon' } }, 'invalid_contentFlag'],
+				[{ scopes: ['global'], contentFlag: { ...flag, labels: ['not a label'] } }, 'invalid_contentFlag'],
+				[{ scopes: ['global'], contentFlag: { ...flag, extra: 1 } }, 'invalid_contentFlag'],
+				[{ needsReview: { ...review, cause: 'revised' } }, 'invalid_needsReview'],
+				[{ needsReview: { ...review, sourceId: 'short' } }, 'invalid_needsReview'],
+				[{ needsReview: { ...review, replacementId: 7 } }, 'invalid_needsReview'],
+				[{ needsReview: 'yes' }, 'invalid_needsReview'],
+			];
+			for (const [overrides, code] of bad) {
+				await rejection(importMemories({ rows: [row(1), row(2, overrides)] }, root, context), 400, code, 1);
+			}
+			assert.equal(rows().size, 0);
+		});
+	});
 });
