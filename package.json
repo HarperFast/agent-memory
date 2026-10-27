@@ -1,6 +1,6 @@
 {
 	"name": "@harperfast/agent-memory",
-	"version": "0.1.1",
+	"version": "0.1.2",
 	"description": "Shared, permissioned, live memory for agents and people — a Harper plugin",
 	"license": "Apache-2.0",
 	"author": {

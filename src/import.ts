@@ -209,13 +209,14 @@ export async function importMemories(input: unknown, principal: Principal, reque
 		let batch: Array<{ id: string; content: string }> = [];
 		let chars = 0;
 		for (const row of missing) {
-			if (batch.length > 0 && chars + row.content.length > IMPORT_EMBED_CHARS) {
+			const rowChars = Math.min(row.content.length, settings.embeddingInputChars);
+			if (batch.length > 0 && chars + rowChars > IMPORT_EMBED_CHARS) {
 				await flush(batch);
 				batch = [];
 				chars = 0;
 			}
 			batch.push(row);
-			chars += row.content.length;
+			chars += rowChars;
 		}
 		if (batch.length > 0) await flush(batch);
 	};

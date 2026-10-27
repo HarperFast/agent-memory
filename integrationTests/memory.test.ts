@@ -888,6 +888,47 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 		);
 	});
 
+	test('memories longer than the embedding context window write, revise and import whole, and stay searchable', async () => {
+		const long = (head: string, tail: string) => `${head} ${'filler '.repeat(2_000)}${tail}`.slice(0, 20_000);
+		const created = await create('alice', 'long-gannet', {
+			title: 'gannet',
+			content: long('gannet colony survey', 'cormorant tailnote'),
+			visibility: 'shared',
+		});
+		strictEqual(created.content.length, long('gannet colony survey', 'cormorant tailnote').length);
+		const revised = await call(
+			'alice',
+			'PUT',
+			created.id,
+			{ title: 'gannet', content: long('gannet colony recount', 'shearwater tailnote') },
+			{ 'if-match': '"1"' },
+		);
+		strictEqual(revised.status, 200, JSON.stringify(revised.body));
+
+		const importId = createHash('sha256').update('flair:long-petrel').digest('hex').slice(0, 32);
+		const imported = await call('admin', 'POST', 'import', {
+			rows: [
+				{ id: importId, ownerId: 'alice', content: 'short petrel note', scopes: ['user:alice'], status: 'active' },
+				{
+					id: createHash('sha256').update('flair:long-petrel-2').digest('hex').slice(0, 32),
+					ownerId: 'alice',
+					content: long('petrel burrow census', 'fulmar tailnote'),
+					scopes: ['user:alice'],
+					status: 'active',
+				},
+			],
+		});
+		strictEqual(imported.status, 200, JSON.stringify(imported.body));
+		deepStrictEqual(
+			imported.body.results.map((result: any) => result.result),
+			['created', 'created'],
+		);
+
+		const tail = await call('alice', 'GET', '?q=shearwater');
+		strictEqual(tail.status, 200, JSON.stringify(tail.body));
+		ok(tail.body.memories.some((m: any) => m.id === created.id && m.content.endsWith('shearwater tailnote')));
+	});
+
 	test('import-flair.mjs --decisions: customer records stay out of global reads; lessons are global and flagged on withdrawal', async () => {
 		const tmpDir = mkdtempSync(join(tmpdir(), 'agent-memory-flair-classify-'));
 		try {

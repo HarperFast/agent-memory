@@ -321,13 +321,21 @@ export function toMemoryView(record: any): MemoryView {
 
 const embedderInstalled = new WeakSet<object>();
 
+/** What an embedding request carries for `text`: its leading `limits.embeddingInputChars`, whole code points only. */
+export function embeddingInput(text: string): string {
+	const max = getSettings().embeddingInputChars;
+	if (text.length <= max) return text;
+	const code = text.charCodeAt(max - 1);
+	return text.slice(0, code >= 0xd800 && code <= 0xdbff ? max - 1 : max);
+}
+
 // Every plugin write carries the vector it embedded before its transaction; a write that carries none is
 // embedded here with the model recorded on the row, so the vector and the tag the vector lane filters on are
 // always from the same write.
 async function embedWithRecordModel(record: any, hook?: { signal?: AbortSignal }) {
 	if (record.content == null) return null;
 	if (Array.isArray(record.embedding) && record.embedding.length > 0) return record.embedding;
-	const [vector] = await models.embed(String(record.content), {
+	const [vector] = await models.embed(embeddingInput(String(record.content)), {
 		model: record.embeddingModel ?? DEFAULT_EMBEDDING_MODEL,
 		inputType: 'document',
 		signal: hook?.signal,
@@ -342,7 +350,7 @@ export function ensureEmbedder(Memory: any): void {
 }
 
 export async function embedContents(contents: string[], model: string): Promise<number[][]> {
-	const vectors = await models.embed(contents, { model, inputType: 'document' });
+	const vectors = await models.embed(contents.map(embeddingInput), { model, inputType: 'document' });
 	// The table's embedder would embed again, under the write's locks, for a missing or empty vector.
 	if (vectors?.length !== contents.length || vectors.some((vector) => !vector?.length)) {
 		throw new Error(`embedding model "${model}" returned no vector`);

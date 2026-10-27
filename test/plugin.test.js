@@ -89,6 +89,7 @@ describe('parseSettings', () => {
 			embeddingModel: 'default',
 			titleChars: 200,
 			contentChars: 20000,
+			embeddingInputChars: 6000,
 			supersession: { mode: 'suggest', similarity: 0.82 },
 			mcp: false,
 		});
@@ -96,6 +97,14 @@ describe('parseSettings', () => {
 		assert.equal(parseSettings({ mcp: true }).mcp, true);
 		assert.throws(() => parseSettings({ mcp: 'true' }), /mcp/);
 		assert.throws(() => parseSettings({ limits: { titleChars: 1001 } }));
+		assert.equal(parseSettings({ limits: { embeddingInputChars: 2 } }).embeddingInputChars, 2);
+		assert.equal(parseSettings({ limits: { embeddingInputChars: 100_000 } }).embeddingInputChars, 100_000);
+		for (const embeddingInputChars of [0, 1, 100_001, 1.5, '6000', -1]) {
+			assert.throws(
+				() => parseSettings({ limits: { embeddingInputChars } }),
+				/limits\.embeddingInputChars must be an integer between 2 and 100000/,
+			);
+		}
 		assert.throws(() => parseSettings({ embeddingModel: '' }));
 		assert.throws(() => parseSettings({ urlPath: '/' }));
 	});

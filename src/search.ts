@@ -3,6 +3,7 @@ import { badRequest, memoryError } from './errors.ts';
 import { recordWatches, WATCH_DEFAULT_TTL_SECONDS } from './events.ts';
 import {
 	BOOTSTRAP_PINNED_LIMIT,
+	embeddingInput,
 	isMemoryId,
 	memoryPinTable,
 	memoryTable,
@@ -305,7 +306,7 @@ export async function searchMemories(
 	let embeddingFailed = false;
 	let embeddingError: unknown;
 	try {
-		[vector] = await models.embed(params.q, { model: embeddingModel, inputType: 'query' });
+		[vector] = await models.embed(embeddingInput(params.q), { model: embeddingModel, inputType: 'query' });
 		if (!vector?.length) throw new Error('Query embedding returned no vector');
 	} catch (error) {
 		embeddingFailed = true;
