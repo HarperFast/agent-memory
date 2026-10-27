@@ -1,8 +1,8 @@
 import { canReadLabels, registerMemorySink, resolvePrincipal, setPrincipalResolver } from '@harperfast/agent-memory';
 
 // Deterministic embedding model for the integration suite: a hashed bag of words, so two texts are close
-// exactly when they share words. Registered as the plugin's default `embeddingModel`. Its context window
-// holds the plugin's default `limits.embeddingInputChars`, and longer input fails as a vLLM backend does.
+// exactly when they share words. Registered as the plugin's default `embeddingModel`. Rejects input longer than
+// the plugin's default `limits.embeddingInputChars`, as a backend with a small context window does.
 const CONTEXT_WINDOW_CHARS = 6_000;
 function embedText(text, dimensions = 32) {
 	const vector = new Array(dimensions).fill(0);

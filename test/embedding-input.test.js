@@ -9,7 +9,6 @@ const superUser = { username: 'root', role: { role: 'super_user', permission: { 
 const queryTarget = (query = '', params = {}) => Object.assign(new URLSearchParams(query), params);
 const prose = (chars) => `${'word '.repeat(Math.ceil(chars / 5)).slice(0, chars - 1)}x`;
 
-// Stands in for a backend whose context window holds `limit` characters, answering longer input as vLLM does.
 let limit;
 let sent;
 const embed = models.embed;

@@ -23,7 +23,9 @@ All notable changes to `@harperfast/agent-memory` are documented here. The forma
   now carries at most `limits.embeddingInputChars` characters (default 6000, 2–100000) of the memory content or
   search query, cut at a code-point boundary; the stored content stays complete and full-text search still
   covers all of it. Before, an OpenAI-compatible backend answered such content with HTTP 400, which failed
-  `PUT`, MCP `remember` and `revise` with a 500, and aborted a whole `POST /Memory/import` batch.
+  `PUT`, MCP `remember` and `revise` with a 500, and aborted a whole `POST /Memory/import` batch. The bound
+  counts characters, not tokens: 6000 fits a 2,048-token window for typical English prose, while token-dense
+  content (CJK text, code) or a smaller window needs a lower value.
 
 ### Changed
 

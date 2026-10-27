@@ -321,7 +321,6 @@ export function toMemoryView(record: any): MemoryView {
 
 const embedderInstalled = new WeakSet<object>();
 
-/** What an embedding request carries for `text`: its leading `limits.embeddingInputChars`, whole code points only. */
 export function embeddingInput(text: string): string {
 	const max = getSettings().embeddingInputChars;
 	if (text.length <= max) return text;
