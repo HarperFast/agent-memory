@@ -518,6 +518,37 @@ describe('created-order cursor', () => {
 		assert.deepEqual(await walk(alice, '&includeSuperseded=true', 1), [rowId(2), rowId(3)]);
 		assert.deepEqual(await walk(root, '&includeSuperseded=true', 1), [1, 2, 3].map(rowId));
 	});
+
+	it('includeWithdrawn lists withdrawn rows for super_user only, and changes nothing without it', async () => {
+		await importMemories(
+			{
+				rows: [
+					{ id: rowId(1), ownerId: 'alice', content: 'kept', scopes: ['global'], createdAt: at },
+					{ id: rowId(2), ownerId: 'alice', content: 'gone', scopes: ['global'], status: 'withdrawn', createdAt: at },
+				],
+			},
+			root,
+			context,
+		);
+		assert.deepEqual(await walk(root, '', 1), [rowId(1)]);
+		const statusCondition = () => __test.searchLog.at(-1).query.conditions[2];
+		const withoutParam = statusCondition();
+		assert.deepEqual(withoutParam, { attribute: 'status', comparator: 'equals', value: 'active' });
+		assert.deepEqual(await walk(root, '&includeWithdrawn=true', 1), [rowId(1), rowId(2)]);
+		assert.deepEqual(await walk(root, '&includeWithdrawn=false', 1), [rowId(1)]);
+		assert.deepEqual(statusCondition(), withoutParam);
+		assert.equal(params('includeWithdrawn=false').includeWithdrawn, undefined);
+		const searches = __test.searchLog.length;
+		for (const principal of [alice, dave]) {
+			const error = await searchMemories(params('order=created&includeWithdrawn=true'), principal, context).catch(
+				(reason) => reason,
+			);
+			assert.equal(error.statusCode, 403);
+			assert.equal(error.code, 'include_withdrawn_forbidden');
+		}
+		assert.equal(__test.searchLog.length, searches, 'refused before any query');
+		assert.deepEqual(await walk(alice, '', 1), [rowId(1)]);
+	});
 });
 
 describe('bootstrapMemories', () => {

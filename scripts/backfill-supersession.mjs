@@ -4,20 +4,17 @@ import { createHash } from 'node:crypto';
 import { access, readFile } from 'node:fs/promises';
 import { parseArgs } from 'node:util';
 import { assertSafeUrl, basicAuth, failureCode, isEntryPoint, reservePrivateFile, UsageError } from './lib/cli.mjs';
+import { createClient, memoryPages, pause, readWithRetry, requestError } from './lib/memory-api.mjs';
 import { createModelBackend, MODEL_BACKENDS } from './lib/model-backend.mjs';
 
 const REPORT_FORMAT = 'agent-memory-supersession-backfill';
 const REPORT_VERSION = 1;
 const VERDICTS = ['supersedes', 'refines', 'unrelated'];
-const PAGE_SIZE = 50;
-const REQUEST_TIMEOUT_MS = 60_000;
 const JUDGE_CONTENT_CHARS = 4000;
 const RATIONALE_MAX_CHARS = 200;
 const DEFAULT_CONCURRENCY = 4;
 const MAX_CONCURRENCY = 16;
 const LINK_ATTEMPTS = 3;
-const READ_ATTEMPTS = 3;
-const RETRY_DELAY_MS = 250;
 // Bounds the memory bodies held at once: the walk keeps ids alone, and pairs of one newer memory are judged together.
 const BODY_CACHE_ENTRIES = 256;
 const MEMORY_ID = /^[A-Za-z0-9_-]{16,64}$/;
@@ -82,66 +79,13 @@ export async function judgePair(backend, newer, older) {
 	}
 }
 
-function createClient(target, authorization) {
-	return async (method, path, { body, headers } = {}) => {
-		let response;
-		try {
-			response = await fetch(`${target}/${path}`, {
-				method,
-				headers: {
-					Authorization: authorization,
-					Accept: 'application/json',
-					...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
-					...headers,
-				},
-				body: body === undefined ? undefined : JSON.stringify(body),
-				redirect: 'error',
-				signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-			});
-		} catch (error) {
-			return { status: 0, code: failureCode(error) };
-		}
-		let json;
-		try {
-			json = await response.json();
-		} catch {
-			// A parse error message would quote the body, which can be memory content.
-			json = undefined;
-		}
-		return { status: response.status, json, code: failureCode(json) };
-	};
-}
-
-function requestError(what, result) {
-	return new Error(`${what} failed: ${result.status ? `HTTP ${result.status}` : 'no response'} (${result.code})`);
-}
-
-const pause = (attempt) => new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS * attempt));
-
-// A 503 is the server asking for a retry: an index catching up, a lock not granted in time.
-async function readWithRetry(request, path) {
-	for (let attempt = 1; ; attempt++) {
-		const result = await request('GET', path);
-		if ((result.status !== 503 && result.status !== 0) || attempt === READ_ATTEMPTS) return result;
-		await pause(attempt);
-	}
-}
-
 async function walkMemories(request, stderr) {
 	const memories = [];
-	let after = '';
-	for (;;) {
-		const result = await readWithRetry(
-			request,
-			`Memory/?order=created&limit=${PAGE_SIZE}&includeSuperseded=true&includeExpired=true${after}`,
-		);
-		if (result.status !== 200 || !Array.isArray(result.json?.memories)) throw requestError('listing memories', result);
-		for (const { id } of result.json.memories) memories.push(id);
+	for await (const page of memoryPages(request)) {
+		for (const { id } of page) memories.push(id);
 		stderr.write(`walked ${memories.length} memories\n`);
-		if (result.json.memories.length < PAGE_SIZE) return memories;
-		const last = result.json.memories.at(-1);
-		after = `&after=${encodeURIComponent(`${last.createdAt},${last.id}`)}`;
 	}
+	return memories;
 }
 
 async function mapPool(items, concurrency, fn) {

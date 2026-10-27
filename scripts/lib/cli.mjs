@@ -1,7 +1,7 @@
 import { realpathSync } from 'node:fs';
 import { link, open, unlink } from 'node:fs/promises';
 
-const ERROR_CODE = /^[A-Za-z0-9_.-]{1,64}$/;
+export const ERROR_CODE = /^[A-Za-z0-9_.-]{1,64}$/;
 const LOOPBACK_HOSTS = new Set(['localhost', '[::1]']);
 
 export class UsageError extends Error {}

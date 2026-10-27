@@ -338,6 +338,48 @@ project instructions, except hooks your administrator manages. If such a hook fo
 `--classifier anthropic`. Owners always read their own memories, so map no Flair agent to a fleet
 principal.
 
+## Copy between instances
+
+`scripts/copy-memories.mjs` copies every memory of one app running this plugin into another, for example from a
+test deployment to its permanent home. Ids, owners, scopes, `createdAt`, supersession links, withdrawn and expired
+memories, content flags and pending review flags carry over; the target re-embeds with its own model. Run it from a
+checkout (Node 22+), as a `super_user` of both apps. Both must run a plugin version with `includeWithdrawn` (the
+script refuses one that does not acknowledge it). Rules: [DESIGN.md](DESIGN.md#copy-between-instances-scriptscopy-memoriesmjs).
+
+```sh
+export AGENT_MEMORY_FROM_AUTHORIZATION="Basic $(printf '%s' 'admin:…' | base64)"   # the source's super_user
+export AGENT_MEMORY_TO_AUTHORIZATION="Bearer …"                                    # the target's super_user
+
+# 1. Preview: source counts by status and scope, and the target check; nothing is written
+node scripts/copy-memories.mjs --from https://test.example.com --to https://app.example.com --dry-run
+
+# 2. Copy, then verify every row; re-running resumes an interrupted copy and reports every row unchanged
+node scripts/copy-memories.mjs --from https://test.example.com --to https://app.example.com
+```
+
+| Option             | Meaning                                                |
+| ------------------ | ------------------------------------------------------ |
+| `--from <url>`     | Base URL of the source app                             |
+| `--to <url>`       | Base URL of the target app (optional with `--dry-run`) |
+| `--batch-size <n>` | Rows per import request, 1–100 (default 100)           |
+| `--dry-run`        | Read only                                              |
+
+- **Stop writers first.** Copy at cutover, with no agent writing to either app, and wait a minute after the last
+  write so any pending customer-content model check has ruled (its call times out at 30 seconds). After the copy, the script reads the source again
+  and fails if anything changed since it was read (`sourceChanged`). A memory missing from the copy is picked up by a
+  re-run; one that changed on the source after it was copied makes the next run refuse rather than overwrite.
+- **One target node.** `--to` must reach a single Harper node, not a load balancer over several: each batch relies
+  on the previous ones being visible, which replication lag between nodes does not guarantee.
+- **The target must hold only this copy.** Before writing, the script compares every target memory with the source
+  and refuses if the target has a memory of its own or one that differs. Exit status is 0 only when the final
+  comparison matches.
+- **Same people, same grants.** Labels are copied as they are, so `user:alice` and every `ScopeGrant` must mean the
+  same on the target. Grants, pins and watches are not copied; recreate the `ScopeGrant` rows by hand.
+- **Not carried:** revision numbers, author and last editor (the target records `source: import`), `confirmed`,
+  `scopeConfirmed` (the target's own check may flag a memory again for review), and which links the judge added. The
+  dry run counts the rows that lose one.
+- Stdout and stderr carry ids, counts, scope labels and codes only.
+
 ## Supersession backfill
 
 Imported history rarely records which memory replaced which. `scripts/backfill-supersession.mjs` finds

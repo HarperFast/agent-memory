@@ -25,9 +25,9 @@ import {
 	WITHDRAW_REASON_MAX_CHARS,
 	withLockPlan,
 } from './lifecycle.ts';
-import { checkedText, matchCustomerContent } from './patterns.ts';
-import { activeDependentIds, CLEARED_REVIEW, flagDependents, reviewFlagFor } from './provenance.ts';
-import { type ContentFlag, contentFlagFields, decideContentFlag } from './quarantine.ts';
+import { checkedText, HOST_LABEL, matchCustomerContent } from './patterns.ts';
+import { activeDependentIds, CLEARED_REVIEW, flagDependents, reviewFlagFor, type ReviewFlag } from './provenance.ts';
+import { CONTENT_FLAG_KIND, type ContentFlag, contentFlagFields, decideContentFlag } from './quarantine.ts';
 import { isScopeLabel, MAX_SCOPES_PER_MEMORY, requirePrincipalId, type Principal } from './scopes.ts';
 import { getSettings } from './settings.ts';
 import { hasSinks, notifySinks } from './sinks.ts';
@@ -50,10 +50,61 @@ const ROW_FIELDS = [
 	'validUntil',
 	'withdrawnAt',
 	'withdrawnReason',
+	'contentFlag',
+	'needsReview',
 ];
 const STATUSES = [STATUS_ACTIVE, STATUS_SUPERSEDED, STATUS_WITHDRAWN];
 
 export type ImportResult = 'created' | 'unchanged' | 'conflict';
+
+const isPlainObject = (value: unknown): value is Record<string, any> =>
+	value !== null && typeof value === 'object' && !Array.isArray(value);
+
+function isoDate(value: unknown): string | undefined {
+	if (typeof value !== 'string') return undefined;
+	const date = new Date(value);
+	return Number.isNaN(date.getTime()) ? undefined : date.toISOString();
+}
+
+// A source's quarantine travels with the row: the target's own check may not match what the source's did.
+function carriedContentFlag(value: unknown, scopes: readonly string[]): ContentFlag | undefined {
+	if (value === undefined || value === null) return undefined;
+	const invalid = () => badRequest('contentFlag must be a content flag of a global memory', 'invalid_contentFlag');
+	if (!isPlainObject(value) || !scopes.includes('global')) throw invalid();
+	const { kind, since, source, labels, ...rest } = value;
+	const at = isoDate(since);
+	if (
+		Object.keys(rest).length > 0 ||
+		kind !== CONTENT_FLAG_KIND ||
+		!at ||
+		(source !== 'pattern' && source !== 'model')
+	) {
+		throw invalid();
+	}
+	if (labels === undefined) return { kind, since: at, source };
+	// A flag lists a `customer:` label per matched name and the configured label of each matched host rule.
+	const isFlagLabel = (label: unknown) => isScopeLabel(label) || (typeof label === 'string' && HOST_LABEL.test(label));
+	if (!Array.isArray(labels) || !labels.every(isFlagLabel)) throw invalid();
+	return { kind, since: at, source, labels: [...labels] };
+}
+
+function carriedReviewFlag(value: unknown): ReviewFlag | undefined {
+	if (value === undefined || value === null) return undefined;
+	const invalid = () => badRequest('needsReview must be a review flag', 'invalid_needsReview');
+	if (!isPlainObject(value)) throw invalid();
+	const { since, cause, sourceId, replacementId, ...rest } = value;
+	const at = isoDate(since);
+	if (
+		Object.keys(rest).length > 0 ||
+		!at ||
+		(cause !== 'superseded' && cause !== 'withdrawn') ||
+		!isMemoryId(sourceId) ||
+		(replacementId !== undefined && !isMemoryId(replacementId))
+	) {
+		throw invalid();
+	}
+	return replacementId === undefined ? { since: at, cause, sourceId } : { since: at, cause, sourceId, replacementId };
+}
 
 function validateRow(input: unknown, index: number) {
 	try {
@@ -106,6 +157,8 @@ function validateRow(input: unknown, index: number) {
 			validUntil: optionalDate(row.validUntil, 'validUntil') ?? null,
 			withdrawnAt: withdrawnAt ?? null,
 			withdrawnReason: withdrawnReason ?? null,
+			carriedContentFlag: carriedContentFlag(row.contentFlag, scopes),
+			carriedReview: carriedReviewFlag(row.needsReview),
 		};
 	} catch (error) {
 		if (isCallerSafe(error)) throw memoryError(error.message, error.statusCode, error.code, index);
@@ -172,7 +225,7 @@ export async function importMemories(input: unknown, principal: Principal, reque
 	const contentFlags = new Map<string, ContentFlag | null>(
 		check.mode === 'flag'
 			? rows
-					.filter((_row: unknown, index: number) => !stored[index])
+					.filter((row: any, index: number) => !stored[index] && !row.carriedContentFlag)
 					.map((row: any) => [row.id, contentFlagFor(row, flaggedAt)])
 			: [],
 	);
@@ -234,13 +287,16 @@ export async function importMemories(input: unknown, principal: Principal, reque
 					if (target.status === STATUS_ACTIVE) transitions.push({ id: targetId, replacementId: next.supersededBy! });
 				}
 
-				for (const row of created) {
+				for (const { carriedContentFlag, carriedReview, ...row } of created) {
 					const state =
 						row.status === STATUS_WITHDRAWN
 							? { status: row.status, supersededBy: row.supersededBy }
 							: await graphState(row.id);
-					let reviewPatch = CLEARED_REVIEW as { needsReview: unknown; needsReviewSince: Date | null };
-					for (const source of transitions) {
+					// A carried flag is the row's first cause, so it stands over one this batch would raise.
+					let reviewPatch: { needsReview: unknown; needsReviewSince: Date | null } = carriedReview
+						? { needsReview: carriedReview, needsReviewSince: new Date(carriedReview.since) }
+						: CLEARED_REVIEW;
+					for (const source of carriedReview ? [] : transitions) {
 						const flag = reviewFlagFor({ ...row, ...state }, source, 'superseded', now);
 						if (flag) {
 							reviewPatch = flag;
@@ -257,7 +313,9 @@ export async function importMemories(input: unknown, principal: Principal, reque
 							autoSupersedes: [],
 							...reviewPatch,
 							confirmed: null,
-							...contentFlagFields(contentFlags.has(row.id) ? contentFlags.get(row.id)! : contentFlagFor(row, now)),
+							...contentFlagFields(
+								carriedContentFlag ?? (contentFlags.has(row.id) ? contentFlags.get(row.id)! : contentFlagFor(row, now)),
+							),
 							scopeConfirmed: null,
 							author: { principalId: row.ownerId, source: 'import', authoredAt: row.createdAt.toISOString() },
 							lastEditor: null,

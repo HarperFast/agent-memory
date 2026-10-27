@@ -1,5 +1,5 @@
 import { logger, models } from 'harper';
-import { badRequest } from './errors.ts';
+import { badRequest, memoryError } from './errors.ts';
 import { recordWatches, WATCH_DEFAULT_TTL_SECONDS } from './events.ts';
 import {
 	BOOTSTRAP_PINNED_LIMIT,
@@ -8,6 +8,7 @@ import {
 	memoryTable,
 	STATUS_ACTIVE,
 	STATUS_SUPERSEDED,
+	STATUS_WITHDRAWN,
 	toMemoryView,
 	type MemoryView,
 } from './lifecycle.ts';
@@ -65,6 +66,7 @@ export interface SearchParams {
 	limit: number;
 	includeSuperseded: boolean;
 	includeExpired: boolean;
+	includeWithdrawn?: boolean;
 	flagged?: boolean;
 	watch?: boolean;
 	order?: 'created';
@@ -131,6 +133,7 @@ export function parseSearchParams(params: URLSearchParams): SearchParams {
 		flagged: booleanParam(params, 'flagged'),
 		watch: booleanParam(params, 'watch'),
 	};
+	if (booleanParam(params, 'includeWithdrawn')) parsed.includeWithdrawn = true;
 	if (order) parsed.order = order;
 	if (after) parsed.after = after;
 	return parsed;
@@ -164,14 +167,10 @@ export function unexpiredCondition(now: Date): Condition {
 }
 
 function filterConditions(params: SearchParams, principal: Principal, now = new Date()): Condition[] {
+	const statuses = params.includeSuperseded ? [STATUS_ACTIVE, STATUS_SUPERSEDED] : [STATUS_ACTIVE];
+	if (params.includeWithdrawn) statuses.push(STATUS_WITHDRAWN);
 	const conditions: Condition[] = [
-		anyOf(
-			(params.includeSuperseded ? [STATUS_ACTIVE, STATUS_SUPERSEDED] : [STATUS_ACTIVE]).map((status) => ({
-				attribute: 'status',
-				comparator: 'equals',
-				value: status,
-			})),
-		),
+		anyOf(statuses.map((status) => ({ attribute: 'status', comparator: 'equals', value: status }))),
 	];
 	if (!params.includeExpired) conditions.push(unexpiredCondition(now));
 	for (const tag of params.tags) conditions.push({ attribute: 'tags', comparator: 'equals', value: tag });
@@ -255,6 +254,10 @@ export async function searchMemories(
 	context: object,
 	access?: Map<string, Promise<any>>,
 ) {
+	// Withdrawn rows are readable by their owner and super_user only; listing them is for a full export.
+	if (params.includeWithdrawn && !principal.superUser) {
+		throw memoryError('includeWithdrawn requires super_user', 403, 'include_withdrawn_forbidden');
+	}
 	const { embeddingModel } = getSettings();
 	const Memory = memoryTable();
 	const conditions = filterConditions(params, principal);

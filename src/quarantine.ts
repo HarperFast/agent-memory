@@ -6,7 +6,7 @@ import { getSettings } from './settings.ts';
 import { hasSinks, notifySinks } from './sinks.ts';
 import { askOneWord, type OneWordOutcome } from './supersession.ts';
 
-const CONTENT_FLAG_KIND = 'possible-customer-detail';
+export const CONTENT_FLAG_KIND = 'possible-customer-detail';
 
 export interface ContentFlag {
 	kind: typeof CONTENT_FLAG_KIND;

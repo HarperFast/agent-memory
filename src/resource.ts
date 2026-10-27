@@ -209,7 +209,10 @@ export class MemoryResource extends MemoryEndpoint {
 	static async get(target: any, context: object) {
 		return handle('get', context, async (principal, ctx) => {
 			if (target?.rest) throw notFound();
-			return json({ memories: await searchMemories(parseSearchParams(target), principal, ctx) });
+			const params = parseSearchParams(target);
+			const memories = await searchMemories(params, principal, ctx);
+			// An older server ignores the parameter, so a full export needs this to know withdrawn rows were included.
+			return json(params.includeWithdrawn ? { memories, includeWithdrawn: true } : { memories });
 		});
 	}
 

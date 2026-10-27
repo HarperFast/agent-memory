@@ -4,6 +4,17 @@ All notable changes to `@harperfast/agent-memory` are documented here. The forma
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `scripts/copy-memories.mjs` copies every memory from one app running this plugin to another (withdrawn,
+  superseded and expired ones included), checks the target before writing, and verifies it afterwards.
+- `GET /Memory/?includeWithdrawn=true` lists withdrawn memories too, for a `super_user` only (403
+  `include_withdrawn_forbidden` for anyone else); the response then carries `includeWithdrawn: true`.
+- `POST /Memory/import` rows may carry `contentFlag` and `needsReview`, kept on a created row, so a copied memory
+  stays quarantined and its pending review survives.
+
 ## [0.1.1] - 2026-10-26
 
 ### Changed

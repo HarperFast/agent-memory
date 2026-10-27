@@ -420,6 +420,7 @@ mounted with `hidden = false` only when the plugin option `mcp` is `true` (defau
 | `DELETE /Memory/<id>?reason=`                                                           | withdraw with `If-Match: "<revision>"` (tombstone, returns `{ memory }`)                                                            |
 | `GET /Memory/?q=&tag=&scope=&limit=&includeSuperseded=&includeExpired=&flagged=&watch=` | search (no `q`: newest first; `flagged=true`: content-flagged memories the caller can read; `watch=true` watches every returned id) |
 | `GET /Memory/?order=created&after=<createdAt>,<id>&limit=`                              | list oldest first by `createdAt`, then id, one page after the cursor (no `q`)                                                       |
+| `GET /Memory/?…&includeWithdrawn=true`                                                  | also list withdrawn memories (`super_user` only; the response carries `includeWithdrawn: true`)                                     |
 | `GET /Memory/<id>/candidates`                                                           | older memories this one may replace (`{ candidates }`; owner or `super_user`)                                                       |
 | `POST /Memory/<id>/supersedes`                                                          | link existing memories as superseded by this one (`{ ids, revisions? }` + `If-Match`; `{ memory }`)                                 |
 | `GET /Memory/bootstrap?q=&budget=&watch=`                                               | session-start context (`watch=true` watches every returned id)                                                                      |
@@ -456,7 +457,7 @@ lease, since a batch writes up to 100 rows and flags their citers inside one tra
   or `> now` unless `includeExpired=true`) and readable-scope conditions, including the customer-content
   quarantine. `scope=` narrows within the readable set; it never widens it. `flagged=true` adds the indexed
   `contentFlagged = true`, the review queue of a cleared reviewer (an uncleared caller sees only its own). Results include `supersededBy` when `includeSuperseded` is set,
-  and `needsReview` under the Provenance visibility rule; withdrawn memories never appear. The vector lane has no distance cutoff, so it contributes the
+  and `needsReview` under the Provenance visibility rule; withdrawn memories never appear (except to a `super_user` passing `includeWithdrawn=true`, below). The vector lane has no distance cutoff, so it contributes the
   nearest readable memories whatever their distance. Passing `watch=true` records a `MemoryWatch` (with
   the default 1 h TTL) for every memory id returned in the result.
 - **Full-text query boundary** (observed locally on Harper 5.3.2, native fulltext 0.5.0):
@@ -487,6 +488,11 @@ lease, since a batch writes up to 100 rows and flags their citers inside one tra
   its source time) lands behind the cursor; walk again to see it. `order` with `q`, or `after` without
   `order=created`, is 400. Neither condition uses `equals` on `createdAt`: Harper 5.3's count estimate for
   `equals` on a Date attribute throws.
+- `includeWithdrawn=true` (any list or search) admits `withdrawn` to the status condition, for a `super_user` only:
+  any other caller gets 403 `include_withdrawn_forbidden` before any query runs, rather than a silently partial
+  answer. It exists for a full export (Copy between instances); owners read their own withdrawn memories by id. A
+  server that predates the parameter ignores it, so the response acknowledges it with `includeWithdrawn: true` and
+  a client that needs every row refuses a page without that. A request without it builds the conditions it always did.
 - **Searchable at commit**: both indexes are Harper derived indexes maintained after commit (`audit:
 true` puts `@embed`'s HNSW index on the native plane). Each lane passes `waitForIndexMilliseconds`,
   so a search covers every write committed before it began; an index that is already current does not
@@ -649,7 +655,7 @@ as REST:
 
 `POST /Memory/import` (`super_user` only) takes `{ rows: [...] }`, at most 100 rows, in one transaction:
 every row commits or none does. Each row: `{ id, ownerId, title?, content, tags?, evidence?, scopes,
-status, supersedes?, supersededBy?, createdAt?, validUntil?, withdrawnAt?, withdrawnReason? }`.
+status, supersedes?, supersededBy?, createdAt?, validUntil?, withdrawnAt?, withdrawnReason?, contentFlag?, needsReview? }`.
 
 - Rows carry the client-chosen `id` directly (`^[A-Za-z0-9_-]{16,64}$`; the Flair import client derives
   `id` as the first 32 hex characters of `sha256('flair:' + flairId)`).
@@ -659,7 +665,12 @@ status, supersedes?, supersededBy?, createdAt?, validUntil?, withdrawnAt?, withd
   as it stands (stored rows plus this batch), and a stored row that a new row supersedes is marked
   superseded. So whatever the batch order, and however a run is interrupted or replayed, no memory is
   hidden behind a missing or withdrawn replacement. The client still sends successors first.
-- A created row whose scopes include `global` gets the customer-content pattern check (Customer content).
+- A created row whose scopes include `global` gets the customer-content pattern check (Customer content), unless
+  it carries a `contentFlag` (`{ kind, since, source, labels? }`, allowed only on a `global` row), which is stored as
+  given: the source's model or names list may have matched what the target's check would not, and dropping the flag
+  would publish a quarantined memory. A carried `needsReview` (`{ since, cause, sourceId, replacementId? }`) is
+  stored with its `needsReviewSince` and stands over a flag the same batch would raise (first cause stands). `null`
+  means not carried. Neither applies to an existing row, and neither enters the `unchanged` comparison below.
 - A stored row the batch turns superseded flags its active citers, stored or created in the same batch,
   except the rows that supersede it (Provenance). Rows created superseded or withdrawn are history, not
   transitions, and flag nothing.
@@ -755,6 +766,39 @@ evidence: [{ kind: memory, ref: sourceId }], createdAt: source createdAt, validU
   `conflict` and are not relabeled.
 - **Customer data**: stdout and stderr carry ids, counts, scope labels and error codes only. The report
   (titles, organization names, rationales, lesson drafts) is written 0600 and never overwritten.
+
+### Copy between instances (`scripts/copy-memories.mjs`)
+
+An operator CLI that moves a deployment's memories to another app running the plugin (a test deployment to its
+permanent home), as a `super_user` of both. The invariant: the target ends with the source's rows and the
+source's derived state (status, `supersededBy`, review and content flags), and no memory becomes readable to a
+reader that could not read it on the source, provided both apps map usernames to the same people and grant no
+broader reads (labels are copied verbatim; that precondition is documented, not checked).
+
+- **Read**: the whole source through the created-order cursor with `includeSuperseded`, `includeExpired` and
+  `includeWithdrawn`, refusing a page that does not acknowledge `includeWithdrawn`. Held in memory to order it,
+  up to 256 Mi characters of row JSON, past which it refuses before writing.
+- **Row**: the view's import fields (`contentFlag` and `needsReview` included), never the embedding: the target
+  re-embeds with its own model. Not carried, because import cannot set them: `revision`, `author` / `lastEditor`,
+  `confirmed`, `scopeConfirmed` (the target's own pattern check may flag the row again, which fails closed),
+  `autoSupersedes` (the links themselves are in `supersedes`), pins, watches and `ScopeGrant` rows.
+- **Order**: successors first (Kahn's order over live rows' `supersedes`; withdrawn rows supersede nothing), so
+  no batch ever supersedes a row already stored. Import would turn such a row superseded and flag its active
+  citers, raising reviews the source's owners had already answered. Rows left on a cycle refuse the copy.
+- **Strict target**: before writing, every target row must be a source id and match the intended row; a memory of
+  the target's own, or one that differs, refuses the copy. Import's `unchanged` compares editable fields only and a
+  batch can change the status of a stored row it supersedes, so only a target holding nothing but this copy keeps
+  both from hiding a difference. A target row may carry a content flag the source row lacks (its own check
+  matched), never lack one.
+- **Verify**: after the batches, the same comparison over the whole target, then an exact one over the whole source
+  again (a write or a model's content verdict that landed after the read, up to 30 s after its write, would
+  otherwise be lost while the copy reported success); exit 0 only when both match. A re-run of an interrupted copy
+  passes the check and imports the rest; the rows already there come back `unchanged`.
+- **One target node**: successor-first order relies on each batch seeing the earlier ones, so `--to` names one node;
+  through a balancer over several, a predecessor could reach a node its replacement has not replicated to and be
+  stored `active`.
+- **Output**: ids, counts, scope labels and codes; credentials come from `AGENT_MEMORY_FROM_AUTHORIZATION` and
+  `AGENT_MEMORY_TO_AUTHORIZATION`, never argv.
 
 ### Supersession backfill (`scripts/backfill-supersession.mjs`)
 
