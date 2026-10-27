@@ -6,6 +6,7 @@ import {
 	EVIDENCE_MAX_ITEMS,
 	EVIDENCE_NOTE_MAX_CHARS,
 	EVIDENCE_REF_MAX_CHARS,
+	embeddingInput,
 	getMemory,
 	pinMemory,
 	putMemory,
@@ -594,6 +595,32 @@ describe('sinks', () => {
 		}
 		assert.equal(memoryRows().size, 1);
 		assert.equal(stored(old.id).status, 'active');
+	});
+});
+
+describe('embeddingInput', () => {
+	it('passes text within the bound through and cuts longer text to the bound', () => {
+		applySettings(parseSettings({ limits: { embeddingInputChars: 4 } }));
+		const short = 'abc';
+		assert.equal(embeddingInput(short), short);
+		assert.equal(embeddingInput('abcd'), 'abcd');
+		assert.equal(embeddingInput('abcde'), 'abcd');
+	});
+
+	it('never splits a surrogate pair', () => {
+		applySettings(parseSettings({ limits: { embeddingInputChars: 4 } }));
+		assert.equal(embeddingInput('abc😀d'), 'abc');
+		assert.equal(embeddingInput('ab😀d'), 'ab😀');
+		applySettings(parseSettings({ limits: { embeddingInputChars: 2 } }));
+		assert.equal(embeddingInput('😀memo'), '😀');
+		assert.equal(embeddingInput('a😀'), 'a');
+	});
+
+	it('reads the bound at call time', () => {
+		applySettings(parseSettings({ limits: { embeddingInputChars: 3 } }));
+		assert.equal(embeddingInput('abcdef'), 'abc');
+		applySettings(parseSettings({ limits: { embeddingInputChars: 5 } }));
+		assert.equal(embeddingInput('abcdef'), 'abcde');
 	});
 });
 

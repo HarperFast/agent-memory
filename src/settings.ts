@@ -13,6 +13,7 @@ export interface Settings {
 	readonly embeddingModel: string;
 	readonly titleChars: number;
 	readonly contentChars: number;
+	readonly embeddingInputChars: number;
 	readonly supersession: SupersessionSettings;
 	readonly customerContentCheck: ContentCheckSettings;
 	readonly mcp: boolean;
@@ -21,6 +22,9 @@ export interface Settings {
 export const DEFAULT_EMBEDDING_MODEL = 'default';
 const MAX_CONTENT_CHARS = 100_000;
 const MAX_TITLE_CHARS = 1_000;
+const DEFAULT_EMBEDDING_INPUT_CHARS = 6_000;
+// The smallest bound whose code-point cut always keeps at least one character.
+const MIN_EMBEDDING_INPUT_CHARS = 2;
 const DEFAULT_SUPERSESSION: SupersessionSettings = Object.freeze({ mode: 'suggest', similarity: 0.82 });
 
 let current: Settings = Object.freeze({
@@ -28,6 +32,7 @@ let current: Settings = Object.freeze({
 	embeddingModel: DEFAULT_EMBEDDING_MODEL,
 	titleChars: 200,
 	contentChars: 20_000,
+	embeddingInputChars: DEFAULT_EMBEDDING_INPUT_CHARS,
 	supersession: DEFAULT_SUPERSESSION,
 	customerContentCheck: CONTENT_CHECK_OFF,
 	mcp: false,
@@ -37,10 +42,10 @@ export function getSettings(): Settings {
 	return current;
 }
 
-function boundedInteger(value: unknown, fallback: number, max: number, name: string): number {
+function boundedInteger(value: unknown, fallback: number, max: number, name: string, min = 1): number {
 	if (value === undefined || value === null) return fallback;
-	if (!Number.isInteger(value) || (value as number) < 1 || (value as number) > max) {
-		throw new Error(`@harperfast/agent-memory: ${name} must be an integer between 1 and ${max}`);
+	if (!Number.isInteger(value) || (value as number) < min || (value as number) > max) {
+		throw new Error(`@harperfast/agent-memory: ${name} must be an integer between ${min} and ${max}`);
 	}
 	return value as number;
 }
@@ -82,6 +87,13 @@ export function parseSettings(options: Record<string, any>, secrets: SecretsSour
 		embeddingModel,
 		titleChars: boundedInteger(options.limits?.titleChars, 200, MAX_TITLE_CHARS, 'limits.titleChars'),
 		contentChars: boundedInteger(options.limits?.contentChars, 20_000, MAX_CONTENT_CHARS, 'limits.contentChars'),
+		embeddingInputChars: boundedInteger(
+			options.limits?.embeddingInputChars,
+			DEFAULT_EMBEDDING_INPUT_CHARS,
+			MAX_CONTENT_CHARS,
+			'limits.embeddingInputChars',
+			MIN_EMBEDDING_INPUT_CHARS,
+		),
 		supersession: parseSupersession(options.supersession),
 		customerContentCheck: parseContentCheck(options.customerContentCheck, secrets),
 		mcp,

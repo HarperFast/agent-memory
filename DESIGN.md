@@ -46,7 +46,13 @@ database).
 
 - `Memory` — one row per memory. `content` is embedded on write (`@embed`) and full-text indexed
   (`@fullText`, which requires `@table(audit: true)`), so a memory is searchable at commit, with no
-  indexing queue of the plugin's own.
+  indexing queue of the plugin's own. The vector covers only the head of the content: every embedding
+  request (write, import, the table embedder, the search query) carries at most
+  `limits.embeddingInputChars` UTF-16 code units, cut at a code-point boundary by `embeddingInput`
+  (`src/lifecycle.ts`), so a memory longer than the model's context window still writes. Full-text
+  covers the whole content. The bound is in characters, not tokens: Harper's embedding API passes no
+  truncation option and the plugin has no tokenizer, so the default (6,000) leaves headroom under a
+  2,048-token window, including a task prefix a host backend may add, rather than guaranteeing it.
 - `ScopeGrant` — read/write scope patterns held by a Harper role or user.
 - `MemoryPin` — a principal's pinned memories (`<principalId>:<memoryId>`), loaded first at session bootstrap.
 - `MemoryWatch` — a principal's time-bounded interest in specific memories (live updates).
@@ -503,7 +509,9 @@ true` puts `@embed`'s HNSW index on the native plane). Each lane passes `waitFor
   exceeds 5 s returns 503 `unavailable`.
 - **One vector space**: each row records the `embeddingModel` that embedded it, and the vector lane
   only compares rows of the configured model. Changing `embeddingModel` does not re-embed existing
-  rows; they stay reachable through full-text until revised. A model whose dimensions differ from the
+  rows; they stay reachable through full-text until revised. Changing `limits.embeddingInputChars` does
+  not re-embed either: rows embedded under different bounds share one vector space, their vectors cover
+  different lengths of head, and a row gets the new bound when its content is next revised. A model whose dimensions differ from the
   indexed vectors is not supported yet: Harper's HNSW plane fixes its dimensions at the first vector,
   skips (and logs) vectors of another size, and rejects a query vector of another size. Search then
   serves the full-text lane alone and logs the rejection once per mismatch episode for that model. Switching dimensions needs a
@@ -643,7 +651,8 @@ as REST:
   JSON copy can still derive scopes for another system. The matchers are not part of the contract; in-process code
   that reaches them through reflection is trusted like any other plugin code.
 - Options (`config.yaml` under the plugin's key): `urlPath`, `mcp` (default `false`), `embeddingModel`
-  (default `default`), `limits.{contentChars, titleChars}` (default 20000 / 200), and
+  (default `default`), `limits.{contentChars, titleChars, embeddingInputChars}` (default 20000 / 200 / 6000;
+  `embeddingInputChars` is 2–100000, see `Memory` above), and
   `supersession.{mode, similarity, judge}` (`off | suggest | auto`, default `suggest`; 0.82; none; `auto`
   without `judge` is rejected as malformed), and `customerContentCheck.{mode, model, patterns}` (see Customer
   content; absent = off). The plugin's table embedder embeds with the model recorded on

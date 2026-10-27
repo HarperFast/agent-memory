@@ -15,6 +15,24 @@ All notable changes to `@harperfast/agent-memory` are documented here. The forma
 - `POST /Memory/import` rows may carry `contentFlag` and `needsReview`, kept on a created row, so a copied memory
   stays quarantined and its pending review survives.
 
+## [0.1.2] - 2026-10-27
+
+### Fixed
+
+- A memory longer than the embedding model's context window no longer fails its write. Every embedding request
+  now carries at most `limits.embeddingInputChars` characters (default 6000, 2–100000) of the memory content or
+  search query, cut at a code-point boundary; the stored content stays complete and full-text search still
+  covers all of it. Before, an OpenAI-compatible backend answered such content with HTTP 400, which failed
+  `PUT`, MCP `remember` and `revise` with a 500, and aborted a whole `POST /Memory/import` batch. The bound
+  counts characters, not tokens: 6000 fits a 2,048-token window for typical English prose, while token-dense
+  content (CJK text, code) or a smaller window needs a lower value.
+
+### Changed
+
+- Memories longer than 6000 characters are now embedded from their first 6000 characters, on every backend.
+  A deployment whose model holds more can raise `limits.embeddingInputChars` (up to `limits.contentChars`).
+  Existing rows keep their vectors until their content is revised.
+
 ## [0.1.1] - 2026-10-26
 
 ### Changed
@@ -53,5 +71,6 @@ First npm release. Requires Harper 5.3.1 or later (`harper` peer dependency) on 
   `setPrincipalResolver` (map app-defined identities), and `resolvePrincipal` / `canReadLabels` (authorize
   other components with the same identity and grants).
 
+[0.1.2]: https://github.com/HarperFast/agent-memory/releases/tag/v0.1.2
 [0.1.1]: https://github.com/HarperFast/agent-memory/releases/tag/v0.1.1
 [0.1.0]: https://github.com/HarperFast/agent-memory/releases/tag/v0.1.0
