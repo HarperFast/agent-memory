@@ -321,8 +321,7 @@ export function toMemoryView(record: any): MemoryView {
 
 const embedderInstalled = new WeakSet<object>();
 
-export function embeddingInput(text: string): string {
-	const max = getSettings().embeddingInputChars;
+export function embeddingInput(text: string, max = getSettings().embeddingInputChars): string {
 	if (text.length <= max) return text;
 	const code = text.charCodeAt(max - 1);
 	return text.slice(0, code >= 0xd800 && code <= 0xdbff ? max - 1 : max);
@@ -348,8 +347,13 @@ export function ensureEmbedder(Memory: any): void {
 	embedderInstalled.add(Memory);
 }
 
-export async function embedContents(contents: string[], model: string): Promise<number[][]> {
-	const vectors = await models.embed(contents.map(embeddingInput), { model, inputType: 'document' });
+export async function embedContents(
+	contents: string[],
+	model: string,
+	maxChars = getSettings().embeddingInputChars,
+): Promise<number[][]> {
+	const inputs = contents.map((content) => embeddingInput(content, maxChars));
+	const vectors = await models.embed(inputs, { model, inputType: 'document' });
 	// The table's embedder would embed again, under the write's locks, for a missing or empty vector.
 	if (vectors?.length !== contents.length || vectors.some((vector) => !vector?.length)) {
 		throw new Error(`embedding model "${model}" returned no vector`);

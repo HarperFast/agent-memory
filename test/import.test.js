@@ -102,6 +102,27 @@ describe('importMemories', () => {
 		assert.equal(rows().get(idOf('big-1')).content.length, 59_999);
 	});
 
+	it('bounds and sizes the whole batch under the settings it started with', async () => {
+		applySettings(parseSettings({ limits: { contentChars: 60_000, embeddingInputChars: 40_000 } }));
+		const big = (n) => row(`big-${n}`, { content: `${n} `.repeat(30_000) });
+		const embed = models.embed;
+		const sizes = [];
+		models.embed = (input, options) => {
+			sizes.push(input.map((text) => text.length));
+			applySettings(parseSettings({ limits: { contentChars: 60_000, embeddingInputChars: 100_000 } }));
+			return embed.call(models, input, options);
+		};
+		try {
+			await importMemories({ rows: [big(1), big(2), big(3), big(4)] }, root, context);
+		} finally {
+			models.embed = embed;
+		}
+		assert.deepEqual(sizes, [
+			[40_000, 40_000],
+			[40_000, 40_000],
+		]);
+	});
+
 	it('preserves owner, createdAt, typed evidence and links, with status derived from the graph (successor first)', async () => {
 		const evidence = [
 			{ kind: 'memory', ref: idOf(1), note: 'imported predecessor' },

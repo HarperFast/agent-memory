@@ -203,6 +203,7 @@ export async function importMemories(input: unknown, principal: Principal, reque
 			const embedded = await embedContents(
 				batch.map((row) => row.content),
 				settings.embeddingModel,
+				settings.embeddingInputChars,
 			);
 			batch.forEach((row, index) => vectors.set(row.id, embedded[index]));
 		};
