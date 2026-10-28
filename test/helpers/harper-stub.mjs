@@ -124,7 +124,7 @@ class StubTable {
 		setEmbedCalls.push({ table: this.name, attribute });
 	}
 	async lock(id, options, context) {
-		lockLog.push({ table: this.name, id, inTransaction: Boolean(context?.transaction) });
+		lockLog.push({ table: this.name, id, scope: options?.scope, inTransaction: Boolean(context?.transaction) });
 	}
 	async #embed(record) {
 		if (!('content' in record)) return;

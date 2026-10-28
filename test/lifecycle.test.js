@@ -342,7 +342,15 @@ describe('If-Match preconditions', () => {
 		const { memory } = await putMemory(DEFAULT_ID, validInput(), alice, context);
 		__test.lockLog.length = 0;
 		await putMemory(memory.id, { content: 'locked' }, alice, ifMatch(1));
-		assert.deepEqual(__test.lockLog, [{ table: 'Memory', id: memory.id, inTransaction: true }]);
+		assert.deepEqual(__test.lockLog, [{ table: 'Memory', id: memory.id, scope: 'node', inTransaction: true }]);
+	});
+
+	it('locks across the cluster when lockScope is cluster', async () => {
+		const { memory } = await putMemory(DEFAULT_ID, validInput(), alice, context);
+		applySettings(parseSettings({ lockScope: 'cluster' }));
+		__test.lockLog.length = 0;
+		await putMemory(memory.id, { content: 'locked' }, alice, ifMatch(1));
+		assert.deepEqual(__test.lockLog, [{ table: 'Memory', id: memory.id, scope: 'cluster', inTransaction: true }]);
 	});
 });
 

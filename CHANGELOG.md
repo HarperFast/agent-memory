@@ -8,6 +8,11 @@ All notable changes to `@harperfast/agent-memory` are documented here. The forma
 
 ### Added
 
+- `lockScope: cluster` takes the lifecycle record locks across the cluster, so concurrent revisions at one
+  `If-Match` revision on different nodes are serialized (exactly one succeeds). It needs the cluster's
+  `replication.recordLocks` on; the default, `node`, keeps the previous behavior.
+- `scripts/race-revisions.mjs` sends concurrent revisions at one `If-Match` revision across two or more nodes and
+  reports how many succeeded and whether the nodes converged, to check `lockScope: cluster` on a live cluster.
 - `scripts/copy-memories.mjs` copies every memory from one app running this plugin to another (withdrawn,
   superseded and expired ones included), checks the target before writing, and verifies it afterwards.
 - `GET /Memory/?includeWithdrawn=true` lists withdrawn memories too, for a `super_user` only (403

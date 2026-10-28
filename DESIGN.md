@@ -208,11 +208,13 @@ only a write that carries none. A `PUT` whose transaction finds it must write co
 no vector for (another writer changed the row after the pre-read) releases its locks, embeds, and
 retries. An embedding failure fails the write before it takes any lock. The plugin is the
 only writer of `Memory`, so on one node a read-check-write is serialized: of N concurrent revisions at
-the same `If-Match` revision exactly one succeeds. The locks are node-scoped, because a cluster-scoped
-lock on a replicated database fails closed unless the cluster has opted into replicated record locks
-(`replication.recordLocks`); across nodes, two revisions at the same revision can both
-succeed and replication keeps the later write — the limit harper-eye documented for optimistic concurrency.
-The same applies to derived status: a withdrawal's restore on one node and a supersede of the
+the same `If-Match` revision exactly one succeeds. The `lockScope` setting picks the locks' scope. The default,
+`node`, serializes only within a node, because a cluster-scoped lock on a replicated database fails closed unless
+the cluster has opted into replicated record locks (`replication.recordLocks`); across nodes, two revisions at
+the same revision can both succeed and replication keeps the later write — the limit harper-eye documented for
+optimistic concurrency. `lockScope: cluster` takes the same locks across every node of a cluster that has opted
+in, so exactly one of those revisions succeeds anywhere in the cluster; on a cluster that has not, every
+lifecycle write fails. With `node` scope the same applies to derived status: a withdrawal's restore on one node and a supersede of the
 same memory on another replicate as competing writes, so the memory can end up `active` beside a live
 superseder until a later operation recomputes it. Any status change, including supersede and restore, bumps the affected row's `revision`.
 
@@ -400,7 +402,7 @@ since, source: 'pattern', labels }` (keeping `since` while the memory stays flag
   withdrawal, which restores its predecessor. `scopeConfirmed: { by, at }` describes the current text: a revise
   that re-runs the check (the checked text changed, or `global` is new) or leaves `global`, and a model flag,
   clear it, so a later mention of the same customer is flagged again.
-- **Across nodes** the locks are node-scoped (Lifecycle), so a revise that flags a memory on one node and a
+- **Across nodes** the locks are node-scoped under the default `lockScope: node` (Lifecycle), so a revise that flags a memory on one node and a
   confirm-scope or model `clean` of the same revision on another can both commit, and replication can keep the
   revise's text with the other write's cleared flag.
 - **Cost**, measured on Harper 5.3.2 (one node, local, a loaded host, 2,000 `global` memories): the quarantine
