@@ -25,6 +25,14 @@ const QUERY_MAX_CHARS = 1000;
 // search keeps a memory searchable from the moment its create returns. An index that is already current
 // does not wait.
 export const INDEX_WAIT_MS = 5000;
+// A lane that does not wait accepts index coverage at most INDEX_LAG_MS old (Harper's default). `updatedAt` is
+// stamped when the transaction first locks or reads, so a write the window has passed is covered unless its
+// transaction stayed open longer than the difference.
+export const INDEX_LAG_MS = 3000;
+export const RECENT_WRITE_WINDOW_MS = 10_000;
+// A window holding this many rows is a bulk write in progress; the search waits rather than read on.
+export const RECENT_WRITE_SCAN = 100;
+const INDEX_LAGGING = 'DERIVED_INDEX_LAGGING';
 const BOOTSTRAP_DEFAULT_BUDGET = 8000;
 const BOOTSTRAP_MAX_BUDGET = 100_000;
 const BOOTSTRAP_RECENT_LIMIT = 50;
@@ -249,6 +257,44 @@ export function fuse<T extends { id: string }>(lanes: readonly (readonly T[])[],
 	);
 }
 
+// Harper 5.3 makes a waiting query wait out the next coverage publication after any commit in the database,
+// watch rows included, so the lanes wait only for a recent write the caller can read. The window is read whole
+// and checked with canRead, rather than as conditions, so a narrow caller's probe cannot walk another tenant's
+// bulk write.
+async function indexWaitMilliseconds(Memory: any, principal: Principal, context: object): Promise<number> {
+	let scanned = 0;
+	for await (const record of Memory.search(
+		{
+			conditions: [
+				{
+					attribute: 'updatedAt',
+					comparator: 'greater_than_equal',
+					value: new Date(Date.now() - RECENT_WRITE_WINDOW_MS),
+				},
+			],
+			select: ['id', 'ownerId', 'scopes', 'status', 'contentFlag'],
+			limit: RECENT_WRITE_SCAN,
+		},
+		context,
+	)) {
+		if (canRead(record, principal)) return INDEX_WAIT_MS;
+		scanned++;
+	}
+	return scanned === RECENT_WRITE_SCAN ? INDEX_WAIT_MS : 0;
+}
+
+// Without a wait, Harper refuses coverage it cannot certify within the lag (start-up, a rebuild, a stalled
+// publisher), where a waiting query would have waited.
+async function laneSearch(run: (freshness: object) => Promise<any[]>, waitMs: number): Promise<any[]> {
+	if (waitMs > 0) return run({ waitForIndexMilliseconds: waitMs });
+	try {
+		return await run({ waitForIndexMilliseconds: 0, maxIndexLagMilliseconds: INDEX_LAG_MS });
+	} catch (error: any) {
+		if (error?.code !== INDEX_LAGGING) throw error;
+		return run({ waitForIndexMilliseconds: INDEX_WAIT_MS });
+	}
+}
+
 export async function searchMemories(
 	params: SearchParams,
 	principal: Principal,
@@ -302,6 +348,7 @@ export async function searchMemories(
 		return results;
 	}
 	const laneLimit = Math.min(params.limit * 2, 100);
+	const waitMs = await indexWaitMilliseconds(Memory, principal, context);
 	let vector: ArrayLike<number> | undefined;
 	let embeddingFailed = false;
 	let embeddingError: unknown;
@@ -315,34 +362,40 @@ export async function searchMemories(
 	const vectorLane = async () => {
 		if (embeddingFailed) throw embeddingError;
 		if (!vector) throw new Error('Query embedding returned no vector');
-		const hits = await collect(
-			Memory.search(
-				{
-					// Rows embedded by another model live in another vector space.
-					conditions: [...conditions, { attribute: 'embeddingModel', comparator: 'equals', value: embeddingModel }],
-					sort: { attribute: 'embedding', target: Array.from(vector), waitForIndexMilliseconds: INDEX_WAIT_MS },
-					select: VIEW_FIELDS,
-					limit: laneLimit,
-				},
-				context,
-			),
+		const target = Array.from(vector);
+		const hits = await laneSearch(
+			(freshness) =>
+				collect(
+					Memory.search(
+						{
+							// Rows embedded by another model live in another vector space.
+							conditions: [...conditions, { attribute: 'embeddingModel', comparator: 'equals', value: embeddingModel }],
+							sort: { attribute: 'embedding', target, ...freshness },
+							select: VIEW_FIELDS,
+							limit: laneLimit,
+						},
+						context,
+					),
+				),
+			waitMs,
 		);
 		rejectedModels.delete(embeddingModel);
 		return hits;
 	};
 	const textLane = async () =>
-		collect(
-			Memory.search(
-				{
-					conditions: [
-						...conditions,
-						{ attribute: 'text', comparator: 'matches', value: params.q, waitForIndexMilliseconds: INDEX_WAIT_MS },
-					],
-					select: VIEW_FIELDS,
-					limit: laneLimit,
-				},
-				context,
-			),
+		laneSearch(
+			(freshness) =>
+				collect(
+					Memory.search(
+						{
+							conditions: [...conditions, { attribute: 'text', comparator: 'matches', value: params.q, ...freshness }],
+							select: VIEW_FIELDS,
+							limit: laneLimit,
+						},
+						context,
+					),
+				),
+			waitMs,
 		);
 	const [vectorResult, textResult] = await Promise.allSettled([vectorLane(), textLane()]);
 	if (vectorResult.status === 'rejected' && textResult.status === 'rejected') {

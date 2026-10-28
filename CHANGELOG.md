@@ -15,6 +15,15 @@ All notable changes to `@harperfast/agent-memory` are documented here. The forma
 - `POST /Memory/import` rows may carry `contentFlag` and `needsReview`, kept on a created row, so a copied memory
   stays quarantined and its pending review survives.
 
+### Changed
+
+- Search (`GET /Memory/?q=`, MCP `recall`, bootstrap's relevant section) waits for the vector and full-text indexes
+  only when a memory the caller can read was written in the last 10 seconds. Before, it waited after any commit in
+  the memory database, including the watch rows a `watch=true` recall writes, so the recall that followed took
+  400–1000 ms instead of a few. A memory is still found by a search right after its write returns, except one
+  whose write stayed open more than 7 seconds or that replicated in from another node with an older timestamp;
+  such a memory can be missed for about a second (DESIGN.md, Searchable at commit).
+
 ## [0.1.2] - 2026-10-27
 
 ### Fixed

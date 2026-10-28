@@ -500,12 +500,26 @@ lease, since a batch writes up to 100 rows and flags their citers inside one tra
   server that predates the parameter ignores it, so the response acknowledges it with `includeWithdrawn: true` and
   a client that needs every row refuses a page without that. A request without it builds the conditions it always did.
 - **Searchable at commit**: both indexes are Harper derived indexes maintained after commit (`audit:
-true` puts `@embed`'s HNSW index on the native plane). Each lane passes `waitForIndexMilliseconds`,
-  so a search covers every write committed before it began; an index that is already current does not
-  wait, otherwise a search waits about one index flush. Measured on Harper 5.3.2 (one node, local): a
-  search with no recent write takes 6–13 ms, one right after a write about 1 s, and a write transaction
-  held open for 6 s by a slow embedding did not delay a concurrent search (8 ms), nor did a two-row
-  import whose second row stalled 6 s after the first was staged (11 ms). A coverage wait that
+true` puts `@embed`'s HNSW index on the native plane). Harper 5.3 makes a query that passes
+  `waitForIndexMilliseconds` wait out the next coverage publication after any commit in the database,
+  indexed table or not, so a `watch=true` recall's own `MemoryWatch` rows made the next recall wait
+  400–1000 ms. Search therefore waits only for a recent write the caller can read. Before its lanes
+  run it reads the `updatedAt` index over the last 10 s (`RECENT_WRITE_WINDOW_MS`), up to 100 rows, and
+  checks each with `canRead`. This is a yes/no probe that returns no rows, so it is not a post-filtered read;
+  checking in code keeps a narrow caller from walking another tenant's bulk write, and a full page counts
+  as a bulk write in progress. A readable row, or a full page: each lane passes
+  `waitForIndexMilliseconds` (5 s) and covers every write committed before the search began; an index
+  that is already current does not wait. Otherwise the lanes pass no wait and
+  `maxIndexLagMilliseconds` 3 s (`INDEX_LAG_MS`, Harper's default), so Harper serves coverage at most 3 s
+  old, and a lane whose coverage it cannot certify that fresh (503 `DERIVED_INDEX_LAGGING`: start-up, a
+  rebuild, a stalled publisher) runs once more with the wait. `@updatedTime` is the transaction's
+  timestamp, taken at its first lock or read, so a row the probe missed committed in time to be covered
+  unless its transaction stayed open more than 7 s (the window less the lag): a host sink, or a wait
+  behind another writer's lock. Harper ends a transaction open past `storage.maxTransactionOpenTime`
+  (30 s by default). A memory replicated from another node keeps its origin's `updatedAt`, and one
+  already older than the window on arrival can be missed for one coverage publication (~1 s). Measured
+  on Harper 5.3.2 (one node, local, 200 memories): a search right after a `watch=true` search took
+  483 ms p50 and 937 ms p95 when every search waited, 5.5 ms p50 and 8.9 ms p95 with the probe. A coverage wait that
   exceeds 5 s returns 503 `unavailable`.
 - **One vector space**: each row records the `embeddingModel` that embedded it, and the vector lane
   only compares rows of the configured model. Changing `embeddingModel` does not re-embed existing
