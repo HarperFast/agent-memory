@@ -188,10 +188,8 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 		strictEqual(revised.status, 200, JSON.stringify(revised.body));
 		await bothLanes('numbat', memory.id);
 		const late = await create('alice', 'bilby', { title: 'bilby', content: 'bilby bilby bilby' });
-		// Past the probe window, the lanes read without a wait and must still cover the write.
 		await new Promise((resolve) => setTimeout(resolve, 10_500));
 		await bothLanes('bilby', late.id);
-		// A watch=true recall writes only watch rows; a waiting search after it took 400–1000 ms.
 		const elapsed = [];
 		for (let i = 0; i < 5; i++) {
 			await search('alice', 'q=bilby&watch=true');

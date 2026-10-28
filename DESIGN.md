@@ -519,8 +519,9 @@ true` puts `@embed`'s HNSW index on the native plane). Harper 5.3 makes a query 
   (30 s by default). A memory replicated from another node keeps its origin's `updatedAt`, and one
   already older than the window on arrival can be missed for one coverage publication (~1 s). Measured
   on Harper 5.3.2 (one node, local, 200 memories): a search right after a `watch=true` search took
-  483 ms p50 and 937 ms p95 when every search waited, 5.5 ms p50 and 8.9 ms p95 with the probe. A coverage wait that
-  exceeds 5 s returns 503 `unavailable`.
+  483 ms p50 and 937 ms p95 when every search waited, 5.5 ms p50 and 8.9 ms p95 with the probe. A caller
+  without a write of its own searched in 7.3 ms p50 with an empty window and 6.9 ms with 99 rows it cannot read in
+  it (25 searches each). A coverage wait that exceeds 5 s returns 503 `unavailable`.
 - **One vector space**: each row records the `embeddingModel` that embedded it, and the vector lane
   only compares rows of the configured model. Changing `embeddingModel` does not re-embed existing
   rows; they stay reachable through full-text until revised. Changing `limits.embeddingInputChars` does

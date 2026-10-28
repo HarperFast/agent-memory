@@ -21,16 +21,13 @@ const RRF_K = 60;
 const SEARCH_MAX_LIMIT = 50;
 const SEARCH_DEFAULT_LIMIT = 10;
 const QUERY_MAX_CHARS = 1000;
-// Both derived indexes apply commits after the fact; waiting for coverage of writes committed before the
-// search keeps a memory searchable from the moment its create returns. An index that is already current
-// does not wait.
+// Both derived indexes apply commits after the fact. See "Searchable at commit" in DESIGN.md for when a
+// search waits for their coverage.
 export const INDEX_WAIT_MS = 5000;
-// A lane that does not wait accepts index coverage at most INDEX_LAG_MS old (Harper's default). `updatedAt` is
-// stamped when the transaction first locks or reads, so a write the window has passed is covered unless its
-// transaction stayed open longer than the difference.
+// The window must exceed the lag by the longest a write transaction may stay open: `updatedAt` is stamped at its
+// first lock or read, not at commit.
 export const INDEX_LAG_MS = 3000;
 export const RECENT_WRITE_WINDOW_MS = 10_000;
-// A window holding this many rows is a bulk write in progress; the search waits rather than read on.
 export const RECENT_WRITE_SCAN = 100;
 const INDEX_LAGGING = 'DERIVED_INDEX_LAGGING';
 const BOOTSTRAP_DEFAULT_BUDGET = 8000;
@@ -257,10 +254,8 @@ export function fuse<T extends { id: string }>(lanes: readonly (readonly T[])[],
 	);
 }
 
-// Harper 5.3 makes a waiting query wait out the next coverage publication after any commit in the database,
-// watch rows included, so the lanes wait only for a recent write the caller can read. The window is read whole
-// and checked with canRead, rather than as conditions, so a narrow caller's probe cannot walk another tenant's
-// bulk write.
+// Checked with canRead rather than as conditions, so a narrow caller's probe stops after one page of another
+// tenant's bulk write.
 async function indexWaitMilliseconds(Memory: any, principal: Principal, context: object): Promise<number> {
 	let scanned = 0;
 	for await (const record of Memory.search(
@@ -283,8 +278,6 @@ async function indexWaitMilliseconds(Memory: any, principal: Principal, context:
 	return scanned === RECENT_WRITE_SCAN ? INDEX_WAIT_MS : 0;
 }
 
-// Without a wait, Harper refuses coverage it cannot certify within the lag (start-up, a rebuild, a stalled
-// publisher), where a waiting query would have waited.
 async function laneSearch(run: (freshness: object) => Promise<any[]>, waitMs: number): Promise<any[]> {
 	if (waitMs > 0) return run({ waitForIndexMilliseconds: waitMs });
 	try {

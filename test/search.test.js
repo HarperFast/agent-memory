@@ -23,7 +23,6 @@ const dave = createPrincipal({ id: 'dave', grants: { read: ['customer:*'] } });
 const root = createPrincipal({ id: 'root', superUser: true });
 const context = {};
 const params = (query) => parseSearchParams(new URLSearchParams(query));
-// The vector and full-text lanes, as opposed to the recent-write probe and plain listings.
 const isLane = (query) => Boolean(query.sort?.target) || Boolean(query.conditions?.some((c) => c.attribute === 'text'));
 const lanes = () => __test.searchLog.filter((entry) => isLane(entry.query));
 
