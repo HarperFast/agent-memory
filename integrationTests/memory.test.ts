@@ -169,6 +169,37 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 		);
 	});
 
+	test('a write is found by both lanes right after it commits, and past the window without waiting after watch writes', async () => {
+		// The only rank-1 hit of both lanes scores 2/61; a lane that missed it would leave 1/61.
+		const bothLanes = async (word: string, id: string) => {
+			const [top] = await search('alice', `q=${word}`);
+			strictEqual(top?.id, id, JSON.stringify(top));
+			strictEqual(top.score, 1 / 61 + 1 / 61);
+		};
+		const memory = await create('alice', 'quokka', { title: 'quokka', content: 'quokka quokka quokka' });
+		await bothLanes('quokka', memory.id);
+		const revised = await call(
+			'alice',
+			'PUT',
+			memory.id,
+			{ title: 'numbat', content: 'numbat numbat numbat' },
+			{ 'If-Match': '"1"' },
+		);
+		strictEqual(revised.status, 200, JSON.stringify(revised.body));
+		await bothLanes('numbat', memory.id);
+		const late = await create('alice', 'bilby', { title: 'bilby', content: 'bilby bilby bilby' });
+		await new Promise((resolve) => setTimeout(resolve, 10_500));
+		await bothLanes('bilby', late.id);
+		const elapsed = [];
+		for (let i = 0; i < 5; i++) {
+			await search('alice', 'q=bilby&watch=true');
+			const started = performance.now();
+			await bothLanes('bilby', late.id);
+			elapsed.push(performance.now() - started);
+		}
+		ok(elapsed.sort((a, b) => a - b)[2] < 250, JSON.stringify(elapsed));
+	});
+
 	test('a customer:x memory is visible only to customer:x and customer:* holders', async () => {
 		const denied = await call('alice', 'PUT', memId('not-allowed'), {
 			title: 'nope',

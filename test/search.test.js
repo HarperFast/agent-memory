@@ -1,11 +1,21 @@
-import { beforeEach, describe, it } from 'node:test';
+import { beforeEach, describe, it, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { __test } from 'harper';
 import { importMemories } from '../dist/import.js';
 import { pinMemory, putMemory, unpinMemory, withdrawMemory } from '../dist/lifecycle.js';
 import { createPrincipal } from '../dist/scopes.js';
 import { applySettings, parseSettings } from '../dist/settings.js';
-import { bootstrapMemories, fuse, parseBootstrapParams, parseSearchParams, searchMemories } from '../dist/search.js';
+import {
+	bootstrapMemories,
+	fuse,
+	INDEX_LAG_MS,
+	INDEX_WAIT_MS,
+	parseBootstrapParams,
+	parseSearchParams,
+	RECENT_WRITE_SCAN,
+	RECENT_WRITE_WINDOW_MS,
+	searchMemories,
+} from '../dist/search.js';
 
 const alice = createPrincipal({ id: 'alice', grants: { read: ['global'], write: ['global'] } });
 const bob = createPrincipal({ id: 'bob', grants: { read: ['global'], write: ['global'] } });
@@ -13,6 +23,8 @@ const dave = createPrincipal({ id: 'dave', grants: { read: ['customer:*'] } });
 const root = createPrincipal({ id: 'root', superUser: true });
 const context = {};
 const params = (query) => parseSearchParams(new URLSearchParams(query));
+const isLane = (query) => Boolean(query.sort?.target) || Boolean(query.conditions?.some((c) => c.attribute === 'text'));
+const lanes = () => __test.searchLog.filter((entry) => isLane(entry.query));
 
 const idFor = (principal, key) =>
 	`mem-${principal.id}-${key.replace(/[^A-Za-z0-9_-]/g, '_')}--`.slice(0, 64).padEnd(16, '_');
@@ -144,7 +156,7 @@ describe('parseSearchParams', () => {
 describe('searchMemories', () => {
 	it('pushes status, expiry and the readable set into both lanes, and the model into the vector lane', async () => {
 		await searchMemories(params('q=disk'), dave, context);
-		const [vector, text] = __test.searchLog;
+		const [vector, text] = lanes();
 		const readable = {
 			operator: 'or',
 			conditions: [
@@ -167,16 +179,18 @@ describe('searchMemories', () => {
 			{ attribute: 'embeddingModel', comparator: 'equals', value: 'default' },
 		]);
 		assert.equal(vector.query.sort.attribute, 'embedding');
-		assert.ok(vector.query.sort.waitForIndexMilliseconds > 0);
+		assert.equal(vector.query.sort.waitForIndexMilliseconds, 0);
+		assert.equal(vector.query.sort.maxIndexLagMilliseconds, INDEX_LAG_MS);
 		assert.deepEqual(text.query.conditions.slice(0, 3), [status, unexpired, readable]);
 		assert.equal(text.query.conditions[3].comparator, 'matches');
-		assert.ok(text.query.conditions[3].waitForIndexMilliseconds > 0);
+		assert.equal(text.query.conditions[3].waitForIndexMilliseconds, 0);
+		assert.equal(text.query.conditions[3].maxIndexLagMilliseconds, INDEX_LAG_MS);
 		for (const lane of [vector, text]) assert.ok(!lane.query.select.includes('embedding'));
 	});
 
 	it('adds no readable condition for super_user, and admits superseded and expired only when asked', async () => {
 		await searchMemories(params('q=disk&includeSuperseded=true&includeExpired=true&tag=ops'), root, context);
-		const [vector] = __test.searchLog;
+		const [vector] = lanes();
 		assert.deepEqual(vector.query.conditions.slice(0, 2), [
 			{
 				operator: 'or',
@@ -296,7 +310,8 @@ describe('searchMemories', () => {
 								throw unavailable;
 							}
 						: embed;
-				Memory.search = function (query) {
+				Memory.search = function (query, ctx) {
+					if (!isLane(query)) return search.call(this, query, ctx);
 					if (query.sort?.target)
 						return (async function* () {
 							throw vectorError;
@@ -322,7 +337,7 @@ describe('searchMemories', () => {
 		const search = Memory.search;
 		let textError = Object.assign(new Error("Full-text query on 'text' is invalid"), { statusCode: 400 });
 		Memory.search = function (query, ctx) {
-			if (query.sort?.target) return search.call(this, query, ctx);
+			if (!isLane(query) || query.sort?.target) return search.call(this, query, ctx);
 			throw textError;
 		};
 		try {
@@ -349,7 +364,8 @@ describe('searchMemories', () => {
 		models.embed = async () => {
 			throw Object.assign(new Error('embedding rate limited'), { upstreamStatus: 429 });
 		};
-		databases.memory.Memory.search = () => {
+		databases.memory.Memory.search = function (query, ctx) {
+			if (!isLane(query)) return search.call(this, query, ctx);
 			throw textError;
 		};
 		try {
@@ -373,7 +389,8 @@ describe('searchMemories', () => {
 					(await searchMemories(params('q=disk'), alice, context)).map((hit) => hit.id),
 					[stored.id],
 				);
-				databases.memory.Memory.search = () => {
+				databases.memory.Memory.search = function (query, ctx) {
+					if (!isLane(query)) return search.call(this, query, ctx);
 					throw Object.assign(new Error("Full-text query on 'text' is invalid"), { statusCode: 400 });
 				};
 				await assert.rejects(searchMemories(params('q=disk'), alice, context), /Query embedding returned no vector/);
@@ -441,11 +458,158 @@ describe('searchMemories', () => {
 		await searchMemories(params('q=disk'), alice, context);
 		const { models } = await import('harper');
 		assert.deepEqual(models.calls.at(-1), { input: 'disk', options: { model: 'local:small', inputType: 'query' } });
-		assert.deepEqual(__test.searchLog[0].query.conditions.at(-1), {
+		assert.deepEqual(lanes()[0].query.conditions.at(-1), {
 			attribute: 'embeddingModel',
 			comparator: 'equals',
 			value: 'local:small',
 		});
+	});
+});
+
+describe('index wait', () => {
+	const probes = () => __test.searchLog.filter((entry) => entry.query.conditions?.[0]?.attribute === 'updatedAt');
+	const laneWaits = () =>
+		lanes().map(({ query }) =>
+			query.sort?.target
+				? query.sort.waitForIndexMilliseconds
+				: query.conditions.find((c) => c.attribute === 'text').waitForIndexMilliseconds,
+		);
+	// The stub stamps writes on its own clock, so the window is measured from the written row.
+	const searchAt = async (time, principal, query = 'q=disk') => {
+		__test.searchLog.length = 0;
+		mock.timers.enable({ apis: ['Date'], now: time });
+		try {
+			return await searchMemories(params(query), principal, context);
+		} finally {
+			mock.timers.reset();
+		}
+	};
+
+	it('waits only while a readable memory was written inside the window', async () => {
+		const written = await create(alice, 'disk recent', { visibility: 'shared' });
+		const stamped = new Date(written.updatedAt).getTime();
+		await searchAt(stamped + RECENT_WRITE_WINDOW_MS - 1, alice);
+		assert.deepEqual(laneWaits(), [INDEX_WAIT_MS, INDEX_WAIT_MS]);
+		await searchAt(stamped + RECENT_WRITE_WINDOW_MS, alice);
+		assert.deepEqual(laneWaits(), [INDEX_WAIT_MS, INDEX_WAIT_MS], 'the window includes its edge');
+		await searchAt(stamped + RECENT_WRITE_WINDOW_MS + 1, alice);
+		assert.deepEqual(laneWaits(), [0, 0]);
+		for (const { query } of lanes()) {
+			const freshness = query.sort?.target ? query.sort : query.conditions.find((c) => c.attribute === 'text');
+			assert.equal(freshness.maxIndexLagMilliseconds, INDEX_LAG_MS);
+		}
+	});
+
+	it('probes the updatedAt index for the window alone, reading the fields canRead needs', async () => {
+		const written = await create(alice, 'disk probe');
+		const time = new Date(written.updatedAt).getTime() + 1000;
+		await searchAt(time, dave);
+		const [probe] = probes();
+		assert.equal(probe.table, 'Memory');
+		assert.deepEqual(probe.query.conditions, [
+			{ attribute: 'updatedAt', comparator: 'greater_than_equal', value: new Date(time - RECENT_WRITE_WINDOW_MS) },
+		]);
+		assert.deepEqual(probe.query.select, ['id', 'ownerId', 'scopes', 'status', 'contentFlag']);
+		assert.equal(probe.query.limit, RECENT_WRITE_SCAN);
+	});
+
+	it('waits when the window is full of rows the caller cannot read, as during a bulk write', async () => {
+		const Memory = (await import('harper')).databases.memory.Memory;
+		const search = Memory.search;
+		let rows = 0;
+		Memory.search = function (query, ctx) {
+			if (query.conditions?.[0]?.attribute !== 'updatedAt') return search.call(this, query, ctx);
+			return (async function* () {
+				for (let i = 0; i < rows; i++)
+					yield { id: `bulk-${i}`, ownerId: 'bob', scopes: ['user:bob'], status: 'active' };
+			})();
+		};
+		try {
+			rows = RECENT_WRITE_SCAN - 1;
+			await searchMemories(params('q=disk'), alice, context);
+			assert.deepEqual(laneWaits(), [0, 0]);
+			__test.searchLog.length = 0;
+			rows = RECENT_WRITE_SCAN;
+			await searchMemories(params('q=disk'), alice, context);
+			assert.deepEqual(laneWaits(), [INDEX_WAIT_MS, INDEX_WAIT_MS]);
+		} finally {
+			Memory.search = search;
+		}
+	});
+
+	it('does not wait for a recent withdrawal the caller can no longer read', async () => {
+		const shared = await create(bob, 'disk shared', { visibility: 'shared' });
+		await withdrawMemory(shared.id, { reason: 'wrong' }, bob, { headers: { 'if-match': '"1"' } });
+		const withdrawn = __test.stores.get('Memory').get(shared.id);
+		assert.equal(withdrawn.status, 'withdrawn');
+		const time = new Date(withdrawn.updatedAt).getTime() + 1000;
+		await searchAt(time, alice);
+		assert.deepEqual(laneWaits(), [0, 0]);
+		await searchAt(time, bob);
+		assert.deepEqual(laneWaits(), [INDEX_WAIT_MS, INDEX_WAIT_MS], 'the owner still reads its tombstone');
+	});
+
+	it('does not wait for a recent write the caller cannot read', async () => {
+		const written = await create(bob, 'disk private');
+		const time = new Date(written.updatedAt).getTime() + 1000;
+		await searchAt(time, alice);
+		assert.deepEqual(laneWaits(), [0, 0]);
+		await searchAt(time, bob);
+		assert.deepEqual(laneWaits(), [INDEX_WAIT_MS, INDEX_WAIT_MS]);
+	});
+
+	it('does not wait after watch or pin writes alone', async () => {
+		const written = await create(alice, 'disk watched', { visibility: 'shared' });
+		const time = new Date(written.updatedAt).getTime() + RECENT_WRITE_WINDOW_MS + 1000;
+		await searchAt(time, alice, 'q=disk&watch=true');
+		mock.timers.enable({ apis: ['Date'], now: time });
+		try {
+			await pinMemory(written.id, {}, alice, context);
+		} finally {
+			mock.timers.reset();
+		}
+		assert.ok(__test.stores.get('MemoryWatch').size > 0);
+		assert.ok(__test.stores.get('MemoryPin').size > 0);
+		const hits = await searchAt(time, alice);
+		assert.deepEqual(laneWaits(), [0, 0]);
+		assert.deepEqual(
+			hits.map((hit) => hit.id),
+			[written.id],
+		);
+	});
+
+	it('retries a lane that cannot certify coverage without waiting, once, with the wait', async () => {
+		const stored = await create(alice, 'disk lagging');
+		const Memory = (await import('harper')).databases.memory.Memory;
+		const search = Memory.search;
+		const lagging = () =>
+			Object.assign(new Error('Cannot certify coverage'), { statusCode: 503, code: 'DERIVED_INDEX_LAGGING' });
+		let failWaiting = false;
+		const attempts = [];
+		Memory.search = function (query, ctx) {
+			const freshness = query.sort?.target ? query.sort : query.conditions?.find((c) => c.attribute === 'text');
+			if (freshness) attempts.push(freshness.waitForIndexMilliseconds);
+			if (freshness && (freshness.waitForIndexMilliseconds === 0 || failWaiting)) {
+				return (async function* () {
+					throw lagging();
+				})();
+			}
+			return search.call(this, query, ctx);
+		};
+		try {
+			const hits = await searchMemories(params('q=disk'), alice, context);
+			assert.deepEqual(
+				hits.map((hit) => hit.id),
+				[stored.id],
+			);
+			assert.deepEqual(attempts, [0, 0, INDEX_WAIT_MS, INDEX_WAIT_MS]);
+			failWaiting = true;
+			attempts.length = 0;
+			await assert.rejects(searchMemories(params('q=disk'), alice, context), { code: 'DERIVED_INDEX_LAGGING' });
+			assert.deepEqual(attempts, [0, 0, INDEX_WAIT_MS, INDEX_WAIT_MS], 'one retry per lane');
+		} finally {
+			Memory.search = search;
+		}
 	});
 });
 
