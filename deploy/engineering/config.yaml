@@ -11,3 +11,7 @@ jsResource:
   mcp: true
   supersession:
     mode: suggest
+  limits:
+    # The engineering nomic model holds 2,048 tokens; 6,000 characters of token-dense content (code, IDs)
+    # exceeds that. 4,000 fits down to 2 characters per token. Token-exact bounding: #28.
+    embeddingInputChars: 4000
