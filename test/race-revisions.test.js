@@ -6,11 +6,6 @@ import { run } from '../scripts/race-revisions.mjs';
 
 const ENV = { AGENT_MEMORY_AUTHORIZATION: 'Bearer race-token' };
 
-/**
- * Two nodes over one store. `revise({ memory, content, ifMatch })` decides a conditional PUT: a status (after any change
- * it makes to `memory`), 'drop' to close the connection unanswered, or undefined for the default, where a matching
- * `If-Match` wins and any other answers 412. `read(node, memory)` can replace what a node serves.
- */
 function fakeCluster() {
 	const cluster = { memories: new Map(), requests: [] };
 	cluster.reset = () => Object.assign(cluster, { revise: undefined, read: undefined, withdrawStatus: 200 });
@@ -187,8 +182,11 @@ describe('scripts/race-revisions.mjs', () => {
 		assert.match(stderr, /withdrawing race-.+ failed: HTTP 503/);
 	});
 
-	it('needs two nodes and the authorization variable', async () => {
+	it('needs two distinct nodes and the authorization variable', async () => {
 		assert.equal(await run(['--node', urls[0]], ENV, { stdout: capture(), stderr: capture() }), 2);
+		const stderr = capture();
+		assert.equal(await run(['--node', urls[0], '--node', `${urls[0]}/`], ENV, { stdout: capture(), stderr }), 2);
+		assert.match(stderr.text, /pass each --node once/);
 		assert.equal(await run(['--node', urls[0], '--node', urls[1]], {}, { stdout: capture(), stderr: capture() }), 2);
 	});
 });

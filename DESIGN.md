@@ -219,7 +219,8 @@ affected row's `revision`. The `lockScope` setting sets the scope of the `Memory
 - **`cluster`** takes Harper's cluster-wide record lock, which needs record locks on the `memory` database
   (`replication.recordLocks` and an agreed home map). Without them every lifecycle write and pin answers 503
   `unavailable`: an explicitly cluster-scoped lock fails closed rather than falling back to a node lock. With every
-  node up, exactly one of N concurrent revisions at one revision succeeds, on any nodes. Harper's lock guarantees
+  node up and every holder committing within its lease, exactly one of N concurrent revisions at one revision
+  succeeds, on any nodes. Harper's lock guarantees
   exclusion, not that the next holder reads the previous holder's commit after a failure: once a holder crashed,
   became unreachable, or committed after its lease, Harper's recovery path can admit a holder that reads a stale
   revision, and two revisions can both commit. While any node of the home map is down, a write whose lock needs that
@@ -227,7 +228,7 @@ affected row's `revision`. The `lockScope` setting sets the scope of the `Memory
   — answers 503 until it returns or an operator publishes a home map without it. The 5-minute lease does not bound
   this; Harper's delegation lease (6 minutes) and recovery barrier do.
 - **Every node runs the same `lockScope`.** A node at `node` never asks for the cluster lock, so while a change rolls
-  across the cluster two revisions can both commit; change it on every node with lifecycle writes stopped.
+  across the cluster two revisions can both commit; change it on every node while no lifecycle write is running.
 - **Watches stay node-scoped** at either setting (`putWatchKeepingLongerTtl`), so reads never wait on, or fail
   because of, another node. Across nodes, two watches of one memory by one principal keep the later write, which can
   be the shorter TTL; Live updates already promise at-most-once delivery, and the next watch renews it.

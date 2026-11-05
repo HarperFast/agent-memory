@@ -21,8 +21,8 @@ const USAGE = `Usage: node scripts/race-revisions.mjs --node <url> --node <url> 
 Creates a private memory, waits until every node serves its first revision, then sends --writers concurrent
 revisions with If-Match on that revision, spread round-robin across the nodes. With lockScope: cluster on a cluster
 that has replication.recordLocks on, exactly one revision succeeds and the rest answer 412; with lockScope: node,
-revisions sent to different nodes can each succeed. Waits for the nodes to agree on the result, prints a report, then
-withdraws the memory unless --keep. Exits 0 only when exactly one revision answered 200, every other one 412, every
+revisions sent to different nodes can each succeed. Waits for the nodes to agree on the result, withdraws the memory
+unless --keep, then prints a report. Exits 0 only when exactly one revision answered 200, every other one 412, every
 node converged on revision + 1 with the winner's content, and the withdrawal succeeded; the report's "problems" lists
 what failed.
 
@@ -100,6 +100,7 @@ export async function run(
 		}
 		if (values.node.length < 2) throw new UsageError('pass --node at least twice');
 		const nodes = values.node.map((node, index) => assertSafeUrl(node, `--node ${index + 1}`));
+		if (new Set(nodes).size < nodes.length) throw new UsageError('pass each --node once');
 		const writers = Number(values.writers);
 		if (!Number.isInteger(writers) || writers < 2 || writers > MAX_WRITERS) {
 			throw new UsageError(`--writers must be an integer between 2 and ${MAX_WRITERS}`);
@@ -131,7 +132,6 @@ export async function run(
 		for (const { status } of results) statuses[status] = (statuses[status] ?? 0) + 1;
 		const succeeded = results.filter((result) => result.status === 200);
 
-		// With no winner the nodes should stay at the seed revision.
 		const final = await settle(
 			requests,
 			id,
