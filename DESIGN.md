@@ -208,15 +208,29 @@ only a write that carries none. A `PUT` whose transaction finds it must write co
 no vector for (another writer changed the row after the pre-read) releases its locks, embeds, and
 retries. An embedding failure fails the write before it takes any lock. The plugin is the
 only writer of `Memory`, so on one node a read-check-write is serialized: of N concurrent revisions at
-the same `If-Match` revision exactly one succeeds. The `lockScope` setting picks the locks' scope. The default,
-`node`, serializes only within a node, because a cluster-scoped lock on a replicated database fails closed unless
-the cluster has opted into replicated record locks (`replication.recordLocks`); across nodes, two revisions at
-the same revision can both succeed and replication keeps the later write — the limit harper-eye documented for
-optimistic concurrency. `lockScope: cluster` takes the same locks across every node of a cluster that has opted
-in, so exactly one of those revisions succeeds anywhere in the cluster; on a cluster that has not, every
-lifecycle write fails. With `node` scope the same applies to derived status: a withdrawal's restore on one node and a supersede of the
-same memory on another replicate as competing writes, so the memory can end up `active` beside a live
-superseder until a later operation recomputes it. Any status change, including supersede and restore, bumps the affected row's `revision`.
+the same `If-Match` revision exactly one succeeds. Any status change, including supersede and restore, bumps the
+affected row's `revision`. The `lockScope` setting sets the scope of the `Memory` and `MemoryPin` locks (`lockRows`):
+
+- **`node`** (default) serializes within a node only. Across nodes, two revisions at the same revision can both
+  succeed and replication keeps the later write — the limit harper-eye documented for optimistic concurrency. The
+  same applies to derived status: a withdrawal's restore on one node and a supersede of the same memory on another
+  replicate as competing writes, so the memory can end up `active` beside a live superseder until a later operation
+  recomputes it.
+- **`cluster`** takes Harper's cluster-wide record lock, which needs record locks on the `memory` database
+  (`replication.recordLocks` and an agreed home map). Without them every lifecycle write and pin answers 503
+  `unavailable`: an explicitly cluster-scoped lock fails closed rather than falling back to a node lock. With every
+  node up, exactly one of N concurrent revisions at one revision succeeds, on any nodes. Harper's lock guarantees
+  exclusion, not that the next holder reads the previous holder's commit after a failure: once a holder crashed,
+  became unreachable, or committed after its lease, Harper's recovery path can admit a holder that reads a stale
+  revision, and two revisions can both commit. While any node of the home map is down, a write whose lock needs that
+  node — a memory it homes, one it locked recently, or any first lock after a home restart, which waits on every node
+  — answers 503 until it returns or an operator publishes a home map without it. The 5-minute lease does not bound
+  this; Harper's delegation lease (6 minutes) and recovery barrier do.
+- **Every node runs the same `lockScope`.** A node at `node` never asks for the cluster lock, so while a change rolls
+  across the cluster two revisions can both commit; change it on every node with lifecycle writes stopped.
+- **Watches stay node-scoped** at either setting (`putWatchKeepingLongerTtl`), so reads never wait on, or fail
+  because of, another node. Across nodes, two watches of one memory by one principal keep the later write, which can
+  be the shorter TTL; Live updates already promise at-most-once delivery, and the next watch renews it.
 
 ### Supersession
 
@@ -572,7 +586,8 @@ Three levels, built in order:
 2. **Watches**: `POST /Memory/watch { ids, ttlSeconds? }` (1–100 ids; `ttlSeconds` integer in
    `1..86400`, default 3600) and `watch=true` on search and bootstrap record `MemoryWatch` rows
    (`<principalId>:<memoryId>`, `expiresAt @expiresAt`), keeping whichever `expiresAt` is later when a
-   watch already exists and returning the earliest effective `expiresAt` across the watched ids. Each
+   watch already exists (on one node; see Lifecycle for concurrent watches on two) and returning the earliest
+   effective `expiresAt` across the watched ids. Each
    worker indexes active watches per principal in memory (lazily pruning expired entries on lookup and
    sweeping expired entries whenever a principal's bucket reaches 4,096 watches). `POST /Memory/watch`
    requires read access on every requested id and rejects unreadable ids with the same 404

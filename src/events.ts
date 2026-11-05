@@ -11,7 +11,6 @@ import {
 import { hasCustomPrincipalResolver, resolvePrincipal } from './principal.ts';
 import { forReader } from './provenance.ts';
 import { canRead, type Principal } from './scopes.ts';
-import { getSettings } from './settings.ts';
 
 const EVENT_KINDS = ['created', 'revised', 'superseded', 'withdrawn', 'restored', 'flagged'] as const;
 type MemoryEventKind = (typeof EVENT_KINDS)[number];
@@ -291,7 +290,9 @@ async function putWatchKeepingLongerTtl(
 	txn: object,
 ): Promise<Date> {
 	const id = memoryWatchIdFor(principalId, memoryId);
-	await MemoryWatch.lock(id, { scope: getSettings().lockScope }, txn);
+	// Node scope even under lockScope: cluster. Across nodes the race only keeps the shorter TTL, and a cluster lock
+	// would fail watch=true reads while any node is down.
+	await MemoryWatch.lock(id, { scope: 'node' }, txn);
 	const existing = await MemoryWatch.get(id, txn);
 	if (existing?.expiresAt) {
 		const existingExpiresAt = new Date(existing.expiresAt);

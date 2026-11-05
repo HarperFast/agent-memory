@@ -376,9 +376,8 @@ export class VectorNeeded {
 /**
  * Serializes read-check-write against every other lifecycle operation on the same rows: Harper's record lock
  * excludes other lock() callers, and this plugin is the only writer of Memory. Sorted so operations that lock
- * several rows acquire them in one global order. Scope is the `lockScope` setting: `node` by default, because a
- * cluster-scoped lock on a replicated database fails closed unless the cluster has opted into replicated record
- * locks; with `node`, concurrent revisions on different nodes are not serialized (replication keeps the later write).
+ * several rows acquire them in one global order. Under `lockScope: node`, revisions on different nodes are not
+ * serialized (replication keeps the later write).
  */
 async function lockRows(Memory: any, ids: Iterable<string>, context: object, lease?: number): Promise<void> {
 	const scope = getSettings().lockScope;
