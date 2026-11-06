@@ -9,6 +9,8 @@ jsResource:
   package: '@harperfast/agent-memory'
   embeddingModel: nomic-prefixed
   mcp: true
+  # The engineering cluster runs with replication.recordLocks on.
+  lockScope: cluster
   supersession:
     mode: suggest
   limits:

@@ -1,6 +1,7 @@
 import { CONTENT_CHECK_OFF, parseContentCheck, type ContentCheckSettings, type SecretsSource } from './patterns.ts';
 
 export type SupersessionMode = 'off' | 'suggest' | 'auto';
+export type LockScope = 'node' | 'cluster';
 
 export interface SupersessionSettings {
 	readonly mode: SupersessionMode;
@@ -17,6 +18,7 @@ export interface Settings {
 	readonly supersession: SupersessionSettings;
 	readonly customerContentCheck: ContentCheckSettings;
 	readonly mcp: boolean;
+	readonly lockScope: LockScope;
 }
 
 export const DEFAULT_EMBEDDING_MODEL = 'default';
@@ -36,6 +38,7 @@ let current: Settings = Object.freeze({
 	supersession: DEFAULT_SUPERSESSION,
 	customerContentCheck: CONTENT_CHECK_OFF,
 	mcp: false,
+	lockScope: 'node',
 });
 
 export function getSettings(): Settings {
@@ -82,6 +85,10 @@ export function parseSettings(options: Record<string, any>, secrets: SecretsSour
 	if (typeof mcp !== 'boolean') {
 		throw new Error('@harperfast/agent-memory: mcp must be a boolean');
 	}
+	const lockScope = options.lockScope ?? 'node';
+	if (lockScope !== 'node' && lockScope !== 'cluster') {
+		throw new Error('@harperfast/agent-memory: lockScope must be node or cluster');
+	}
 	return Object.freeze({
 		urlPath,
 		embeddingModel,
@@ -97,6 +104,7 @@ export function parseSettings(options: Record<string, any>, secrets: SecretsSour
 		supersession: parseSupersession(options.supersession),
 		customerContentCheck: parseContentCheck(options.customerContentCheck, secrets),
 		mcp,
+		lockScope,
 	});
 }
 

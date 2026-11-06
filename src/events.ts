@@ -290,6 +290,8 @@ async function putWatchKeepingLongerTtl(
 	txn: object,
 ): Promise<Date> {
 	const id = memoryWatchIdFor(principalId, memoryId);
+	// Node scope even under lockScope: cluster. Across nodes the race only keeps the shorter TTL, and a cluster lock
+	// would fail watch=true reads while any node is down.
 	await MemoryWatch.lock(id, { scope: 'node' }, txn);
 	const existing = await MemoryWatch.get(id, txn);
 	if (existing?.expiresAt) {

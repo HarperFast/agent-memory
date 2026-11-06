@@ -92,10 +92,13 @@ describe('parseSettings', () => {
 			embeddingInputChars: 6000,
 			supersession: { mode: 'suggest', similarity: 0.82 },
 			mcp: false,
+			lockScope: 'node',
 		});
 		assert.equal(customerContentCheck.mode, 'off');
 		assert.equal(parseSettings({ mcp: true }).mcp, true);
 		assert.throws(() => parseSettings({ mcp: 'true' }), /mcp/);
+		assert.equal(parseSettings({ lockScope: 'cluster' }).lockScope, 'cluster');
+		assert.throws(() => parseSettings({ lockScope: 'global' }), /lockScope/);
 		assert.throws(() => parseSettings({ limits: { titleChars: 1001 } }));
 		assert.equal(parseSettings({ limits: { embeddingInputChars: 2 } }).embeddingInputChars, 2);
 		assert.equal(parseSettings({ limits: { embeddingInputChars: 100_000 } }).embeddingInputChars, 100_000);

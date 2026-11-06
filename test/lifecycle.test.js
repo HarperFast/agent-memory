@@ -8,11 +8,13 @@ import {
 	EVIDENCE_REF_MAX_CHARS,
 	embeddingInput,
 	getMemory,
+	LONG_LOCK_LEASE_MS,
 	pinMemory,
 	putMemory,
 	unpinMemory,
 	withdrawMemory,
 } from '../dist/lifecycle.js';
+import { recordWatches } from '../dist/events.js';
 import { createPrincipal } from '../dist/scopes.js';
 import { registerMemorySink } from '../dist/sinks.js';
 import { applySettings, parseSettings } from '../dist/settings.js';
@@ -342,7 +344,52 @@ describe('If-Match preconditions', () => {
 		const { memory } = await putMemory(DEFAULT_ID, validInput(), alice, context);
 		__test.lockLog.length = 0;
 		await putMemory(memory.id, { content: 'locked' }, alice, ifMatch(1));
-		assert.deepEqual(__test.lockLog, [{ table: 'Memory', id: memory.id, inTransaction: true }]);
+		assert.deepEqual(__test.lockLog, [{ table: 'Memory', id: memory.id, scope: 'node', inTransaction: true }]);
+	});
+});
+
+describe('lockScope: cluster', () => {
+	beforeEach(() => applySettings(parseSettings({ lockScope: 'cluster' })));
+
+	it('locks a revised row across the cluster', async () => {
+		const { memory } = await putMemory(DEFAULT_ID, validInput(), alice, context);
+		__test.lockLog.length = 0;
+		await putMemory(memory.id, { content: 'locked' }, alice, ifMatch(1));
+		assert.deepEqual(__test.lockLog, [{ table: 'Memory', id: memory.id, scope: 'cluster', inTransaction: true }]);
+	});
+
+	it('holds the long lease across the cluster for a supersede and a withdrawal', async () => {
+		const old = (await putMemory(idFor('lease-old'), validInput(), alice, context)).memory;
+		__test.lockLog.length = 0;
+		const next = (await putMemory(idFor('lease-next'), validInput({ supersedes: [old.id] }), alice, context)).memory;
+		await withdrawMemory(next.id, {}, alice, ifMatch(1));
+		const expected = (id) => ({
+			table: 'Memory',
+			id,
+			scope: 'cluster',
+			lease: LONG_LOCK_LEASE_MS,
+			inTransaction: true,
+		});
+		const ids = [old.id, next.id].sort();
+		assert.deepEqual(__test.lockLog, [...ids, ...ids].map(expected));
+	});
+
+	it('locks pins across the cluster', async () => {
+		const { memory } = await putMemory(DEFAULT_ID, validInput(), alice, context);
+		__test.lockLog.length = 0;
+		await pinMemory(memory.id, {}, alice, context);
+		await unpinMemory(memory.id, {}, alice, context);
+		assert.ok(__test.lockLog.length > 0);
+		assert.ok(__test.lockLog.every((entry) => entry.table === 'MemoryPin' && entry.scope === 'cluster'));
+	});
+
+	it('keeps watch locks node-scoped, so watch=true reads never wait on another node', async () => {
+		const { memory } = await putMemory(DEFAULT_ID, validInput(), alice, context);
+		__test.lockLog.length = 0;
+		await recordWatches([memory.id], alice, 60, context);
+		assert.deepEqual(__test.lockLog, [
+			{ table: 'MemoryWatch', id: `alice:${memory.id}`, scope: 'node', inTransaction: true },
+		]);
 	});
 });
 
