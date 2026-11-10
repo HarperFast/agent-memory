@@ -327,7 +327,7 @@ export function embeddingInput(text: string, max = getSettings().embeddingInputC
 	return text.slice(0, code >= 0xd800 && code <= 0xdbff ? max - 1 : max);
 }
 
-export type EmbeddingSettings = Pick<Settings, 'embeddingModel' | 'embeddingInputChars' | 'embeddingTruncate'>;
+type EmbeddingSettings = Pick<Settings, 'embeddingModel' | 'embeddingInputChars' | 'embeddingTruncate'>;
 type EmbedCallOptions = { model: string; inputType: 'document' | 'query'; signal?: AbortSignal };
 
 // Core makes `truncate` a required capability: a backend that cannot truncate refuses the call, so it is asked for

@@ -4,7 +4,7 @@ import { EventEmitter } from 'node:events';
 import { models } from 'harper';
 import { handleApplication } from '../dist/index.js';
 import { MemoryMcpResource, MemoryResource } from '../dist/resource.js';
-import { getSettings, parseSettings } from '../dist/settings.js';
+import { applySettings, getSettings, parseSettings } from '../dist/settings.js';
 
 function fakeScope(options) {
 	const entries = new Map();
@@ -84,27 +84,32 @@ describe('handleApplication', () => {
 	});
 
 	it('warns when embeddingTruncate is on and this Harper cannot truncate', async () => {
-		const quiet = fakeScope({});
-		await handleApplication(quiet.scope);
-		assert.deepEqual(quiet.warnings, []);
-
-		const harness = fakeScope({ embeddingTruncate: true });
-		await handleApplication(harness.scope);
-		assert.equal(getSettings().embeddingTruncate, true);
-		assert.equal(harness.warnings.length, 1);
-		assert.match(harness.warnings[0][0], /embeddingTruncate needs Harper 5\.4/);
-
-		// Core 5.4's defineBackend carries the spec's `truncate` into capabilities().
-		models.defineBackend = (spec) => ({
+		const stubDefineBackend = models.defineBackend;
+		// Core 5.3's defineBackend ignores the spec's `truncate`; 5.4's carries it into capabilities().
+		const defineBackendOf = (withTruncate) => (spec) => ({
 			name: spec.name,
-			capabilities: () => ({ embed: true, truncate: spec.truncate }),
+			capabilities: () => (withTruncate ? { embed: true, truncate: spec.truncate } : { embed: true }),
 		});
+		const warningsFor = async (options) => {
+			const harness = fakeScope(options);
+			await handleApplication(harness.scope);
+			return harness.warnings.map(([message]) => message);
+		};
 		try {
-			const capable = fakeScope({ embeddingTruncate: true });
-			await handleApplication(capable.scope);
-			assert.deepEqual(capable.warnings, []);
+			assert.deepEqual(await warningsFor({}), []);
+			for (const defineBackend of [undefined, defineBackendOf(false)]) {
+				models.defineBackend = defineBackend;
+				const warnings = await warningsFor({ embeddingTruncate: true });
+				assert.equal(getSettings().embeddingTruncate, true);
+				assert.equal(warnings.length, 1);
+				assert.match(warnings[0], /embeddingTruncate needs Harper 5\.4/);
+			}
+			models.defineBackend = defineBackendOf(true);
+			assert.deepEqual(await warningsFor({ embeddingTruncate: true }), []);
 		} finally {
-			delete models.defineBackend;
+			if (stubDefineBackend === undefined) delete models.defineBackend;
+			else models.defineBackend = stubDefineBackend;
+			applySettings(parseSettings({}));
 		}
 	});
 });
