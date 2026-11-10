@@ -39,13 +39,16 @@ Requires Harper 5.3.1 or later within 5.x, on RocksDB (the default).
      # urlPath: 'Memory'          # mount path (watch stream mounts at '<urlPath>Events')
      # mcp: false                 # expose MCP tools and memory:///{id} on Harper's /mcp endpoint
      # embeddingModel: 'default'  # logical model name from Harper's models config
+     # embeddingTruncate: false   # Harper 5.4+: the model cuts each input at its own token window. Turn on only
+     #                            # when the model's entry can truncate (OpenAI-compatible vLLM with
+     #                            # truncation: 'vllm', Ollama, Bedrock Cohere), or every embedding is refused
      # lockScope: 'node'          # 'cluster' serializes lifecycle writes across nodes; set it on every node, and only
      #                            # with record locks on the memory database, or every write answers 503
      # limits:
      #   contentChars: 20000      # longest memory content accepted
      #   embeddingInputChars: 6000  # leading characters of content (and of a search query) sent to the embedding
      #                            # model. Characters, not tokens: lower it for a small window or token-dense text
-     #                            # (CJK, code). Full-text search covers the rest.
+     #                            # (CJK, code), unless embeddingTruncate is on. Full-text search covers the rest.
      # supersession:
      #   similarity: 0.82         # candidates returned on PUT at or above this cosine similarity
      #   judge: 'judge'           # a generative model that classifies each candidate

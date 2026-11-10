@@ -8,12 +8,14 @@ jsResource:
 '@harperfast/agent-memory':
   package: '@harperfast/agent-memory'
   embeddingModel: nomic-prefixed
+  # Each node's models.embedding.default entry must set truncation: 'vllm' first (README, Embedding truncation).
+  embeddingTruncate: true
   mcp: true
   # The engineering cluster runs with replication.recordLocks on.
   lockScope: cluster
   supersession:
     mode: suggest
   limits:
-    # The engineering nomic model holds 2,048 tokens; 6,000 characters of token-dense content (code, IDs)
-    # exceeds that. 4,000 fits down to 2 characters per token. Token-exact bounding: #28.
-    embeddingInputChars: 4000
+    # vLLM cuts each input at nomic's 2,048 tokens; this only bounds the request. 12,000 is above what 2,048
+    # tokens of English prose cover, so the model decides the cut. Back to 4000 if embeddingTruncate goes off.
+    embeddingInputChars: 12000

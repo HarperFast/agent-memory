@@ -12,6 +12,7 @@ export interface SupersessionSettings {
 export interface Settings {
 	readonly urlPath: string;
 	readonly embeddingModel: string;
+	readonly embeddingTruncate: boolean;
 	readonly titleChars: number;
 	readonly contentChars: number;
 	readonly embeddingInputChars: number;
@@ -32,6 +33,7 @@ const DEFAULT_SUPERSESSION: SupersessionSettings = Object.freeze({ mode: 'sugges
 let current: Settings = Object.freeze({
 	urlPath: 'Memory',
 	embeddingModel: DEFAULT_EMBEDDING_MODEL,
+	embeddingTruncate: false,
 	titleChars: 200,
 	contentChars: 20_000,
 	embeddingInputChars: DEFAULT_EMBEDDING_INPUT_CHARS,
@@ -81,6 +83,10 @@ export function parseSettings(options: Record<string, any>, secrets: SecretsSour
 	if (typeof embeddingModel !== 'string' || !embeddingModel) {
 		throw new Error('@harperfast/agent-memory: embeddingModel must be a non-empty string');
 	}
+	const embeddingTruncate = options.embeddingTruncate ?? false;
+	if (typeof embeddingTruncate !== 'boolean') {
+		throw new Error('@harperfast/agent-memory: embeddingTruncate must be a boolean');
+	}
 	const mcp = options.mcp ?? false;
 	if (typeof mcp !== 'boolean') {
 		throw new Error('@harperfast/agent-memory: mcp must be a boolean');
@@ -92,6 +98,7 @@ export function parseSettings(options: Record<string, any>, secrets: SecretsSour
 	return Object.freeze({
 		urlPath,
 		embeddingModel,
+		embeddingTruncate,
 		titleChars: boundedInteger(options.limits?.titleChars, 200, MAX_TITLE_CHARS, 'limits.titleChars'),
 		contentChars: boundedInteger(options.limits?.contentChars, 20_000, MAX_CONTENT_CHARS, 'limits.contentChars'),
 		embeddingInputChars: boundedInteger(

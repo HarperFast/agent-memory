@@ -22,3 +22,18 @@ Roles and their `ScopeGrant` rows:
 | `eng`             | engineers                      | `global`, `customer:*` | `global`, `customer:*` |
 | `eng-agents`      | interactive agents             | `global`, `customer:*` | `global`, `customer:*` |
 | `dispatch-worker` | fleet workers (separate users) | `global`               | `global`               |
+
+## Embedding truncation
+
+`config.yaml` sets `embeddingTruncate: true` and `limits.embeddingInputChars: 12000`: vLLM cuts each input at
+nomic's 2,048 tokens. `resources.js`'s `nomic-prefixed` backend adds the task prefix and passes `truncate` on to
+`default`. That works only when each node's `models.embedding.default` entry carries `truncation: 'vllm'`, which
+host-manager writes into the root config; without it every embedding is refused, so writes fail and search serves
+full-text only. Before running `deploy.sh` with this config:
+
+1. Both nodes run Harper 5.4 or later (5.3 ignores `truncate`; with the 12,000 cap, long prose would then fail).
+2. Both nodes' root config shows `truncation: 'vllm'` on `models.embedding.default`, and the host's vLLM is 0.18
+   or later (`hm.vllmVersion`; host-manager defaults to 0.21).
+
+Rollback is one deploy with `embeddingTruncate: false` and `embeddingInputChars: 4000` together, before removing
+`truncation` from the root config or moving a node back to 5.3.

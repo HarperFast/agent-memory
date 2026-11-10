@@ -14,7 +14,7 @@ import {
 	reviewsCustomerContent,
 	type Principal,
 } from './scopes.ts';
-import { DEFAULT_EMBEDDING_MODEL, getSettings } from './settings.ts';
+import { DEFAULT_EMBEDDING_MODEL, getSettings, type Settings } from './settings.ts';
 import { hasSinks, notifySinks } from './sinks.ts';
 import { type Candidate, findCandidates, judgeCandidates, toCandidates } from './supersession.ts';
 
@@ -327,17 +327,31 @@ export function embeddingInput(text: string, max = getSettings().embeddingInputC
 	return text.slice(0, code >= 0xd800 && code <= 0xdbff ? max - 1 : max);
 }
 
+export type EmbeddingSettings = Pick<Settings, 'embeddingModel' | 'embeddingInputChars' | 'embeddingTruncate'>;
+type EmbedCallOptions = { model: string; inputType: 'document' | 'query'; signal?: AbortSignal };
+
+// Core makes `truncate` a required capability: a backend that cannot truncate refuses the call, so it is asked for
+// only when the setting says the model can.
+export function embedOptions(options: EmbedCallOptions, truncate: boolean): EmbedCallOptions & { truncate?: true } {
+	return truncate ? { ...options, truncate: true } : options;
+}
+
 // Every plugin write carries the vector it embedded before its transaction; a write that carries none is
 // embedded here with the model recorded on the row, so the vector and the tag the vector lane filters on are
 // always from the same write.
 async function embedWithRecordModel(record: any, hook?: { signal?: AbortSignal }) {
 	if (record.content == null) return null;
 	if (Array.isArray(record.embedding) && record.embedding.length > 0) return record.embedding;
-	const [vector] = await models.embed(embeddingInput(String(record.content)), {
-		model: record.embeddingModel ?? DEFAULT_EMBEDDING_MODEL,
-		inputType: 'document',
-		signal: hook?.signal,
-	});
+	const settings = getSettings();
+	const model = record.embeddingModel ?? DEFAULT_EMBEDDING_MODEL;
+	// `embeddingTruncate` describes the configured model, not one a row was recorded under before a change.
+	const [vector] = await models.embed(
+		embeddingInput(String(record.content), settings.embeddingInputChars),
+		embedOptions(
+			{ model, inputType: 'document', signal: hook?.signal },
+			settings.embeddingTruncate && model === settings.embeddingModel,
+		),
+	);
 	return vector ? Array.from(vector) : undefined;
 }
 
@@ -347,13 +361,13 @@ export function ensureEmbedder(Memory: any): void {
 	embedderInstalled.add(Memory);
 }
 
-export async function embedContents(
-	contents: string[],
-	model: string,
-	maxChars = getSettings().embeddingInputChars,
-): Promise<number[][]> {
-	const inputs = contents.map((content) => embeddingInput(content, maxChars));
-	const vectors = await models.embed(inputs, { model, inputType: 'document' });
+export async function embedContents(contents: string[], settings: EmbeddingSettings): Promise<number[][]> {
+	const model = settings.embeddingModel;
+	const inputs = contents.map((content) => embeddingInput(content, settings.embeddingInputChars));
+	const vectors = await models.embed(
+		inputs,
+		embedOptions({ model, inputType: 'document' }, settings.embeddingTruncate),
+	);
 	// The table's embedder would embed again, under the write's locks, for a missing or empty vector.
 	if (vectors?.length !== contents.length || vectors.some((vector) => !vector?.length)) {
 		throw new Error(`embedding model "${model}" returned no vector`);
@@ -361,8 +375,8 @@ export async function embedContents(
 	return vectors.map((vector) => Array.from(vector));
 }
 
-async function embedContent(content: string, model: string): Promise<number[]> {
-	return (await embedContents([content], model))[0];
+async function embedContent(content: string, settings: EmbeddingSettings): Promise<number[]> {
+	return (await embedContents([content], settings))[0];
 }
 
 /** The transaction is about to write content it holds no vector for; embedding it there would hold the locks. */
@@ -594,7 +608,7 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 			(planningCreate ||
 				(mayRevise &&
 					(parsedContent !== preExisting.content || preExisting.embeddingModel !== settings.embeddingModel)));
-		const vector = writesContent || reembed ? await embedContent(parsedContent!, settings.embeddingModel) : undefined;
+		const vector = writesContent || reembed ? await embedContent(parsedContent!, settings) : undefined;
 		// A PUT cannot change supersedes after create, so auto verdicts must exist before the create commits.
 		const proposals =
 			planningCreate && supersession.mode === 'auto'
