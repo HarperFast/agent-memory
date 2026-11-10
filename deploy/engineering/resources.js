@@ -8,8 +8,8 @@ models.registerBackend(
 	'nomic-prefixed',
 	models.defineBackend({
 		name: 'nomic-prefixed',
-		// Passed on to "default", which honors it only when its entry sets truncation: 'vllm'. vLLM keeps the start of
-		// each input, so the prefix survives the cut.
+		// Passed on to "default", which honors it only when its entry sets truncation: 'vllm'. Core then sends
+		// truncation_side: 'right' (vLLM 0.18+), which keeps the start of each input, so the prefix survives the cut.
 		truncate: true,
 		async embed(input, opts) {
 			const prefix = PREFIX[opts?.inputType] ?? '';

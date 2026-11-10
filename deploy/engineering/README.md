@@ -33,7 +33,8 @@ full-text only. Before running `deploy.sh` with this config:
 
 1. Both nodes run Harper 5.4 or later (5.3 ignores `truncate`; with the 12,000 cap, long prose would then fail).
 2. Both nodes' root config shows `truncation: 'vllm'` on `models.embedding.default`, and the host's vLLM is 0.18
-   or later (`hm.vllmVersion`; host-manager defaults to 0.21).
+   or later (`hm.vllmVersion`; host-manager defaults to 0.21). Older vLLM ignores `truncation_side: 'right'` and
+   can keep the end of a long input instead of its start and prefix.
 
 Rollback is one deploy with `embeddingTruncate: false` and `embeddingInputChars: 4000` together, before removing
 `truncation` from the root config or moving a node back to 5.3.
