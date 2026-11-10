@@ -4,6 +4,7 @@ import { recordWatches, WATCH_DEFAULT_TTL_SECONDS } from './events.ts';
 import {
 	BOOTSTRAP_PINNED_LIMIT,
 	embeddingInput,
+	embedOptions,
 	isMemoryId,
 	memoryPinTable,
 	memoryTable,
@@ -298,7 +299,7 @@ export async function searchMemories(
 	if (params.includeWithdrawn && !principal.superUser) {
 		throw memoryError('includeWithdrawn requires super_user', 403, 'include_withdrawn_forbidden');
 	}
-	const { embeddingModel } = getSettings();
+	const { embeddingModel, embeddingInputChars, embeddingTruncate } = getSettings();
 	const Memory = memoryTable();
 	const conditions = filterConditions(params, principal);
 	if (!params.q) {
@@ -346,7 +347,10 @@ export async function searchMemories(
 	let embeddingFailed = false;
 	let embeddingError: unknown;
 	try {
-		[vector] = await models.embed(embeddingInput(params.q), { model: embeddingModel, inputType: 'query' });
+		[vector] = await models.embed(
+			embeddingInput(params.q, embeddingInputChars),
+			embedOptions({ model: embeddingModel, inputType: 'query' }, embeddingTruncate),
+		);
 		if (!vector?.length) throw new Error('Query embedding returned no vector');
 	} catch (error) {
 		embeddingFailed = true;

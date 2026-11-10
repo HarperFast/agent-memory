@@ -1,25 +1,28 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import { models } from 'harper';
 import { handleApplication } from '../dist/index.js';
 import { MemoryMcpResource, MemoryResource } from '../dist/resource.js';
-import { getSettings, parseSettings } from '../dist/settings.js';
+import { applySettings, getSettings, parseSettings } from '../dist/settings.js';
 
 function fakeScope(options) {
 	const entries = new Map();
 	const errors = [];
+	const warnings = [];
 	const watcher = new EventEmitter();
 	watcher.getAll = () => options;
 	return {
 		entries,
 		errors,
+		warnings,
 		setOptions(next) {
 			options = next;
 			watcher.emit('change');
 		},
 		scope: {
 			options: watcher,
-			logger: { error: (...args) => errors.push(args) },
+			logger: { error: (...args) => errors.push(args), warn: (...args) => warnings.push(args) },
 			resources: {
 				set: (path, Resource) => entries.set(path, { Resource, path }),
 				get: (path) => entries.get(path),
@@ -79,6 +82,36 @@ describe('handleApplication', () => {
 		assert.equal(getSettings().embeddingModel, 'first');
 		assert.equal(harness.errors.length, 1);
 	});
+
+	it('warns when embeddingTruncate is on and this Harper cannot truncate', async () => {
+		const stubDefineBackend = models.defineBackend;
+		// Core 5.3's defineBackend ignores the spec's `truncate`; 5.4's carries it into capabilities().
+		const defineBackendOf = (withTruncate) => (spec) => ({
+			name: spec.name,
+			capabilities: () => (withTruncate ? { embed: true, truncate: spec.truncate } : { embed: true }),
+		});
+		const warningsFor = async (options) => {
+			const harness = fakeScope(options);
+			await handleApplication(harness.scope);
+			return harness.warnings.map(([message]) => message);
+		};
+		try {
+			assert.deepEqual(await warningsFor({}), []);
+			for (const defineBackend of [undefined, defineBackendOf(false)]) {
+				models.defineBackend = defineBackend;
+				const warnings = await warningsFor({ embeddingTruncate: true });
+				assert.equal(getSettings().embeddingTruncate, true);
+				assert.equal(warnings.length, 1);
+				assert.match(warnings[0], /embeddingTruncate needs Harper 5\.4/);
+			}
+			models.defineBackend = defineBackendOf(true);
+			assert.deepEqual(await warningsFor({ embeddingTruncate: true }), []);
+		} finally {
+			if (stubDefineBackend === undefined) delete models.defineBackend;
+			else models.defineBackend = stubDefineBackend;
+			applySettings(parseSettings({}));
+		}
+	});
 });
 
 describe('parseSettings', () => {
@@ -87,6 +120,7 @@ describe('parseSettings', () => {
 		assert.deepEqual(defaults, {
 			urlPath: 'Memory',
 			embeddingModel: 'default',
+			embeddingTruncate: false,
 			titleChars: 200,
 			contentChars: 20000,
 			embeddingInputChars: 6000,
@@ -97,6 +131,10 @@ describe('parseSettings', () => {
 		assert.equal(customerContentCheck.mode, 'off');
 		assert.equal(parseSettings({ mcp: true }).mcp, true);
 		assert.throws(() => parseSettings({ mcp: 'true' }), /mcp/);
+		assert.equal(parseSettings({ embeddingTruncate: true }).embeddingTruncate, true);
+		for (const embeddingTruncate of ['true', 1, {}]) {
+			assert.throws(() => parseSettings({ embeddingTruncate }), /embeddingTruncate must be a boolean/);
+		}
 		assert.equal(parseSettings({ lockScope: 'cluster' }).lockScope, 'cluster');
 		assert.throws(() => parseSettings({ lockScope: 'global' }), /lockScope/);
 		assert.throws(() => parseSettings({ limits: { titleChars: 1001 } }));

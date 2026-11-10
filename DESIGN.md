@@ -50,9 +50,18 @@ database).
   request (write, import, the table embedder, the search query) carries at most
   `limits.embeddingInputChars` UTF-16 code units, cut at a code-point boundary by `embeddingInput`
   (`src/lifecycle.ts`), so a memory longer than the model's context window still writes. Full-text
-  covers the whole content. The bound is in characters, not tokens: Harper's embedding API passes no
-  truncation option and the plugin has no tokenizer, so the default (6,000) leaves headroom under a
-  2,048-token window, including a task prefix a host backend may add, rather than guaranteeing it.
+  covers the whole content. The bound is in characters, not tokens: the plugin has no tokenizer, so the
+  default (6,000) leaves headroom under a 2,048-token window, including a task prefix a host backend may
+  add, rather than guaranteeing it. With `embeddingTruncate` on, each of those requests also carries
+  `truncate: true` (`embedOptions`), and the model cuts at its own token window, keeping the start; the
+  character bound then only limits request size. Core (Harper 5.4) makes `truncate` a required
+  capability: a backend that cannot truncate refuses the call before any request, so the setting is off
+  by default and turned on only for a model whose own entry truncates. A `fallback` entry that truncates
+  behind a primary that cannot would take every embed into a different vector space. The model, cap and
+  truncate flag of one write, import or search come from one settings snapshot (`EmbeddingSettings`),
+  so a reload mid-import cannot split them. The table embedder, with no snapshot, truncates only a row
+  recorded under the configured `embeddingModel`. Harper 5.3 ignores the option; `handleApplication`
+  warns when it is on there (`coreCanTruncate`).
 - `ScopeGrant` — read/write scope patterns held by a Harper role or user.
 - `MemoryPin` — a principal's pinned memories (`<principalId>:<memoryId>`), loaded first at session bootstrap.
 - `MemoryWatch` — a principal's time-bounded interest in specific memories (live updates).
@@ -541,8 +550,8 @@ true` puts `@embed`'s HNSW index on the native plane). Harper 5.3 makes a query 
   it (25 searches each). A coverage wait that exceeds 5 s returns 503 `unavailable`.
 - **One vector space**: each row records the `embeddingModel` that embedded it, and the vector lane
   only compares rows of the configured model. Changing `embeddingModel` does not re-embed existing
-  rows; they stay reachable through full-text until revised. Changing `limits.embeddingInputChars` does
-  not re-embed either: rows embedded under different bounds share one vector space, their vectors cover
+  rows; they stay reachable through full-text until revised. Changing `limits.embeddingInputChars` or
+  `embeddingTruncate` does not re-embed either: rows embedded under different bounds share one vector space, their vectors cover
   different lengths of head, and a row gets the new bound when its content is next revised. A model whose dimensions differ from the
   indexed vectors is not supported yet: Harper's HNSW plane fixes its dimensions at the first vector,
   skips (and logs) vectors of another size, and rejects a query vector of another size. Search then
@@ -684,7 +693,7 @@ as REST:
   JSON copy can still derive scopes for another system. The matchers are not part of the contract; in-process code
   that reaches them through reflection is trusted like any other plugin code.
 - Options (`config.yaml` under the plugin's key): `urlPath`, `mcp` (default `false`), `embeddingModel`
-  (default `default`), `limits.{contentChars, titleChars, embeddingInputChars}` (default 20000 / 200 / 6000;
+  (default `default`), `embeddingTruncate` (default `false`, see `Memory` above), `limits.{contentChars, titleChars, embeddingInputChars}` (default 20000 / 200 / 6000;
   `embeddingInputChars` is 2–100000, see `Memory` above), and
   `supersession.{mode, similarity, judge}` (`off | suggest | auto`, default `suggest`; 0.82; none; `auto`
   without `judge` is rejected as malformed), and `customerContentCheck.{mode, model, patterns}` (see Customer

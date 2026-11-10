@@ -202,8 +202,7 @@ export async function importMemories(input: unknown, principal: Principal, reque
 		const flush = async (batch: Array<{ id: string; content: string }>) => {
 			const embedded = await embedContents(
 				batch.map((row) => row.content),
-				settings.embeddingModel,
-				settings.embeddingInputChars,
+				settings,
 			);
 			batch.forEach((row, index) => vectors.set(row.id, embedded[index]));
 		};

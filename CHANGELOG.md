@@ -6,6 +6,15 @@ All notable changes to `@harperfast/agent-memory` are documented here. The forma
 
 ## [Unreleased]
 
+### Added
+
+- `embeddingTruncate: true` asks the embedding model to cut each input at its own token window (Harper 5.4's
+  `models.embed(..., { truncate: true })`), so token-dense content (code, IDs, CJK) no longer fails a write,
+  import or search when it fits `limits.embeddingInputChars` but not the model. The character cap still applies
+  first and now only bounds request size. Off by default: Harper 5.4 refuses every embedding on a backend that
+  cannot truncate (an OpenAI-compatible entry needs `truncation: 'vllm'`), and Harper 5.3 ignores the option, with
+  a warning at startup.
+
 ## [0.1.3] - 2026-11-09
 
 ### Added
