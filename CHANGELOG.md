@@ -6,6 +6,8 @@ All notable changes to `@harperfast/agent-memory` are documented here. The forma
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-11-09
+
 ### Added
 
 - `lockScope: cluster` takes the lifecycle and pin record locks across the cluster, so with every node up, of
@@ -16,12 +18,6 @@ All notable changes to `@harperfast/agent-memory` are documented here. The forma
 - `scripts/race-revisions.mjs` sends concurrent revisions at one `If-Match` revision across two or more nodes and
   exits 0 only when exactly one succeeded, every other one answered 412, and every node serves the winner's revision,
   to check `lockScope: cluster` on a live cluster.
-- `scripts/copy-memories.mjs` copies every memory from one app running this plugin to another (withdrawn,
-  superseded and expired ones included), checks the target before writing, and verifies it afterwards.
-- `GET /Memory/?includeWithdrawn=true` lists withdrawn memories too, for a `super_user` only (403
-  `include_withdrawn_forbidden` for anyone else); the response then carries `includeWithdrawn: true`.
-- `POST /Memory/import` rows may carry `contentFlag` and `needsReview`, kept on a created row, so a copied memory
-  stays quarantined and its pending review survives.
 
 ### Changed
 
@@ -33,6 +29,15 @@ All notable changes to `@harperfast/agent-memory` are documented here. The forma
   such a memory can be missed for about a second (DESIGN.md, Searchable at commit).
 
 ## [0.1.2] - 2026-10-27
+
+### Added
+
+- `scripts/copy-memories.mjs` copies every memory from one app running this plugin to another (withdrawn,
+  superseded and expired ones included), checks the target before writing, and verifies it afterwards.
+- `GET /Memory/?includeWithdrawn=true` lists withdrawn memories too, for a `super_user` only (403
+  `include_withdrawn_forbidden` for anyone else); the response then carries `includeWithdrawn: true`.
+- `POST /Memory/import` rows may carry `contentFlag` and `needsReview`, kept on a created row, so a copied memory
+  stays quarantined and its pending review survives.
 
 ### Fixed
 
