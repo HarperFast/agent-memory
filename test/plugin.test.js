@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { models } from 'harper';
 import { handleApplication } from '../dist/index.js';
+import { embedTexts } from '../dist/lifecycle.js';
 import { MemoryMcpResource, MemoryResource } from '../dist/resource.js';
 import { applySettings, getSettings, parseSettings } from '../dist/settings.js';
 
@@ -90,22 +91,32 @@ describe('handleApplication', () => {
 			name: spec.name,
 			capabilities: () => (withTruncate ? { embed: true, truncate: spec.truncate } : { embed: true }),
 		});
-		const warningsFor = async (options) => {
+		const warningsFor = async (options, reload) => {
 			const harness = fakeScope(options);
 			await handleApplication(harness.scope);
+			if (reload) harness.setOptions(reload);
 			return harness.warnings.map(([message]) => message);
+		};
+		const embedLong = async () => {
+			const before = models.calls.length;
+			await embedTexts(['x'.repeat(10_000)], { model: 'default', inputType: 'document' }, getSettings(), true);
+			return models.calls.slice(before).map(({ input, options }) => [input[0].length, options.truncate === true]);
 		};
 		try {
 			assert.deepEqual(await warningsFor({}), []);
 			for (const defineBackend of [undefined, defineBackendOf(false)]) {
 				models.defineBackend = defineBackend;
-				const warnings = await warningsFor({ embeddingTruncate: true });
+				const options = { embeddingTruncate: true, limits: { embeddingInputChars: 12_000 } };
+				const warnings = await warningsFor(options, { ...options, mcp: true });
 				assert.equal(getSettings().embeddingTruncate, true);
 				assert.equal(warnings.length, 1);
 				assert.match(warnings[0], /embeddingTruncate needs Harper 5\.4/);
+				assert.match(warnings[0], /limits\.embeddingFallbackChars/);
+				assert.deepEqual(await embedLong(), [[4_000, false]]);
 			}
 			models.defineBackend = defineBackendOf(true);
-			assert.deepEqual(await warningsFor({ embeddingTruncate: true }), []);
+			assert.deepEqual(await warningsFor({ embeddingTruncate: true, limits: { embeddingInputChars: 12_000 } }), []);
+			assert.deepEqual(await embedLong(), [[10_000, true]]);
 		} finally {
 			if (stubDefineBackend === undefined) delete models.defineBackend;
 			else models.defineBackend = stubDefineBackend;
@@ -124,6 +135,7 @@ describe('parseSettings', () => {
 			titleChars: 200,
 			contentChars: 20000,
 			embeddingInputChars: 6000,
+			embeddingFallbackChars: 4000,
 			supersession: { mode: 'suggest', similarity: 0.82 },
 			mcp: false,
 			lockScope: 'node',
@@ -144,6 +156,14 @@ describe('parseSettings', () => {
 			assert.throws(
 				() => parseSettings({ limits: { embeddingInputChars } }),
 				/limits\.embeddingInputChars must be an integer between 2 and 100000/,
+			);
+		}
+		assert.equal(parseSettings({ limits: { embeddingFallbackChars: 2 } }).embeddingFallbackChars, 2);
+		assert.equal(parseSettings({ limits: { embeddingFallbackChars: 100_000 } }).embeddingFallbackChars, 100_000);
+		for (const embeddingFallbackChars of [0, 1, 100_001, 1.5, '4000', -1]) {
+			assert.throws(
+				() => parseSettings({ limits: { embeddingFallbackChars } }),
+				/limits\.embeddingFallbackChars must be an integer between 2 and 100000/,
 			);
 		}
 		assert.throws(() => parseSettings({ embeddingModel: '' }));

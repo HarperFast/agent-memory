@@ -16,6 +16,7 @@ export interface Settings {
 	readonly titleChars: number;
 	readonly contentChars: number;
 	readonly embeddingInputChars: number;
+	readonly embeddingFallbackChars: number;
 	readonly supersession: SupersessionSettings;
 	readonly customerContentCheck: ContentCheckSettings;
 	readonly mcp: boolean;
@@ -26,6 +27,8 @@ export const DEFAULT_EMBEDDING_MODEL = 'default';
 const MAX_CONTENT_CHARS = 100_000;
 const MAX_TITLE_CHARS = 1_000;
 const DEFAULT_EMBEDDING_INPUT_CHARS = 6_000;
+// Below the prose default: a deployment that asks the model to truncate has content too dense for that guess.
+const DEFAULT_EMBEDDING_FALLBACK_CHARS = 4_000;
 // The smallest bound whose code-point cut always keeps at least one character.
 const MIN_EMBEDDING_INPUT_CHARS = 2;
 const DEFAULT_SUPERSESSION: SupersessionSettings = Object.freeze({ mode: 'suggest', similarity: 0.82 });
@@ -37,6 +40,7 @@ let current: Settings = Object.freeze({
 	titleChars: 200,
 	contentChars: 20_000,
 	embeddingInputChars: DEFAULT_EMBEDDING_INPUT_CHARS,
+	embeddingFallbackChars: DEFAULT_EMBEDDING_FALLBACK_CHARS,
 	supersession: DEFAULT_SUPERSESSION,
 	customerContentCheck: CONTENT_CHECK_OFF,
 	mcp: false,
@@ -106,6 +110,13 @@ export function parseSettings(options: Record<string, any>, secrets: SecretsSour
 			DEFAULT_EMBEDDING_INPUT_CHARS,
 			MAX_CONTENT_CHARS,
 			'limits.embeddingInputChars',
+			MIN_EMBEDDING_INPUT_CHARS,
+		),
+		embeddingFallbackChars: boundedInteger(
+			options.limits?.embeddingFallbackChars,
+			DEFAULT_EMBEDDING_FALLBACK_CHARS,
+			MAX_CONTENT_CHARS,
+			'limits.embeddingFallbackChars',
 			MIN_EMBEDDING_INPUT_CHARS,
 		),
 		supersession: parseSupersession(options.supersession),

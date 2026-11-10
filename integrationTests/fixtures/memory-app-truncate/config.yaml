@@ -1,0 +1,15 @@
+rest: true
+
+graphqlSchema:
+  files: 'schema.graphql'
+
+jsResource:
+  files: 'resources.js'
+
+# The model is asked to truncate, but its backend cannot: the plugin must fall back to embeddingFallbackChars.
+'@harperfast/agent-memory':
+  package: '@harperfast/agent-memory'
+  embeddingModel: prefixed
+  embeddingTruncate: true
+  limits:
+    embeddingInputChars: 12000

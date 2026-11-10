@@ -1,0 +1,7 @@
+# One row per request the window-limited backend received.
+type EmbedCall @table @export {
+	id: ID @primaryKey
+	inputType: String
+	longest: Int
+	truncate: Boolean
+}
