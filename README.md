@@ -271,8 +271,9 @@ npm run test:integration    # boots Harper with the fixture and exercises the HT
 
 ## Releasing
 
-1. Open a PR that bumps `version` in `package.json` (and `package-lock.json`) and adds a dated `CHANGELOG.md`
-   entry for that version.
+1. Open a PR that bumps `version` in `package.json` (and `package-lock.json`) and `PACKAGE_VERSION` in
+   `src/version.ts`, the version the running plugin advertises to other apps, and adds a dated `CHANGELOG.md` entry for
+   that version. A unit test fails when the two versions differ.
 2. After it merges, publish a GitHub release tagged `v<version>` from `main`. The
    [release workflow](.github/workflows/release.yml) refuses a tag that does not match `package.json`, runs the
    unit and integration tests, and publishes the tested tarball to npm with provenance through trusted
