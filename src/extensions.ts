@@ -1,5 +1,5 @@
 import { logger } from 'harper';
-import { domain, noteExtensionRegistration } from './runtime.ts';
+import { domain, noteExtensionRegistered, noteRegistration } from './runtime.ts';
 import type { Principal } from './scopes.ts';
 import { VIEW_FIELDS } from './search.ts';
 
@@ -40,6 +40,7 @@ const BUILT_IN_SECTIONS = ['pinned', 'needsReview', 'recent', 'relevant'];
 const FAILURE_LOG_INTERVAL_MS = 60_000;
 const lastFailureLog = new Map<string, number>();
 
+// Stores a frozen copy, so the name checked here is the name dispatch uses.
 function register<T extends { readonly name: string }>(
 	list: T[],
 	entry: T,
@@ -48,20 +49,23 @@ function register<T extends { readonly name: string }>(
 	reserved: readonly string[],
 ): () => void {
 	const name = entry?.name;
+	const fn = (entry as any)?.[method];
 	if (typeof name !== 'string' || !NAME_PATTERN.test(name)) {
 		throw new TypeError(`@harperfast/agent-memory: a ${kind} name must match ${NAME_PATTERN}`);
 	}
-	if (typeof (entry as any)[method] !== 'function') {
+	if (typeof fn !== 'function') {
 		throw new TypeError(`@harperfast/agent-memory: ${kind} "${name}" needs a ${method} function`);
 	}
 	if (reserved.includes(name)) throw new TypeError(`@harperfast/agent-memory: ${kind} name "${name}" is reserved`);
 	if (list.some((other) => other.name === name)) {
 		throw new TypeError(`@harperfast/agent-memory: ${kind} "${name}" is already registered`);
 	}
-	noteExtensionRegistration();
-	list.push(entry);
+	noteRegistration();
+	const registered = Object.freeze({ name, [method]: fn.bind(entry) }) as unknown as T;
+	list.push(registered);
+	noteExtensionRegistered();
 	return () => {
-		const index = list.indexOf(entry);
+		const index = list.indexOf(registered);
 		if (index !== -1) list.splice(index, 1);
 	};
 }
@@ -99,9 +103,12 @@ function reportFailure(kind: string, name: string, error: unknown): void {
 	} catch {}
 }
 
+const NO_SECTIONS: readonly BootstrapSection[] = Object.freeze([]);
+
 /** The sections registered now; one registered or unregistered later takes effect from the next bootstrap. */
-export function registeredBootstrapSections(): BootstrapSection[] {
-	return domain().bootstrapSections?.slice() ?? [];
+export function registeredBootstrapSections(): readonly BootstrapSection[] {
+	const sections = domain().bootstrapSections;
+	return sections?.length ? sections.slice() : NO_SECTIONS;
 }
 
 function bootstrapItems(output: unknown): BootstrapItem[] {
@@ -110,7 +117,8 @@ function bootstrapItems(output: unknown): BootstrapItem[] {
 	if (Array.isArray(output)) list = output;
 	else if (typeof (output as any).text === 'string') list = [{ content: (output as any).text }];
 	else throw new TypeError('render must return { text }, an array of { title?, content }, or nothing');
-	return list.map((item) => {
+	// Array.from visits holes, so a sparse array fails here, inside the section's own catch.
+	return Array.from(list, (item) => {
 		const { title, content } = item ?? {};
 		if (typeof content !== 'string' || (title !== undefined && typeof title !== 'string')) {
 			throw new TypeError('a bootstrap item must be { title?: string, content: string }');
@@ -119,7 +127,6 @@ function bootstrapItems(output: unknown): BootstrapItem[] {
 	});
 }
 
-/** Each section's items, in registration order. */
 export function renderBootstrapSections(
 	sections: readonly BootstrapSection[],
 	input: BootstrapRenderInput,
@@ -182,7 +189,6 @@ async function runAnnotators(
 	}
 }
 
-/** Adds each annotator's value for a hit to that hit, in place. */
 export function annotateSearchHits(
 	hits: Record<string, unknown>[],
 	principal: Principal,

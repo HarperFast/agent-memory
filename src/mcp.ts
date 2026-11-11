@@ -410,7 +410,8 @@ export const MEMORY_MCP_METHODS = {
 			const searchParams = parseRecallParams(params);
 			const searchContext = mcpLifecycleContext(ctx);
 			const memories = await searchMemories(searchParams, principal, searchContext);
-			if (searchParams.q) await annotateSearchHits(memories, principal, searchContext);
+			const annotating = searchParams.q ? annotateSearchHits(memories, principal, searchContext) : undefined;
+			if (annotating) await annotating;
 			return { memories };
 		});
 	},

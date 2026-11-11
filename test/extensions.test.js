@@ -151,6 +151,16 @@ describe('scanMemories', () => {
 		assert.deepEqual(await collectScan({ after: { createdAt: last.createdAt.toISOString(), id: last.id } }), []);
 	});
 
+	it('keeps its own cursor when the consumer mutates the createdAt it was handed', async () => {
+		seed(250, (i) => new Date(Date.UTC(2026, 0, 1) + i * 1000));
+		const ids = [];
+		for await (const row of scanMemories()) {
+			ids.push(row.id);
+			row.createdAt.setUTCFullYear(2000);
+		}
+		assert.deepEqual(ids, [...__test.stores.get('Memory').keys()].sort());
+	});
+
 	it('accepts a cursor Date from another realm and rejects a malformed cursor', async () => {
 		seed(3, (i) => new Date(Date.UTC(2026, 0, 1 + i)));
 		const [first] = await collectScan();
@@ -259,6 +269,11 @@ describe('registerBootstrapSection', () => {
 			wrongShape: () => 'just a string',
 			badItem: () => [{ content: 42 }],
 			badTitle: () => [{ title: 7, content: 'x' }],
+			sparse: () => {
+				const items = new Array(3);
+				items[0] = { content: 'first' };
+				return items;
+			},
 		};
 		for (const [name, render] of Object.entries(broken)) register(registerBootstrapSection, { name, render });
 		register(registerBootstrapSection, { name: 'healthy', render: () => [{ content: 'fine' }] });
@@ -318,6 +333,25 @@ describe('registerBootstrapSection', () => {
 		} finally {
 			Memory.search = search;
 			process.off('unhandledRejection', onUnhandled);
+		}
+	});
+
+	it('warns when a registration made before an older plugin published meets it on the next scan', async () => {
+		const warnings = [];
+		const originalWarn = logger.warn;
+		logger.warn = (message) => warnings.push(message);
+		const target = domain();
+		try {
+			register(registerBootstrapSection, { name: 'orientation', render: () => [] });
+			assert.deepEqual(warnings, []);
+			target.runtime = { version: '0.1.4', resolvePrincipal() {}, canReadLabels() {} };
+			for await (const _row of scanMemories());
+			register(registerSearchAnnotator, { name: 'summaries', annotate: () => undefined });
+			assert.equal(warnings.length, 1);
+			assert.match(warnings[0], /running plugin is 0\.1\.4/);
+		} finally {
+			target.runtime = undefined;
+			logger.warn = originalWarn;
 		}
 	});
 
@@ -583,6 +617,19 @@ describe('registerSearchAnnotator', () => {
 		assert.ok(booted.memories.some((entry) => entry.section === 'relevant'));
 		assert.ok(booted.memories.every((entry) => !('summaries' in entry)));
 		assert.equal(calls, 0);
+	});
+
+	it('dispatches under the name it checked, whatever the registered object later says', async () => {
+		await seedHits();
+		const annotator = { name: 'notes', annotate: ({ hits }) => new Map(hits.map((hit) => [hit.id, 'note'])) };
+		register(registerSearchAnnotator, annotator);
+		annotator.name = 'title';
+		annotator.annotate = () => {
+			throw new Error('replaced');
+		};
+		const [hit] = await restSearch('q=wading');
+		assert.equal(hit.title, 'heron-one');
+		assert.equal(hit.notes, 'note');
 	});
 
 	it('rejects a name a hit already carries, a taken name, or no annotate function', () => {

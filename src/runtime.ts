@@ -41,7 +41,7 @@ const UNSCOPED_COPY =
 let memo: MemoryDomain | undefined;
 let scoped = false;
 let warnedUnscoped = false;
-let warnedOldRuntime = false;
+let warnedOldRuntime: MemoryRuntime | undefined;
 let checkedRuntime: MemoryRuntime | undefined;
 
 function isObject(value: unknown): value is object {
@@ -105,15 +105,20 @@ export function noteRegistration(): void {
 	if (shared.scopedRuntime) warnUnscopedOnce();
 }
 
-/** For a section or annotator registration: an older running plugin never reads them, so say so once. */
-export function noteExtensionRegistration(): void {
-	noteRegistration();
-	const runtime = domain().runtime;
-	if (warnedOldRuntime || runtime === undefined || typeof runtime.scanMemories === 'function') return;
-	warnedOldRuntime = true;
+// Checked after a section or annotator registers and when this copy first meets a runtime, so a registration made
+// before an older plugin published is caught on this copy's next call to it (a summary plugin's first scan).
+function warnIfOldRuntime(runtime: MemoryRuntime | undefined): void {
+	if (runtime === undefined || runtime === warnedOldRuntime || typeof runtime.scanMemories === 'function') return;
+	const { bootstrapSections, searchAnnotators } = domain();
+	if (!bootstrapSections?.length && !searchAnnotators?.length) return;
+	warnedOldRuntime = runtime;
 	warn(
 		`@harperfast/agent-memory: the running plugin is ${runtime.version}, which never renders bootstrap sections or runs search annotators; upgrade it to use them`,
 	);
+}
+
+export function noteExtensionRegistered(): void {
+	warnIfOldRuntime(domain().runtime);
 }
 
 export function publishRuntime(runtime: MemoryRuntime): void {
@@ -135,6 +140,7 @@ export function foreignRuntime(own: MemoryRuntime): MemoryRuntime | undefined {
 	if (runtime === undefined || runtime === own) return undefined;
 	if (runtime !== checkedRuntime) {
 		checkedRuntime = runtime;
+		warnIfOldRuntime(runtime);
 		if (major(runtime.version) !== OWN_MAJOR) {
 			warn(
 				`@harperfast/agent-memory: this app imports ${PACKAGE_VERSION} but the running plugin is ${runtime.version}; calls go to the running plugin`,

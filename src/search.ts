@@ -217,10 +217,11 @@ export async function* scanMemories(options: ScanOptions = {}): AsyncGenerator<R
 				{ authorize: false },
 			),
 		);
+		const last = page[SCAN_PAGE - 1];
+		// Copied before the consumer sees the row: a Date stays mutable inside a frozen row.
+		after = last && { createdAt: new Date(last.createdAt), id: last.id };
 		yield* page;
-		if (page.length < SCAN_PAGE) return;
-		const last = page[page.length - 1];
-		after = { createdAt: last.createdAt, id: last.id };
+		if (after === undefined) return;
 	}
 }
 
@@ -595,23 +596,24 @@ export async function bootstrapMemories(params: BootstrapParams, principal: Prin
 	const sections = registeredBootstrapSections();
 	// Contributed sections render once pinned and needsReview have packed, so they know the budget left, while recent
 	// and relevant still load. One Promise.all observes every stage's rejection.
-	const head = Promise.all([loadPinned(), loadNeedsReview()]).then(async ([pinned, needsReview]) => {
+	const head = Promise.all([loadPinned(), loadNeedsReview()]).then(([pinned, needsReview]) => {
 		pack('pinned', pinned);
 		pack('needsReview', needsReview);
 		if (sections.length === 0) return;
-		const rendered = await renderBootstrapSections(sections, {
+		return renderBootstrapSections(sections, {
 			principal,
 			q: params.q,
 			budgetChars: params.budget - used,
 			context,
-		});
-		for (const { name, items } of rendered) {
-			// No id: clients must not watch, cache or deduplicate contributed text as a memory.
-			for (const item of items) {
-				if (fits(item.title, item.content))
-					memories.push({ title: item.title ?? null, content: item.content, section: name });
+		}).then((rendered) => {
+			for (const { name, items } of rendered) {
+				// No id: clients must not watch, cache or deduplicate contributed text as a memory.
+				for (const item of items) {
+					if (fits(item.title, item.content))
+						memories.push({ title: item.title ?? null, content: item.content, section: name });
+				}
 			}
-		}
+		});
 	});
 	const [, recent, relevant] = await Promise.all([
 		head,

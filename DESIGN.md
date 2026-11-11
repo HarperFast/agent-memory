@@ -68,7 +68,8 @@ database).
 - `MemoryWatch` — a principal's time-bounded interest in specific memories (live updates).
 
 See `schema/memory.graphql`. The table is not `@export`ed: every read and write goes through the
-`Memory` resource so the rules below have exactly one enforcement point.
+`Memory` resource so the rules below have exactly one enforcement point. The one exception is `scanMemories`
+(Extension points), an unguarded read for trusted in-process plugins that no route reaches.
 
 Server-owned fields: `ownerId`, `status`, `revision`, `author`, `lastEditor`, `supersededBy`,
 `autoSupersedes`, `evidenceMemoryIds`, `needsReview`, `needsReviewSince`, `confirmed`, `contentFlag`,
@@ -757,7 +758,8 @@ context })` (sync or async) returns a `Map` from memory id to a JSON value, or n
     functions) once `configure()` succeeds, and never for an `isTransientValidation` scope. The exported
     `resolvePrincipal` and `scanMemories` call it when present, else run locally. A runtime without `scanMemories`
     is 0.1.4 or earlier, which never renders sections or runs annotators: registering one beside it warns once
-    (`noteExtensionRegistration`), and a scan runs locally. `canReadLabels` is answered by the copy that compiled the
+    (`warnIfOldRuntime`, also when this copy first calls a runtime it had not seen, so a registration made before the
+    old plugin published is caught by the copy's first scan), and a scan runs locally. `canReadLabels` is answered by the copy that compiled the
     principal (`compiledHere`), so a principal resolved before the plugin published keeps working. A different
     major version warns once and still delegates. The plugin's own routes call their functions directly; only
     `src/index.ts` forwards.
