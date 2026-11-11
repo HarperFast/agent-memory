@@ -132,7 +132,6 @@ suite('@harperfast/agent-memory embeddingTruncate on a backend that cannot trunc
 			.filter((name) => name.endsWith('.log'))
 			.map((name) => readFileSync(join(logDir, name), 'utf8'))
 			.join('\n');
-		// Harper 5.3 is detected at startup; 5.4 refuses the first call, naming the backend that cannot truncate.
 		ok(
 			/embeddingTruncate needs Harper 5\.4/.test(logs) ||
 				/embeddingModel "prefixed" cannot truncate \(Backend 'test-window' does not support 'truncate'\)/.test(logs),
