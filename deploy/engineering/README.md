@@ -1,15 +1,27 @@
 # Engineering deployment
 
-Harper engineering's shared agent memory runs as `agent-memory-app` on the two-node
-`agent-memory.engineering.harperfabric.com` cluster. Both nodes sit on GPU Fabric hosts, so
-host-manager injects the host's local vLLM as `models.embedding.default` (nomic-embed-text-v1.5) and
-`models.generative.default`.
+Harper engineering's shared agent memory runs as `agent-memory-app` on a two-node Fabric cluster. Both nodes sit
+on GPU Fabric hosts, so host-manager injects the host's local vLLM as `models.embedding.default`
+(nomic-embed-text-v1.5) and `models.generative.default`.
 
-- `deploy.sh`: packs the plugin from this checkout and runs a replicated `deploy_component` through
-  the operations socket inside one node's container. Access is the SSH key only.
-- `provision-user.sh <username> <role> <local|ssh:user@host|none> [--rotate]`: creates a Harper user
-  and writes its credentials to that machine's `~/.config/agent-memory/env` (mode 0600). The
-  password is never printed.
+## Deploying
+
+Hosts, container names and URLs are never committed (the repo is public); every script takes them from the
+environment and refuses to run without them:
+
+```bash
+export AGENT_MEMORY_DEPLOY_HOST=<ssh host of one node>       # root, SSH key only
+export AGENT_MEMORY_CONTAINER_MATCH=<substring of that node's container name>
+deploy/deploy.sh deploy/engineering
+```
+
+- Needs Harper 5.3.1 or later; embedding truncation needs 5.4 ([below](#embedding-truncation)).
+- [`../deploy.sh`](../deploy.sh): packs the plugin from this checkout, vendors it into this app, and runs a
+  replicated `deploy_component` for the project named in this `package.json` through the operations socket inside
+  one node's container.
+- `provision-user.sh <username> <role> <local|ssh:user@host|none> [--rotate]`: creates a Harper user and writes
+  its credentials to that machine's `~/.config/agent-memory/env` (mode 0600). The password is never printed. It
+  reads the same two variables, plus `AGENT_MEMORY_URL` (the cluster's base URL) unless the target is `none`.
 
 Root config set once per node (not part of the app): `mcp.application.mountPath: /mcp`, and
 `authentication.authorizeLocal: false` (the node sits behind a local TLS proxy, so loopback requests

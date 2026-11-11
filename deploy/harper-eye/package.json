@@ -1,0 +1,9 @@
+{
+	"name": "agent-memory-harper-eye",
+	"private": true,
+	"type": "module",
+	"description": "agent-memory as its own app on the cluster hosting the harper-eye app. deploy/deploy.sh vendors the packed plugin.",
+	"dependencies": {
+		"@harperfast/agent-memory": "file:./vendor/harperfast-agent-memory.tgz"
+	}
+}

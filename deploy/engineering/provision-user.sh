@@ -4,20 +4,24 @@
 # cluster only on stdin through the container's operations socket, and never printed.
 #
 # Usage:
-#   provision-user.sh <username> <role> <target> [--rotate]
+#   AGENT_MEMORY_DEPLOY_HOST=<ssh host> AGENT_MEMORY_CONTAINER_MATCH=<container name substring> \
+#   AGENT_MEMORY_URL=<cluster base URL> provision-user.sh <username> <role> <target> [--rotate]
 #     role    eng | eng-agents | dispatch-worker
 #     target  local            -> ~/.config/agent-memory/env on this machine
 #             ssh:<user@host>  -> ~/.config/agent-memory/env on that machine
 #             none             -> create the user without writing credentials anywhere
+#   The cluster is never defaulted (this repo is public). AGENT_MEMORY_URL is the base URL written into the
+#   credentials file, so it is only needed when target is not none.
 set -euo pipefail
 USERNAME="${1:?username}"; ROLE="${2:?role}"; TARGET="${3:?target}"; MODE="${4:-}"
 case "$ROLE" in eng|eng-agents|dispatch-worker) ;; *) echo "unknown role $ROLE" >&2; exit 2;; esac
 [[ "$USERNAME" =~ ^[A-Za-z0-9._@-]{1,122}$ ]] || { echo "invalid username" >&2; exit 2; }
 case "$TARGET" in local|none|ssh:?*) ;; *) echo "unknown target $TARGET" >&2; exit 2;; esac
 case "$MODE" in ''|--rotate) ;; *) echo "unknown option $MODE" >&2; exit 2;; esac
-HOST="${AGENT_MEMORY_DEPLOY_HOST:-hm-t4-gpu-us-west4-b}"
-MATCH="${AGENT_MEMORY_CONTAINER_MATCH:-agent-memory.engineering}"
-URL="${AGENT_MEMORY_URL:-https://agent-memory.engineering.harperfabric.com}"
+HOST="${AGENT_MEMORY_DEPLOY_HOST:?set AGENT_MEMORY_DEPLOY_HOST to the SSH host of one cluster node}"
+MATCH="${AGENT_MEMORY_CONTAINER_MATCH:?set AGENT_MEMORY_CONTAINER_MATCH to a substring of that node's container name}"
+[ "$TARGET" = none ] || : "${AGENT_MEMORY_URL:?set AGENT_MEMORY_URL to the cluster base URL, or use target none}"
+URL="${AGENT_MEMORY_URL:-}"
 
 # Checked before the cluster changes: a rotation whose credentials cannot be delivered loses the password.
 case "$TARGET" in ssh:*) ssh -o ProxyJump=none "${TARGET#ssh:}" true || { echo "cannot reach ${TARGET#ssh:}" >&2; exit 1; };; esac
