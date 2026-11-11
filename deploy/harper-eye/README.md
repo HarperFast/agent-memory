@@ -17,7 +17,7 @@ and refuses to run without them:
 
 ```bash
 export AGENT_MEMORY_DEPLOY_HOST=<ssh host of one node>       # root, SSH key only
-export AGENT_MEMORY_CONTAINER_MATCH=<substring of that node's container name>
+export AGENT_MEMORY_CONTAINER_MATCH=<substring matching exactly one container name on that host>
 deploy/deploy.sh deploy/harper-eye
 ```
 

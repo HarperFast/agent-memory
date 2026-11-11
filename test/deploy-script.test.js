@@ -1,7 +1,8 @@
-import { describe, it } from 'node:test';
+import { after, before, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { readdirSync, readFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const deployDir = new URL('../deploy/', import.meta.url).pathname;
@@ -43,6 +44,52 @@ describe('deploy/engineering/provision-user.sh', () => {
 		const result = run('engineering/provision-user.sh', ['someone', 'eng', 'none'], {});
 		assert.notEqual(result.status, 0);
 		assert.match(result.stderr, /AGENT_MEMORY_DEPLOY_HOST/);
+	});
+
+	describe('container selection', () => {
+		let stubs;
+		before(() => {
+			// ssh runs the remote command locally; docker answers from STUB_CONTAINERS.
+			stubs = mkdtempSync(join(tmpdir(), 'deploy-stubs-'));
+			writeFileSync(join(stubs, 'ssh'), '#!/usr/bin/env bash\nshift 3\nbash -c "$1"\n');
+			writeFileSync(
+				join(stubs, 'docker'),
+				'#!/usr/bin/env bash\ncase "$1" in\n  ps) printf "%s\\n" $STUB_CONTAINERS;;\n  exec) cat >/dev/null; echo \'{"message":"ok"}\';;\nesac\n',
+			);
+			for (const name of ['ssh', 'docker']) chmodSync(join(stubs, name), 0o755);
+		});
+		after(() => rmSync(stubs, { recursive: true, force: true }));
+
+		const provision = (match, containers) =>
+			run('engineering/provision-user.sh', ['someone', 'eng', 'none'], {
+				PATH: `${stubs}:${process.env.PATH}`,
+				AGENT_MEMORY_DEPLOY_HOST: 'host.invalid',
+				AGENT_MEMORY_CONTAINER_MATCH: match,
+				STUB_CONTAINERS: containers,
+			});
+
+		it('uses the one container that matches', () => {
+			const result = provision('match', 'other match-1');
+			assert.equal(result.status, 0, result.stderr);
+			assert.match(result.stdout, /add_user ok/);
+		});
+
+		it('refuses when no container matches', () => {
+			const result = provision('match', 'other');
+			assert.notEqual(result.status, 0);
+			assert.match(result.stderr, /need exactly one running container matching match/);
+		});
+
+		it('refuses when several containers match instead of taking the first', () => {
+			const result = provision('match', 'match-1 match-2');
+			assert.notEqual(result.status, 0);
+			assert.match(result.stderr, /match-1 match-2/);
+		});
+
+		it('reads a match that starts with a dash as text, not as a grep option', () => {
+			const result = provision('-x', 'other a-x');
+			assert.equal(result.status, 0, result.stderr);
+		});
 	});
 });
 

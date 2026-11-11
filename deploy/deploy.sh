@@ -11,7 +11,7 @@ usage: AGENT_MEMORY_DEPLOY_HOST=<ssh host> AGENT_MEMORY_CONTAINER_MATCH=<contain
   <env-dir>                     a directory holding config.yaml, package.json and resources.js, such as
                                 deploy/engineering. Its package.json "name" is the deployed project.
   AGENT_MEMORY_DEPLOY_HOST      SSH host (root) of one node of the target cluster
-  AGENT_MEMORY_CONTAINER_MATCH  substring identifying that node's running Harper container
+  AGENT_MEMORY_CONTAINER_MATCH  substring matching exactly one running container name on that host
 EOF
 	exit 2
 }
@@ -43,8 +43,8 @@ node -e 'process.stdout.write(JSON.stringify({operation:"deploy_component",proje
 
 echo "deploying $(basename "$tarball") as $PROJECT via $HOST"
 QMATCH="$(printf %q "$MATCH")"
-RESULT="$(ssh -o ProxyJump=none "root@$HOST" "C=\$(docker ps --format '{{.Names}}' | grep -F -- $QMATCH | head -1); \
-  [ -n \"\$C\" ] || { echo no running container matches $QMATCH >&2; exit 1; }; \
+RESULT="$(ssh -o ProxyJump=none "root@$HOST" "C=\$(docker ps --format '{{.Names}}' | grep -F -- $QMATCH); \
+  [ \"\$(printf '%s\\n' \"\$C\" | grep -c .)\" = 1 ] || { echo need exactly one running container matching $QMATCH, got: \$C >&2; exit 1; }; \
   docker exec -i \"\$C\" curl -sS --unix-socket /home/harperdb/harper/operations-server http://localhost \
   -H 'content-type: application/json' -d @-" <"$work/op.json")"
 # The SSH session banner can precede the response; the operation's JSON is the last line.

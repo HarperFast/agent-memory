@@ -19,7 +19,7 @@ case "$ROLE" in eng|eng-agents|dispatch-worker) ;; *) echo "unknown role $ROLE" 
 case "$TARGET" in local|none|ssh:?*) ;; *) echo "unknown target $TARGET" >&2; exit 2;; esac
 case "$MODE" in ''|--rotate) ;; *) echo "unknown option $MODE" >&2; exit 2;; esac
 HOST="${AGENT_MEMORY_DEPLOY_HOST:?set AGENT_MEMORY_DEPLOY_HOST to the SSH host of one cluster node}"
-MATCH="${AGENT_MEMORY_CONTAINER_MATCH:?set AGENT_MEMORY_CONTAINER_MATCH to a substring of that node's container name}"
+MATCH="${AGENT_MEMORY_CONTAINER_MATCH:?set AGENT_MEMORY_CONTAINER_MATCH to a substring of the container name}"
 [ "$TARGET" = none ] || : "${AGENT_MEMORY_URL:?set AGENT_MEMORY_URL to the cluster base URL, or use target none}"
 URL="${AGENT_MEMORY_URL:-}"
 
@@ -34,8 +34,8 @@ process.stdout.write(JSON.stringify({operation:e.OP, username:e.USERNAME, passwo
 
 QMATCH="$(printf %q "$MATCH")"
 RESULT="$(printf '%s' "$BODY" | ssh -o ProxyJump=none "root@$HOST" \
-  "C=\$(docker ps --format '{{.Names}}' | grep -F -- $QMATCH | head -1); \
-  [ -n \"\$C\" ] || { echo no running container matches $QMATCH >&2; exit 1; }; \
+  "C=\$(docker ps --format '{{.Names}}' | grep -F -- $QMATCH); \
+  [ \"\$(printf '%s\\n' \"\$C\" | grep -c .)\" = 1 ] || { echo need exactly one running container matching $QMATCH, got: \$C >&2; exit 1; }; \
   docker exec -i \"\$C\" curl -sS --unix-socket /home/harperdb/harper/operations-server http://localhost -H content-type:application/json -d @-")"
 # The SSH session banner can precede the response; the operation's JSON is the last line.
 RESULT="$RESULT" node -e 'const r=JSON.parse(process.env.RESULT.trim().split("\n").pop()); if (r.error) { console.error("cluster refused:", JSON.stringify(r)); process.exit(1); }'
