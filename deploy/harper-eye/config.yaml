@@ -1,0 +1,18 @@
+jsResource:
+  files: 'resources.js'
+
+'@harperfast/agent-memory':
+  package: '@harperfast/agent-memory'
+  embeddingModel: nomic-prefixed
+  # The model cuts only when its models.embedding.default entry can truncate (vLLM: truncation: 'vllm') on Harper
+  # 5.4+; otherwise the plugin embeds the first limits.embeddingFallbackChars (default 4000) characters and warns.
+  embeddingTruncate: true
+  mcp: true
+  # 'cluster' needs replication.recordLocks, which this cluster lacks; with it, every lifecycle write answers 503.
+  lockScope: node
+  supersession:
+    mode: suggest
+  limits:
+    # With a cut, this only bounds the request: 12,000 is above what nomic's 2,048 tokens of English prose cover.
+    # Back to 4000 if embeddingTruncate goes off.
+    embeddingInputChars: 12000
