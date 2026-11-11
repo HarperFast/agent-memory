@@ -625,18 +625,22 @@ export async function bootstrapMemories(params: BootstrapParams, principal: Prin
 	const sections = registeredBootstrapSections();
 	let recent: MemoryView[];
 	let relevant: MemoryView[];
+	// loadRecent goes first: it is the only load that can throw synchronously (a closing database), and then nothing
+	// else has started whose rejection would go unobserved.
 	if (sections.length === 0) {
 		let pinned: MemoryView[];
 		let needsReview: MemoryView[];
-		[pinned, needsReview, recent, relevant] = await Promise.all([
-			loadPinned(),
-			loadNeedsReview(),
+		[recent, relevant, pinned, needsReview] = await Promise.all([
 			loadRecent(),
 			loadRelevant(),
+			loadPinned(),
+			loadNeedsReview(),
 		]);
 		pack('pinned', pinned);
 		pack('needsReview', needsReview);
 	} else {
+		const recentLoad = loadRecent();
+		const relevantLoad = loadRelevant();
 		// Sections render once pinned and needsReview have packed, so they know the budget left, while recent and
 		// relevant still load. Awaiting the head on its own would leave a recent or relevant rejection unobserved.
 		const head = Promise.all([loadPinned(), loadNeedsReview()]).then(async ([pinned, needsReview]) => {
@@ -656,7 +660,7 @@ export async function bootstrapMemories(params: BootstrapParams, principal: Prin
 				}
 			}
 		});
-		[, recent, relevant] = await Promise.all([head, loadRecent(), loadRelevant()]);
+		[, recent, relevant] = await Promise.all([head, recentLoad, relevantLoad]);
 	}
 	pack('recent', recent);
 	pack('relevant', relevant);

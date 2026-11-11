@@ -307,7 +307,11 @@ describe('registerBootstrapSection', () => {
 		const Memory = databases.memory.Memory;
 		const search = Memory.search;
 		Memory.search = function (query, ctx) {
-			if (query.sort?.attribute === 'updatedAt' && query.limit === 50) throw new Error('recent load failed');
+			if (query.sort?.attribute === 'updatedAt' && query.limit === 50) {
+				return (async function* () {
+					throw new Error('recent load failed');
+				})();
+			}
 			return search.call(this, query, ctx);
 		};
 		let rendered = false;
@@ -323,6 +327,28 @@ describe('registerBootstrapSection', () => {
 			await assert.rejects(bootstrapMemories({ budget: 8000 }, alice, context), /recent load failed/);
 			await new Promise((resolve) => setTimeout(resolve, 60));
 			assert.equal(rendered, true);
+			assert.deepEqual(unhandled, []);
+		} finally {
+			Memory.search = search;
+			process.off('unhandledRejection', onUnhandled);
+		}
+	});
+
+	it('rejects cleanly when every query throws synchronously, with or without a section', async () => {
+		await setUp();
+		const unhandled = [];
+		const onUnhandled = (reason) => unhandled.push(reason);
+		process.on('unhandledRejection', onUnhandled);
+		const Memory = databases.memory.Memory;
+		const search = Memory.search;
+		Memory.search = () => {
+			throw new Error('database closed');
+		};
+		try {
+			await assert.rejects(bootstrapMemories({ q: 'tapir', budget: 8000 }, alice, context), /database closed/);
+			register(registerBootstrapSection, { name: 'orientation', render: () => [] });
+			await assert.rejects(bootstrapMemories({ q: 'tapir', budget: 8000 }, alice, context), /database closed/);
+			await new Promise((resolve) => setTimeout(resolve, 20));
 			assert.deepEqual(unhandled, []);
 		} finally {
 			Memory.search = search;

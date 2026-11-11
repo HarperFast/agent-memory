@@ -84,7 +84,8 @@ export function registerBootstrapSection(section: BootstrapSection): () => void 
 
 /**
  * Attaches per-hit data to hybrid search results (REST `q` searches and MCP `recall` with `q`) under the
- * annotator's name. It cannot add, remove, reorder or change hits; a throwing annotator is skipped and logged.
+ * annotator's name. It cannot add, remove or reorder hits, and must not change them; a throwing annotator is skipped
+ * and logged.
  * Returns an unregister function. Contract: DESIGN.md, Extension points.
  */
 export function registerSearchAnnotator(annotator: SearchAnnotator): () => void {
