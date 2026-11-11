@@ -181,10 +181,7 @@ export interface ScanOptions {
 	includeInactive?: boolean;
 }
 
-/**
- * Every stored memory row in `createdAt`, then id, order, for trusted in-process builders: no principal, no scope
- * conditions. Paged, so a slow consumer never holds a read open across the walk; a walk, not a snapshot.
- */
+// Paged, so a consumer that pauses between rows holds no read open. Contract: `scanMemories` in src/index.ts.
 export async function* scanMemories(options: ScanOptions = {}): AsyncGenerator<Record<string, unknown>> {
 	let after: CreatedPosition | undefined;
 	if (options.after !== undefined) {
