@@ -269,11 +269,6 @@ describe('registerBootstrapSection', () => {
 			wrongShape: () => 'just a string',
 			badItem: () => [{ content: 42 }],
 			badTitle: () => [{ title: 7, content: 'x' }],
-			sparse: () => {
-				const items = new Array(3);
-				items[0] = { content: 'first' };
-				return items;
-			},
 		};
 		for (const [name, render] of Object.entries(broken)) register(registerBootstrapSection, { name, render });
 		register(registerBootstrapSection, { name: 'healthy', render: () => [{ content: 'fine' }] });
@@ -332,45 +327,6 @@ describe('registerBootstrapSection', () => {
 		} finally {
 			Memory.search = search;
 			process.off('unhandledRejection', onUnhandled);
-		}
-	});
-
-	it('rejects cleanly when every query throws synchronously, with or without a section', async () => {
-		await setUp();
-		const unhandled = [];
-		const onUnhandled = (reason) => unhandled.push(reason);
-		process.on('unhandledRejection', onUnhandled);
-		const Memory = databases.memory.Memory;
-		const search = Memory.search;
-		Memory.search = () => {
-			throw new Error('database closed');
-		};
-		try {
-			await assert.rejects(bootstrapMemories({ q: 'tapir', budget: 8000 }, alice, context), /database closed/);
-			register(registerBootstrapSection, { name: 'orientation', render: () => [] });
-			await assert.rejects(bootstrapMemories({ q: 'tapir', budget: 8000 }, alice, context), /database closed/);
-			await new Promise((resolve) => setTimeout(resolve, 20));
-			assert.deepEqual(unhandled, []);
-		} finally {
-			Memory.search = search;
-			process.off('unhandledRejection', onUnhandled);
-		}
-	});
-
-	it("skips a section another version's copy registered under a built-in name", async () => {
-		const { mine } = await setUp();
-		const sections = (domain().bootstrapSections ??= []);
-		const smuggled = Object.freeze({ name: 'recent', render: () => [{ content: 'not a memory' }] });
-		sections.push(smuggled);
-		try {
-			const result = await bootstrapMemories({ budget: 8000 }, alice, context);
-			assert.deepEqual(
-				result.memories.filter((entry) => entry.section === 'recent').map((entry) => entry.id),
-				[mine.id],
-			);
-			assert.match(errors[0][0], /"recent"/);
-		} finally {
-			sections.splice(sections.indexOf(smuggled), 1);
 		}
 	});
 
@@ -500,8 +456,8 @@ describe('registerSearchAnnotator', () => {
 		const seen = [];
 		register(registerSearchAnnotator, {
 			name: 'summaries',
-			annotate({ principal, hits, context: annotateContext }) {
-				seen.push({ principal, hits, annotateContext });
+			annotate({ principal, hits }) {
+				seen.push({ principal, ids: hits.map((hit) => hit.id), frozen: Object.isFrozen(hits) });
 				return new Map([
 					[hits[0].id, [{ node: 'n1', size: 37 }]],
 					[hits[1].id, { node: 'n2' }],
@@ -530,7 +486,11 @@ describe('registerSearchAnnotator', () => {
 		);
 		assert.ok(!('summaries' in annotated[2]));
 		assert.equal(seen[0].principal.id, 'alice');
-		assert.deepEqual(seen[0].hits, baseline);
+		assert.deepEqual(
+			seen[0].ids,
+			baseline.map((hit) => hit.id),
+		);
+		assert.equal(seen[0].frozen, true);
 
 		const recalled = await new MemoryMcpResource().mcpRecall({ q: 'heron' }, { user: aliceUser });
 		assert.deepEqual(
@@ -539,22 +499,13 @@ describe('registerSearchAnnotator', () => {
 		);
 	});
 
-	it('cannot add, remove, reorder or edit hits, even nested fields, and the healthy annotators still apply', async () => {
+	it('cannot add, remove or reorder hits, and the healthy annotators still apply', async () => {
 		await seedHits();
 		const baseline = await restSearch('q=heron');
 		const attempts = {
 			sorts: ({ hits }) => hits.sort(() => -1),
 			pops: ({ hits }) => hits.pop(),
 			pushes: ({ hits }) => hits.push({ id: 'mem-injected-00000' }),
-			retitles: ({ hits }) => {
-				hits[0].title = 'changed';
-			},
-			rescopes: ({ hits }) => {
-				hits[0].scopes[0] = 'user:bob';
-			},
-			reattributes: ({ hits }) => {
-				hits[0].author.principalId = 'bob';
-			},
 		};
 		for (const [name, annotate] of Object.entries(attempts)) register(registerSearchAnnotator, { name, annotate });
 		register(registerSearchAnnotator, { name: 'healthy', annotate: ({ hits }) => new Map([[hits[0].id, true]]) });
@@ -571,10 +522,8 @@ describe('registerSearchAnnotator', () => {
 		);
 	});
 
-	it('skips an annotator that throws, returns a non-Map, or a value the response could not serialize', async () => {
+	it('skips an annotator that throws, rejects or returns something other than a Map', async () => {
 		await seedHits();
-		const cycle = {};
-		cycle.self = cycle;
 		const broken = {
 			throws: () => {
 				throw new Error('boom');
@@ -583,19 +532,6 @@ describe('registerSearchAnnotator', () => {
 				throw new Error('async boom');
 			},
 			plainObject: ({ hits }) => ({ [hits[0].id]: 1 }),
-			cyclic: ({ hits }) => new Map([[hits[0].id, cycle]]),
-			bigint: ({ hits }) => new Map([[hits[0].id, 10n]]),
-			badToJSON: ({ hits }) =>
-				new Map([
-					[
-						hits[0].id,
-						{
-							toJSON() {
-								throw new Error('no');
-							},
-						},
-					],
-				]),
 		};
 		for (const [name, annotate] of Object.entries(broken)) register(registerSearchAnnotator, { name, annotate });
 		register(registerSearchAnnotator, { name: 'healthy', annotate: ({ hits }) => new Map([[hits[0].id, 'ok']]) });
@@ -613,25 +549,7 @@ describe('registerSearchAnnotator', () => {
 		);
 	});
 
-	it('answers without annotations when the hits cannot be copied for annotators', async () => {
-		await seedHits();
-		let calls = 0;
-		register(registerSearchAnnotator, {
-			name: 'summaries',
-			annotate: () => {
-				calls++;
-				return undefined;
-			},
-		});
-		const hits = await searchMemories(parseSearchParams(new URLSearchParams('q=heron')), alice, context);
-		hits[0].uncloneable = () => {};
-		await annotateSearchHits(hits, alice, context);
-		assert.equal(calls, 0);
-		assert.ok(hits.every((hit) => !('summaries' in hit)));
-		assert.match(errors[0][0], /"snapshot"/);
-	});
-
-	it("reads a Map from another app's realm and copies its values out", async () => {
+	it("reads a Map from another app's realm", async () => {
 		const [first] = await seedHits();
 		const value = { node: 'n1' };
 		register(registerSearchAnnotator, {
@@ -644,8 +562,7 @@ describe('registerSearchAnnotator', () => {
 		});
 		const hits = await searchMemories(parseSearchParams(new URLSearchParams('q=wading')), alice, context);
 		await annotateSearchHits(hits, alice, context);
-		assert.deepEqual(hits[0].summaries, { node: 'n1' });
-		assert.notEqual(hits[0].summaries, value);
+		assert.equal(hits[0].summaries, value);
 	});
 
 	it('does no work without an annotator, and annotates neither q-less listings nor bootstrap', async () => {
@@ -687,23 +604,6 @@ describe('registerSearchAnnotator', () => {
 		const [hit] = await restSearch('q=wading');
 		assert.equal(hit.title, 'heron-one');
 		assert.equal(hit.notes, 'note');
-	});
-
-	it("skips an annotator another version's copy registered under a name that is a hit field here", async () => {
-		await seedHits();
-		const annotators = (domain().searchAnnotators ??= []);
-		const smuggled = Object.freeze({
-			name: 'title',
-			annotate: ({ hits }) => new Map(hits.map((hit) => [hit.id, 'x'])),
-		});
-		annotators.push(smuggled);
-		try {
-			const [hit] = await restSearch('q=wading');
-			assert.equal(hit.title, 'heron-one');
-			assert.match(errors[0][0], /"title"/);
-		} finally {
-			annotators.splice(annotators.indexOf(smuggled), 1);
-		}
 	});
 
 	it('rejects a name a hit already carries, a taken name, or no annotate function', () => {

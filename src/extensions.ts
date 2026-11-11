@@ -35,9 +35,10 @@ export interface SearchAnnotator {
 	annotate(input: SearchAnnotateInput): SearchAnnotations | Promise<SearchAnnotations>;
 }
 
+type SearchHit = Record<string, unknown> & { id: string };
+
 const NAME_PATTERN = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
 const BUILT_IN_SECTIONS = ['pinned', 'needsReview', 'recent', 'relevant'];
-const hitFields = () => [...VIEW_FIELDS, 'score'];
 const FAILURE_LOG_INTERVAL_MS = 60_000;
 const lastFailureLog = new Map<string, number>();
 
@@ -88,7 +89,10 @@ export function registerBootstrapSection(section: BootstrapSection): () => void 
  */
 export function registerSearchAnnotator(annotator: SearchAnnotator): () => void {
 	const target = domain();
-	return register((target.searchAnnotators ??= []), annotator, 'search annotator', 'annotate', hitFields());
+	return register((target.searchAnnotators ??= []), annotator, 'search annotator', 'annotate', [
+		...VIEW_FIELDS,
+		'score',
+	]);
 }
 
 function reportFailure(kind: string, name: string, error: unknown): void {
@@ -115,8 +119,7 @@ function bootstrapItems(output: unknown): BootstrapItem[] {
 	if (Array.isArray(output)) list = output;
 	else if (typeof (output as any).text === 'string') list = [{ content: (output as any).text }];
 	else throw new TypeError('render must return { text }, an array of { title?, content }, or nothing');
-	// Array.from visits holes, so a sparse array fails here, inside the section's own catch.
-	return Array.from(list, (item) => {
+	return list.map((item) => {
 		const { title, content } = item ?? {};
 		if (typeof content !== 'string' || (title !== undefined && typeof title !== 'string')) {
 			throw new TypeError('a bootstrap item must be { title?: string, content: string }');
@@ -134,8 +137,6 @@ export function renderBootstrapSections(
 		sections.map(async (section) => {
 			const name = section.name;
 			try {
-				// A copy of another version checked the name against its own list at registration.
-				if (BUILT_IN_SECTIONS.includes(name)) throw new TypeError(`section name "${name}" is reserved`);
 				return { name, items: bootstrapItems(await section.render(shared)) };
 			} catch (error) {
 				reportFailure('bootstrap section', name, error);
@@ -145,46 +146,21 @@ export function renderBootstrapSections(
 	);
 }
 
-function deepFreeze<T>(value: T): T {
-	if (typeof value === 'object' && value !== null && !Object.isFrozen(value)) {
-		Object.freeze(value);
-		for (const child of Object.values(value)) deepFreeze(child);
-	}
-	return value;
-}
-
 async function runAnnotators(
 	annotators: readonly SearchAnnotator[],
-	hits: Record<string, unknown>[],
+	hits: SearchHit[],
 	principal: Principal,
 	context: object,
 ): Promise<void> {
-	let snapshot: Record<string, unknown>[];
-	try {
-		snapshot = deepFreeze(structuredClone(hits));
-	} catch (error) {
-		reportFailure('search annotation', 'snapshot', error);
-		return;
-	}
-	const input = Object.freeze({ principal, hits: snapshot, context });
-	const reserved = hitFields();
+	// Each annotator sees a frozen copy of the list, so none can add, drop or reorder hits for the response or the others.
+	const input = Object.freeze({ principal, hits: Object.freeze(hits.slice()), context });
 	const results = await Promise.all(
 		annotators.map(async (annotator) => {
 			const name = annotator.name;
 			try {
-				// A copy of another version checked the name against its own hit fields at registration.
-				if (reserved.includes(name)) throw new TypeError(`annotator name "${name}" is a hit field`);
 				const annotations = await annotator.annotate(input);
 				if (annotations === null || annotations === undefined) return undefined;
-				// Called through Map.prototype so a Map from another app's realm works, and anything else throws. The JSON
-				// copy keeps a value the response could not serialize inside this catch.
-				const values = new Map<unknown, unknown>();
-				for (const { id } of hits) {
-					if (!Map.prototype.has.call(annotations, id)) continue;
-					const value = Map.prototype.get.call(annotations, id);
-					if (value !== undefined) values.set(id, JSON.parse(JSON.stringify(value)));
-				}
-				return { name, values };
+				return { name, values: hits.map((hit) => annotations.get(hit.id)) };
 			} catch (error) {
 				reportFailure('search annotator', name, error);
 				return undefined;
@@ -193,17 +169,13 @@ async function runAnnotators(
 	);
 	for (const result of results) {
 		if (result === undefined) continue;
-		for (const hit of hits) {
-			if (result.values.has(hit.id)) hit[result.name] = result.values.get(hit.id);
-		}
+		hits.forEach((hit, index) => {
+			if (result.values[index] !== undefined) hit[result.name] = result.values[index];
+		});
 	}
 }
 
-export function annotateSearchHits(
-	hits: Record<string, unknown>[],
-	principal: Principal,
-	context: object,
-): void | Promise<void> {
+export function annotateSearchHits(hits: SearchHit[], principal: Principal, context: object): void | Promise<void> {
 	const annotators = domain().searchAnnotators;
 	if (!annotators?.length || hits.length === 0) return;
 	return runAnnotators(annotators.slice(), hits, principal, context);

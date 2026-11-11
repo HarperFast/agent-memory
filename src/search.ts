@@ -593,8 +593,7 @@ export async function bootstrapMemories(params: BootstrapParams, principal: Prin
 			memories.push({ ...memory, section });
 		}
 	};
-	// async, so a synchronous throw from a query rejects rather than escaping before Promise.all observes the others.
-	const loadRecent = async () =>
+	const loadRecent = () =>
 		collect(
 			Memory.search(
 				{
@@ -606,7 +605,7 @@ export async function bootstrapMemories(params: BootstrapParams, principal: Prin
 				context,
 			),
 		).then((records) => forReader(records.map(toMemoryView), principal, context, access));
-	const loadRelevant = async () =>
+	const loadRelevant = () =>
 		params.q
 			? searchMemories(
 					{

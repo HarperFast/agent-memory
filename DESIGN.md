@@ -707,15 +707,13 @@ context })` (sync or async) returns `{ text }`, an array of `{ title?, content }
 context })` (sync or async) returns a `Map` from memory id to a JSON value, or nothing; each hit whose id the
   map holds with a value other than `undefined` gains it as `hit[name]`. It runs for searches with `q` (REST and
   MCP `recall`), not for listings (the `order=created` walk feeds Copy between instances, whose import rejects
-  unknown fields) or bootstrap's `relevant` search. `hits` is one deep-frozen copy of the results shared by every
-  annotator, and agent-memory merges by id in its own order, so an annotator cannot add, remove, reorder or edit a
-  hit. The map is read through `Map.prototype`, so a `Map` from another app's realm works, and each value is copied
-  through JSON inside the annotator's error boundary, so a value the response could not serialize (a cycle, a
-  `BigInt`, a throwing `toJSON`) skips that annotator like a throw or a non-`Map` result: logged at most once a
-  minute per name, and the search still answers. `name` follows the section rule and is not a field a hit carries
-  (the view's fields and `score`). The running plugin checks that again at dispatch, since a copy of another
-  version checked it against its own fields: an annotator whose name is a hit field in the plugin's version is
-  skipped and logged, as is a section named like a built-in. With no annotator registered, results go out untouched.
+  unknown fields) or bootstrap's `relevant` search. `hits` is a frozen copy of the result list holding the result
+  objects themselves, which annotators must not change; agent-memory merges by position in its own list, so an
+  annotator cannot add, remove or reorder hits. One that throws, rejects, or returns something without a `get`
+  method is skipped and logged at most once a minute per name, and the search still answers. `name` follows the
+  section rule and is not a field a hit carries (the view's fields and `score`), checked by the registering copy:
+  a plugin of a later version that adds a hit field of that name sees it overwritten, so pick a name specific to
+  the plugin. With no annotator registered, results go out untouched.
 - **Contributed output is the contributor's to authorize.** Sections and annotators get the resolved principal,
   and agent-memory does not filter what they return. `canReadLabels` is the label test only: ownership, withdrawal
   and the customer-content quarantine (`contentFlag`; clearance is `superUser` or the `customer:*` read wildcard in
@@ -723,7 +721,9 @@ context })` (sync or async) returns a `Map` from memory id to a JSON value, or n
   several memories is shown only to a reader of all of them, checked against the sources' current state: a
   rescope, flag or withdrawal reaches the contributor through its sink before its derived text is rebuilt, so it
   must stop serving that text then, not after the rebuild.
-- Sections and annotators are awaited, like sinks, with no time bound: a slow one delays the response.
+- Contributors (sections, annotators, `scanMemories` callers) are trusted in-process code, as sinks are:
+  agent-memory contains their failures, a throw or a rejection, but does not defend against the values they
+  return or the objects they are handed. They are awaited with no time bound, so a slow one delays the response.
 - `setPrincipalResolver(fn)` — see Identity.
 - `resolvePrincipal(context)` — the caller behind a request context, resolved exactly as the plugin's own routes
   resolve it (custom resolver, else the Harper user and its `ScopeGrant` rows, read on every call). It resolves
