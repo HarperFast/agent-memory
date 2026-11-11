@@ -48,7 +48,6 @@ export class ScanProbe extends Resource {
 	static async get() {
 		const rows = [];
 		for await (const row of scanMemories()) rows.push(row);
-		// The cursor carries the plugin's Date back into the plugin.
 		const resumed = [];
 		for await (const row of scanMemories({ after: { createdAt: rows[0].createdAt, id: rows[0].id } })) {
 			resumed.push(row.id);

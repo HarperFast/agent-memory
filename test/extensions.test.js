@@ -312,7 +312,6 @@ describe('registerBootstrapSection', () => {
 		const Memory = databases.memory.Memory;
 		const search = Memory.search;
 		Memory.search = function (query, ctx) {
-			// The recent load: the caller's own memories, newest first.
 			if (query.sort?.attribute === 'updatedAt' && query.limit === 50) throw new Error('recent load failed');
 			return search.call(this, query, ctx);
 		};
@@ -336,7 +335,7 @@ describe('registerBootstrapSection', () => {
 		}
 	});
 
-	it('warns when a registration made before an older plugin published meets it on the next scan', async () => {
+	it('warns when an older plugin publishes after a section registered, and once per runtime', async () => {
 		const warnings = [];
 		const originalWarn = logger.warn;
 		logger.warn = (message) => warnings.push(message);
@@ -345,6 +344,7 @@ describe('registerBootstrapSection', () => {
 			register(registerBootstrapSection, { name: 'orientation', render: () => [] });
 			assert.deepEqual(warnings, []);
 			target.runtime = { version: '0.1.4', resolvePrincipal() {}, canReadLabels() {} };
+			assert.equal(warnings.length, 1);
 			for await (const _row of scanMemories());
 			register(registerSearchAnnotator, { name: 'summaries', annotate: () => undefined });
 			assert.equal(warnings.length, 1);

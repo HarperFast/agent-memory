@@ -758,8 +758,10 @@ context })` (sync or async) returns a `Map` from memory id to a JSON value, or n
     functions) once `configure()` succeeds, and never for an `isTransientValidation` scope. The exported
     `resolvePrincipal` and `scanMemories` call it when present, else run locally. A runtime without `scanMemories`
     is 0.1.4 or earlier, which never renders sections or runs annotators: registering one beside it warns once
-    (`warnIfOldRuntime`, also when this copy first calls a runtime it had not seen, so a registration made before the
-    old plugin published is caught by the copy's first scan), and a scan runs locally. `canReadLabels` is answered by the copy that compiled the
+    per runtime (`warnIfOldRuntime`). A registration made before any plugin published turns the domain's `runtime`
+    into an accessor whose setter runs the same check (`noteExtensionRegistered`), since an older plugin publishes
+    with a plain assignment; reads and writes of `runtime` behave as before. A scan beside an older runtime runs
+    locally. `canReadLabels` is answered by the copy that compiled the
     principal (`compiledHere`), so a principal resolved before the plugin published keeps working. A different
     major version warns once and still delegates. The plugin's own routes call their functions directly; only
     `src/index.ts` forwards.

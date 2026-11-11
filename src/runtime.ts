@@ -105,8 +105,6 @@ export function noteRegistration(): void {
 	if (shared.scopedRuntime) warnUnscopedOnce();
 }
 
-// Checked after a section or annotator registers and when this copy first meets a runtime, so a registration made
-// before an older plugin published is caught on this copy's next call to it (a summary plugin's first scan).
 function warnIfOldRuntime(runtime: MemoryRuntime | undefined): void {
 	if (runtime === undefined || runtime === warnedOldRuntime || typeof runtime.scanMemories === 'function') return;
 	const { bootstrapSections, searchAnnotators } = domain();
@@ -118,7 +116,21 @@ function warnIfOldRuntime(runtime: MemoryRuntime | undefined): void {
 }
 
 export function noteExtensionRegistered(): void {
-	warnIfOldRuntime(domain().runtime);
+	const target = domain();
+	warnIfOldRuntime(target.runtime);
+	if (target.runtime !== undefined || Object.getOwnPropertyDescriptor(target, 'runtime')?.set) return;
+	// No plugin has published yet, and one from 0.1.4 or earlier will not look at these lists when it does: it
+	// publishes with a plain assignment, which this setter observes. Reads and writes behave as before.
+	let runtime: MemoryRuntime | undefined;
+	Object.defineProperty(target, 'runtime', {
+		configurable: true,
+		enumerable: true,
+		get: () => runtime,
+		set: (value: MemoryRuntime | undefined) => {
+			runtime = value;
+			warnIfOldRuntime(value);
+		},
+	});
 }
 
 export function publishRuntime(runtime: MemoryRuntime): void {

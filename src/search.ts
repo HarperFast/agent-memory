@@ -593,30 +593,7 @@ export async function bootstrapMemories(params: BootstrapParams, principal: Prin
 			memories.push({ ...memory, section });
 		}
 	};
-	const sections = registeredBootstrapSections();
-	// Contributed sections render once pinned and needsReview have packed, so they know the budget left, while recent
-	// and relevant still load. Awaiting head on its own would leave a recent or relevant rejection unobserved.
-	const head = Promise.all([loadPinned(), loadNeedsReview()]).then(([pinned, needsReview]) => {
-		pack('pinned', pinned);
-		pack('needsReview', needsReview);
-		if (sections.length === 0) return;
-		return renderBootstrapSections(sections, {
-			principal,
-			q: params.q,
-			budgetChars: params.budget - used,
-			context,
-		}).then((rendered) => {
-			for (const { name, items } of rendered) {
-				// No id: clients must not watch, cache or deduplicate contributed text as a memory.
-				for (const item of items) {
-					if (fits(item.title, item.content))
-						memories.push({ title: item.title ?? null, content: item.content, section: name });
-				}
-			}
-		});
-	});
-	const [, recent, relevant] = await Promise.all([
-		head,
+	const loadRecent = () =>
 		collect(
 			Memory.search(
 				{
@@ -627,7 +604,8 @@ export async function bootstrapMemories(params: BootstrapParams, principal: Prin
 				},
 				context,
 			),
-		).then((records) => forReader(records.map(toMemoryView), principal, context, access)),
+		).then((records) => forReader(records.map(toMemoryView), principal, context, access));
+	const loadRelevant = () =>
 		params.q
 			? searchMemories(
 					{
@@ -643,8 +621,43 @@ export async function bootstrapMemories(params: BootstrapParams, principal: Prin
 					context,
 					access,
 				).then((hits) => hits.map(({ score: _score, ...memory }) => memory))
-			: [],
-	]);
+			: [];
+	const sections = registeredBootstrapSections();
+	let recent: MemoryView[];
+	let relevant: MemoryView[];
+	if (sections.length === 0) {
+		let pinned: MemoryView[];
+		let needsReview: MemoryView[];
+		[pinned, needsReview, recent, relevant] = await Promise.all([
+			loadPinned(),
+			loadNeedsReview(),
+			loadRecent(),
+			loadRelevant(),
+		]);
+		pack('pinned', pinned);
+		pack('needsReview', needsReview);
+	} else {
+		// Sections render once pinned and needsReview have packed, so they know the budget left, while recent and
+		// relevant still load. Awaiting the head on its own would leave a recent or relevant rejection unobserved.
+		const head = Promise.all([loadPinned(), loadNeedsReview()]).then(async ([pinned, needsReview]) => {
+			pack('pinned', pinned);
+			pack('needsReview', needsReview);
+			const rendered = await renderBootstrapSections(sections, {
+				principal,
+				q: params.q,
+				budgetChars: params.budget - used,
+				context,
+			});
+			for (const { name, items } of rendered) {
+				// No id: clients must not watch, cache or deduplicate contributed text as a memory.
+				for (const item of items) {
+					if (fits(item.title, item.content))
+						memories.push({ title: item.title ?? null, content: item.content, section: name });
+				}
+			}
+		});
+		[, recent, relevant] = await Promise.all([head, loadRecent(), loadRelevant()]);
+	}
 	pack('recent', recent);
 	pack('relevant', relevant);
 	if (params.watch) await recordWatches([...seen], principal, WATCH_DEFAULT_TTL_SECONDS, context);
