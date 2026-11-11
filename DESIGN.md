@@ -713,8 +713,9 @@ context })` (sync or async) returns a `Map` from memory id to a JSON value, or n
   through JSON inside the annotator's error boundary, so a value the response could not serialize (a cycle, a
   `BigInt`, a throwing `toJSON`) skips that annotator like a throw or a non-`Map` result: logged at most once a
   minute per name, and the search still answers. `name` follows the section rule and is not a field a hit carries
-  (the view's fields and `score`); a later version that adds a hit field of the same name rejects that
-  registration. With no annotator registered, results go out untouched.
+  (the view's fields and `score`). The running plugin checks that again at dispatch, since a copy of another
+  version checked it against its own fields: an annotator whose name is a hit field in the plugin's version is
+  skipped and logged, as is a section named like a built-in. With no annotator registered, results go out untouched.
 - **Contributed output is the contributor's to authorize.** Sections and annotators get the resolved principal,
   and agent-memory does not filter what they return. `canReadLabels` is the label test only: ownership, withdrawal
   and the customer-content quarantine (`contentFlag`; clearance is `superUser` or the `customer:*` read wildcard in

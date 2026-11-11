@@ -335,6 +335,45 @@ describe('registerBootstrapSection', () => {
 		}
 	});
 
+	it('rejects cleanly when every query throws synchronously, with or without a section', async () => {
+		await setUp();
+		const unhandled = [];
+		const onUnhandled = (reason) => unhandled.push(reason);
+		process.on('unhandledRejection', onUnhandled);
+		const Memory = databases.memory.Memory;
+		const search = Memory.search;
+		Memory.search = () => {
+			throw new Error('database closed');
+		};
+		try {
+			await assert.rejects(bootstrapMemories({ q: 'tapir', budget: 8000 }, alice, context), /database closed/);
+			register(registerBootstrapSection, { name: 'orientation', render: () => [] });
+			await assert.rejects(bootstrapMemories({ q: 'tapir', budget: 8000 }, alice, context), /database closed/);
+			await new Promise((resolve) => setTimeout(resolve, 20));
+			assert.deepEqual(unhandled, []);
+		} finally {
+			Memory.search = search;
+			process.off('unhandledRejection', onUnhandled);
+		}
+	});
+
+	it("skips a section another version's copy registered under a built-in name", async () => {
+		const { mine } = await setUp();
+		const sections = (domain().bootstrapSections ??= []);
+		const smuggled = Object.freeze({ name: 'recent', render: () => [{ content: 'not a memory' }] });
+		sections.push(smuggled);
+		try {
+			const result = await bootstrapMemories({ budget: 8000 }, alice, context);
+			assert.deepEqual(
+				result.memories.filter((entry) => entry.section === 'recent').map((entry) => entry.id),
+				[mine.id],
+			);
+			assert.match(errors[0][0], /"recent"/);
+		} finally {
+			sections.splice(sections.indexOf(smuggled), 1);
+		}
+	});
+
 	it('warns when an older plugin publishes after a section registered, and once per runtime', async () => {
 		const warnings = [];
 		const originalWarn = logger.warn;
@@ -648,6 +687,23 @@ describe('registerSearchAnnotator', () => {
 		const [hit] = await restSearch('q=wading');
 		assert.equal(hit.title, 'heron-one');
 		assert.equal(hit.notes, 'note');
+	});
+
+	it("skips an annotator another version's copy registered under a name that is a hit field here", async () => {
+		await seedHits();
+		const annotators = (domain().searchAnnotators ??= []);
+		const smuggled = Object.freeze({
+			name: 'title',
+			annotate: ({ hits }) => new Map(hits.map((hit) => [hit.id, 'x'])),
+		});
+		annotators.push(smuggled);
+		try {
+			const [hit] = await restSearch('q=wading');
+			assert.equal(hit.title, 'heron-one');
+			assert.match(errors[0][0], /"title"/);
+		} finally {
+			annotators.splice(annotators.indexOf(smuggled), 1);
+		}
 	});
 
 	it('rejects a name a hit already carries, a taken name, or no annotate function', () => {

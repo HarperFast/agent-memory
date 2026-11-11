@@ -37,6 +37,7 @@ export interface SearchAnnotator {
 
 const NAME_PATTERN = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
 const BUILT_IN_SECTIONS = ['pinned', 'needsReview', 'recent', 'relevant'];
+const hitFields = () => [...VIEW_FIELDS, 'score'];
 const FAILURE_LOG_INTERVAL_MS = 60_000;
 const lastFailureLog = new Map<string, number>();
 
@@ -87,10 +88,7 @@ export function registerBootstrapSection(section: BootstrapSection): () => void 
  */
 export function registerSearchAnnotator(annotator: SearchAnnotator): () => void {
 	const target = domain();
-	return register((target.searchAnnotators ??= []), annotator, 'search annotator', 'annotate', [
-		...VIEW_FIELDS,
-		'score',
-	]);
+	return register((target.searchAnnotators ??= []), annotator, 'search annotator', 'annotate', hitFields());
 }
 
 function reportFailure(kind: string, name: string, error: unknown): void {
@@ -136,6 +134,8 @@ export function renderBootstrapSections(
 		sections.map(async (section) => {
 			const name = section.name;
 			try {
+				// A copy of another version checked the name against its own list at registration.
+				if (BUILT_IN_SECTIONS.includes(name)) throw new TypeError(`section name "${name}" is reserved`);
 				return { name, items: bootstrapItems(await section.render(shared)) };
 			} catch (error) {
 				reportFailure('bootstrap section', name, error);
@@ -167,10 +167,13 @@ async function runAnnotators(
 		return;
 	}
 	const input = Object.freeze({ principal, hits: snapshot, context });
+	const reserved = hitFields();
 	const results = await Promise.all(
 		annotators.map(async (annotator) => {
 			const name = annotator.name;
 			try {
+				// A copy of another version checked the name against its own hit fields at registration.
+				if (reserved.includes(name)) throw new TypeError(`annotator name "${name}" is a hit field`);
 				const annotations = await annotator.annotate(input);
 				if (annotations === null || annotations === undefined) return undefined;
 				// Called through Map.prototype so a Map from another app's realm works, and anything else throws. The JSON
