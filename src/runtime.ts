@@ -34,7 +34,7 @@ const UNSCOPED_COPY =
 let memo: MemoryDomain | undefined;
 let scoped = false;
 let warnedUnscoped = false;
-let warnedVersion = false;
+let checkedRuntime: MemoryRuntime | undefined;
 
 function isObject(value: unknown): value is object {
 	return (typeof value === 'object' || typeof value === 'function') && value !== null;
@@ -52,12 +52,7 @@ function anchor(): Anchor {
 	return shared;
 }
 
-/**
- * The state this copy shares with every other copy loaded into the same `resources` registry and `databases`
- * view: Harper gives all live apps on a worker the same pair, a deploy-validation candidate its own `resources`,
- * and an app with branched databases its own `databases`. A copy loaded without an app scope (its `harper` has
- * no `resources`) keeps a private domain.
- */
+// Keyed by the bindings Harper gives each app scope (DESIGN.md, Extension points, Across apps).
 export function domain(): MemoryDomain {
 	if (memo !== undefined) return memo;
 	const { resources, databases } = harper as unknown as { resources?: unknown; databases?: unknown };
@@ -107,15 +102,18 @@ function major(version: string): string {
 	return version.split('.', 1)[0];
 }
 
-/** The running plugin's runtime when it is another copy, else undefined. */
+const OWN_MAJOR = major(PACKAGE_VERSION);
+
 export function foreignRuntime(own: MemoryRuntime): MemoryRuntime | undefined {
 	const runtime = domain().runtime;
 	if (runtime === undefined || runtime === own) return undefined;
-	if (!warnedVersion && major(runtime.version) !== major(PACKAGE_VERSION)) {
-		warnedVersion = true;
-		harper.logger.warn?.(
-			`@harperfast/agent-memory: this app imports ${PACKAGE_VERSION} but the running plugin is ${runtime.version}; calls go to the running plugin`,
-		);
+	if (runtime !== checkedRuntime) {
+		checkedRuntime = runtime;
+		if (major(runtime.version) !== OWN_MAJOR) {
+			harper.logger.warn?.(
+				`@harperfast/agent-memory: this app imports ${PACKAGE_VERSION} but the running plugin is ${runtime.version}; calls go to the running plugin`,
+			);
+		}
 	}
 	return runtime;
 }

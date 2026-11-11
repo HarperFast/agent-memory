@@ -244,7 +244,6 @@ export const databases = {
 	},
 };
 export const tables = {};
-// The app's resource registry, which Harper's module loader binds per scope; agent-memory keys its shared state on it.
 export const resources = new Map();
 
 let chain = Promise.resolve();

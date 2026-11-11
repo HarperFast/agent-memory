@@ -709,13 +709,15 @@ as REST:
     major version warns once and still delegates. The plugin's own routes call their functions directly; only
     `src/index.ts` forwards.
   - A second plugin instance in a domain throws before mounting: one resolver and one sink list cannot serve two
-    hosts' registrations. The check, `configure()` and the publish run with no `await` between them.
+    hosts' registrations. Each worker decides independently which instance loaded first. The check,
+    `configure()` and the publish run with no `await` between them.
   - The anchor, the domain object, `MemoryRuntime` and the sink and resolver call shapes are a protocol between
     package versions. They only gain members; an incompatible change needs a new anchor key.
   - A copy whose `harper` has no `resources` was loaded without an app scope (`moduleLoader` `native` or
-    `compartment`, or `dependencyLoader: native`). It keeps a private domain, as every copy did before, and warns
-    once beside a scoped plugin (`noteRegistration`, `publishRuntime`). In-app hosting is unaffected, because
-    the host and the plugin share one module instance.
+    `compartment`, or `dependencyLoader: native`). It keeps a private domain, as every copy did before, so two
+    such copies in different apps never meet. Beside a scoped plugin, the unscoped copy and the plugin each warn
+    once, in their own app's log (`noteRegistration`, `publishRuntime`). In-app hosting is unaffected, because the
+    host and the plugin share one module instance.
   - The registry is per worker thread, so an `isolated` agent-memory app is out of reach. A copy from 0.1.3 or
     earlier keeps its registrations to itself.
 - Options (`config.yaml` under the plugin's key): `urlPath`, `mcp` (default `false`), `embeddingModel`

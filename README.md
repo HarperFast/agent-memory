@@ -187,10 +187,11 @@ differ. This needs:
 
 - Both apps on Harper's shared worker pool: agent-memory must not be `isolated`.
 - Harper's default module loading: `applications.moduleLoader` `vm-current-context` (the default) or `vm`, and
-  `applications.dependencyLoader` unset or `app`. Under the `native` or `compartment` loader, or
-  `dependencyLoader: native`, each copy keeps its own state, as before, and a copy registering beside a running
-  plugin logs a warning.
-- Exactly one app listing the plugin in its `config.yaml`. A second one fails to load.
+  `applications.dependencyLoader` unset or `app`. Under the `native` or `compartment` loader each copy keeps its
+  own state, as before, so this does not work there, and nothing warns. With `dependencyLoader: native`, a copy
+  that registers beside a running plugin logs a warning.
+- Exactly one app listing the plugin in its `config.yaml`. A second one fails to load. Which of the two loads
+  first can differ from worker to worker, so remove one.
 - A version of this package newer than 0.1.3 in the importing app. 0.1.3 and earlier keep registrations to
   themselves.
 

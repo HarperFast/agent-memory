@@ -27,8 +27,8 @@ All notable changes to `@harperfast/agent-memory` are documented here. The forma
 
 ### Changed
 
-- A second app listing the plugin on the same Harper worker now fails to load, rather than both serving the
-  same `memory` database with separate sinks and resolvers.
+- Under Harper's default module loading, a second app listing the plugin on the same worker now fails to load,
+  rather than both serving the same `memory` database with separate sinks and resolvers.
 
 ## [0.1.3] - 2026-11-09
 

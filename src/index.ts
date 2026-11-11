@@ -24,7 +24,12 @@ const RUNTIME: MemoryRuntime = Object.freeze({
  * copy when none runs beside it (DESIGN.md, Extension points).
  */
 export function resolvePrincipal(context: any): Promise<Principal> {
-	const runtime = foreignRuntime(RUNTIME);
+	let runtime: MemoryRuntime | undefined;
+	try {
+		runtime = foreignRuntime(RUNTIME);
+	} catch (error) {
+		return Promise.reject(error);
+	}
 	return runtime ? runtime.resolvePrincipal(context) : resolveHere(context);
 }
 
@@ -33,8 +38,10 @@ export function resolvePrincipal(context: any): Promise<Principal> {
  * nothing. Answered by the copy of the package that resolved `principal`; any other object throws a TypeError.
  */
 export function canReadLabels(principal: Principal, labels: readonly string[] | null | undefined): boolean {
-	const runtime = compiledHere(principal) ? undefined : foreignRuntime(RUNTIME);
-	return runtime ? runtime.canReadLabels(principal, labels) : canReadLabelsHere(principal, labels);
+	const runtime = foreignRuntime(RUNTIME);
+	return runtime && !compiledHere(principal)
+		? runtime.canReadLabels(principal, labels)
+		: canReadLabelsHere(principal, labels);
 }
 
 function routePathFor(basePath: string, resource: { path: string }): string {
