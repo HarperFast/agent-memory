@@ -76,10 +76,17 @@ export function domain(): MemoryDomain {
 	return found;
 }
 
+// A diagnostic must never fail the registration, load or authorization that triggered it.
+function warn(message: string): void {
+	try {
+		harper.logger.warn?.(message);
+	} catch {}
+}
+
 function warnUnscopedOnce(): void {
 	if (warnedUnscoped) return;
 	warnedUnscoped = true;
-	harper.logger.warn?.(UNSCOPED_COPY);
+	warn(UNSCOPED_COPY);
 }
 
 export function noteRegistration(): void {
@@ -110,7 +117,7 @@ export function foreignRuntime(own: MemoryRuntime): MemoryRuntime | undefined {
 	if (runtime !== checkedRuntime) {
 		checkedRuntime = runtime;
 		if (major(runtime.version) !== OWN_MAJOR) {
-			harper.logger.warn?.(
+			warn(
 				`@harperfast/agent-memory: this app imports ${PACKAGE_VERSION} but the running plugin is ${runtime.version}; calls go to the running plugin`,
 			);
 		}

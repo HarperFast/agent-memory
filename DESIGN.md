@@ -716,10 +716,13 @@ as REST:
   - A copy whose `harper` has no `resources` was loaded without an app scope (`moduleLoader` `native` or
     `compartment`, or `dependencyLoader: native`). It keeps a private domain, as every copy did before, so two
     such copies in different apps never meet. Beside a scoped plugin, the unscoped copy and the plugin each warn
-    once, in their own app's log (`noteRegistration`, `publishRuntime`). In-app hosting is unaffected, because the
-    host and the plugin share one module instance.
+    once, in their own app's log (`noteRegistration`, `publishRuntime`). In-app hosting is unaffected under the
+    default loaders and under `native` and `compartment`, where the host and the plugin share one module instance.
+    `dependencyLoader: native` already split them before this change; now it warns.
   - The registry is per worker thread, so an `isolated` agent-memory app is out of reach. A copy from 0.1.3 or
-    earlier keeps its registrations to itself.
+    earlier keeps its registrations to itself. A registration lasts as long as the worker, even when the app
+    that made it fails to load afterwards, as it already did for an in-app host. Harper restarts workers to
+    replace an app, so a domain never sees a second runtime from a redeploy.
 - Options (`config.yaml` under the plugin's key): `urlPath`, `mcp` (default `false`), `embeddingModel`
   (default `default`), `embeddingTruncate` (default `false`), `limits.{contentChars, titleChars, embeddingInputChars,
 embeddingFallbackChars}` (default 20000 / 200 / 6000 / 4000; the last two 2–100000; see `Memory` above), and
