@@ -715,8 +715,9 @@ as REST:
     package versions. They only gain members; an incompatible change needs a new anchor key.
   - A copy whose `harper` has no `resources` was loaded without an app scope (`moduleLoader` `native` or
     `compartment`, or `dependencyLoader: native`). It keeps a private domain, as every copy did before, so two
-    such copies in different apps never meet. Beside a scoped plugin, the unscoped copy and the plugin each warn
-    once, in their own app's log (`noteRegistration`, `publishRuntime`). In-app hosting is unaffected under the
+    such copies in different apps never meet. Mixed with a scoped plugin, whichever side comes second warns
+    once in its own app's log: the plugin when it publishes after such a registration (`publishRuntime`), the
+    copy when it registers after the plugin published (`noteRegistration`). In-app hosting is unaffected under the
     default loaders and under `native` and `compartment`, where the host and the plugin share one module instance.
     `dependencyLoader: native` already split them before this change; now it warns.
   - The registry is per worker thread, so an `isolated` agent-memory app is out of reach. A copy from 0.1.3 or
