@@ -1,0 +1,8 @@
+# Imports @harperfast/agent-memory from its own node_modules without listing the plugin: memory-service runs it.
+rest: true
+
+graphqlSchema:
+  files: 'schema.graphql'
+
+jsResource:
+  files: 'resources.js'

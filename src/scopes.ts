@@ -141,6 +141,10 @@ function patternList(matcher: ScopeMatcher): readonly string[] {
 	return Object.freeze(patterns);
 }
 
+export function compiledHere(principal: unknown): boolean {
+	return typeof principal === 'object' && principal !== null && Object.hasOwn(principal, MATCHERS);
+}
+
 function matchersOf(principal: Principal): { readonly read: ScopeMatcher; readonly write: ScopeMatcher } {
 	if (!Object.hasOwn(principal, MATCHERS)) throw new TypeError('Expected a principal returned by resolvePrincipal');
 	return (principal as CompiledPrincipal)[MATCHERS]!;

@@ -37,6 +37,7 @@ allowlists, idempotent `PUT` create/revise with `If-Match` revision precondition
 | MCP tools and `memory:///{id}` resource (`mcp` option)                                                           | implemented (`src/mcp.ts`)          |
 | Customer-content flag and quarantine (`customerContentCheck` option)                                             | implemented (`src/quarantine.ts`)   |
 | Supersession backfill: candidates for an existing memory, links between existing memories, created-order cursor  | implemented (`src/lifecycle.ts`)    |
+| Package exports reaching the plugin from another app (Extension points, Across apps)                             | implemented (`src/runtime.ts`)      |
 
 ## Data model
 
@@ -101,7 +102,8 @@ source? }`, or `undefined` for unauthenticated. `next()` is the default Harper-u
   resolver can handle its own credentials and defer the rest. This exists for migration.
 - Other components on the same instance (harper-eye, Reflex) authorize with this identity and these grants
   rather than their own: `resolvePrincipal` and `canReadLabels` (see Extension points) are the composition
-  contract, and the plugin's own routes run on the same two functions.
+  contract, and the plugin's own routes run on the same two functions, also when the component runs in
+  another app (Across apps).
 
 Principal ids must not contain whitespace, `:` or `*`, and are capped at 122 characters, so that
 `user:<id>` fits a 128-character scope label.
@@ -691,6 +693,37 @@ as REST:
   (`src/scopes.ts` `matchersOf`), so a JSON, spread, prototype-derived or hand-built copy throws a `TypeError`. A
   JSON copy can still derive scopes for another system. The matchers are not part of the contract; in-process code
   that reaches them through reflection is trusted like any other plugin code.
+- **Across apps.** An app may import the package without listing the plugin while agent-memory runs as another
+  app on the same Harper. Copies of the package meet in a per-worker registry, `process[Symbol.for('@harperfast/agent-memory')]`
+  (`src/runtime.ts` `domain`), keyed by the `resources` registry and `databases` view the copy's own `harper`
+  import carries. It uses `process` because `globalThis` differs per app under the `vm` and `compartment`
+  loaders. All live apps on a worker share that pair. A deploy-validation candidate loads into its own
+  `Resources`, and an app with branched databases has its own `databases`, so neither reaches the live plugin.
+  Within a domain:
+  - Sinks and the principal resolver live in the domain, so every copy registers where the plugin dispatches,
+    whatever order the apps load in. The last `setPrincipalResolver` from any app wins.
+  - `handleApplication` publishes `{ version, resolvePrincipal, canReadLabels }` (the plugin's own functions)
+    once `configure()` succeeds, and never for an `isTransientValidation` scope. The exported `resolvePrincipal`
+    calls it when present, else resolves locally. `canReadLabels` is answered by the copy that compiled the
+    principal (`compiledHere`), so a principal resolved before the plugin published keeps working. A different
+    major version warns once and still delegates. The plugin's own routes call their functions directly; only
+    `src/index.ts` forwards.
+  - A second plugin instance in a domain throws before mounting: one resolver and one sink list cannot serve two
+    hosts' registrations. Each worker decides independently which instance loaded first. The check,
+    `configure()` and the publish run with no `await` between them.
+  - The anchor, the domain object, `MemoryRuntime` and the sink and resolver call shapes are a protocol between
+    package versions. They only gain members; an incompatible change needs a new anchor key.
+  - A copy whose `harper` has no `resources` was loaded without an app scope (`moduleLoader` `native` or
+    `compartment`, or `dependencyLoader: native`). It keeps a private domain, as every copy did before, so two
+    such copies in different apps never meet. Mixed with a scoped plugin, whichever side comes second warns
+    once in its own app's log: the plugin when it publishes after such a registration (`publishRuntime`), the
+    copy when it registers after the plugin published (`noteRegistration`). In-app hosting is unaffected under the
+    default loaders and under `native` and `compartment`, where the host and the plugin share one module instance.
+    `dependencyLoader: native` already split them before this change; now it warns.
+  - The registry is per worker thread, so an `isolated` agent-memory app is out of reach. A copy from 0.1.3 or
+    earlier keeps its registrations to itself. A registration lasts as long as the worker, even when the app
+    that made it fails to load afterwards, as it already did for an in-app host. Harper restarts workers to
+    replace an app, so a domain never sees a second runtime from a redeploy.
 - Options (`config.yaml` under the plugin's key): `urlPath`, `mcp` (default `false`), `embeddingModel`
   (default `default`), `embeddingTruncate` (default `false`), `limits.{contentChars, titleChars, embeddingInputChars,
 embeddingFallbackChars}` (default 20000 / 200 / 6000 / 4000; the last two 2–100000; see `Memory` above), and

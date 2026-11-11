@@ -8,6 +8,12 @@ All notable changes to `@harperfast/agent-memory` are documented here. The forma
 
 ### Added
 
+- `registerMemorySink`, `setPrincipalResolver`, `resolvePrincipal` and `canReadLabels` reach the running plugin
+  from an app that imports the package without listing it, so agent-memory can run as its own app on the same
+  Harper. Before, that app's copy kept its sinks and resolver to itself: its sinks were never called, and its
+  `resolvePrincipal` ran its own version. A registration made before the plugin loads is honored, and
+  `resolvePrincipal` delegates to the plugin even across versions, warning once when the major differs. It
+  needs Harper's default module loading and both apps on the shared worker pool (README, From another app).
 - `embeddingTruncate: true` asks the embedding model to cut each input at its own token window (Harper 5.4's
   `models.embed(..., { truncate: true })`), so token-dense content (code, IDs, CJK) no longer fails a write,
   import or search when it fits `limits.embeddingInputChars` but not the model. The character cap still applies
@@ -18,6 +24,11 @@ All notable changes to `@harperfast/agent-memory` are documented here. The forma
   that gains `truncation` is picked up without a restart. Other embedding failures behave as before.
 - `limits.embeddingFallbackChars` (default 4000, 2–100000, never above `limits.embeddingInputChars`): the bound used
   when `embeddingTruncate` is on but the model cannot truncate.
+
+### Changed
+
+- Under Harper's default module loading, a second app listing the plugin on the same worker now fails to load,
+  rather than both serving the same `memory` database with separate sinks and resolvers.
 
 ## [0.1.3] - 2026-11-09
 

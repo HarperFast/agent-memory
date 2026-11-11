@@ -1,0 +1,6 @@
+# Runs the plugin as its own app. memory-consumer imports the package without listing it here or in its own config.
+jsResource:
+  files: 'resources.js'
+
+'@harperfast/agent-memory':
+  package: '@harperfast/agent-memory'

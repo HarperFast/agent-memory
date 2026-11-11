@@ -1,0 +1,6 @@
+{
+	"name": "agent-memory-fixture-service-dup",
+	"private": true,
+	"type": "module",
+	"description": "Integration-test app that lists the plugin a second time beside memory-service. scripts/install-fixtures.js installs the packed @harperfast/agent-memory into it."
+}

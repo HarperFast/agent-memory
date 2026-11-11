@@ -244,6 +244,7 @@ export const databases = {
 	},
 };
 export const tables = {};
+export const resources = new Map();
 
 let chain = Promise.resolve();
 
