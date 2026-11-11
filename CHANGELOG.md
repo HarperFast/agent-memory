@@ -6,6 +6,20 @@ All notable changes to `@harperfast/agent-memory` are documented here. The forma
 
 ## [Unreleased]
 
+### Added
+
+- `scanMemories({ after?, includeInactive? })` reads every memory as stored, embedding included, oldest `createdAt`
+  first, for a trusted plugin building derived data (a first build, or a rebuild after it was not loaded). It
+  resumes after a given row without skipping or repeating rows that share a timestamp.
+- `registerBootstrapSection({ name, render })` adds a section to `GET /Memory/bootstrap`, after `pinned` and
+  `needsReview` and before `recent`, rendered for each caller within the budget those sections left. Its items come
+  back as `memories` entries with a `section` and no `id`, so existing clients show them as stored data without a
+  change.
+- `registerSearchAnnotator({ name, annotate })` adds per-hit data under its name to search results with `q`
+  (`GET /Memory/?q=`, MCP `recall`). It cannot change which hits come back or their order.
+- A section or annotator that throws is left out and logged, and the request still succeeds. All three reach the
+  running plugin from another app on the same Harper, like `registerMemorySink`.
+
 ## [0.1.4] - 2026-11-11
 
 ### Added

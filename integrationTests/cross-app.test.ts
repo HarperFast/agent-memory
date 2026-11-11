@@ -191,6 +191,48 @@ for (const moduleLoader of ['vm-current-context', 'vm']) {
 					['alice', ['user:alice', 'global'], false],
 				);
 			});
+
+			test("the consumer's bootstrap section reaches the plugin's bootstrap, rendered for the caller", async () => {
+				const id = memId(`boot-${moduleLoader}`);
+				strictEqual((await call('alice', 'PUT', `Memory/${id}`, { title: 'x', content: 'plover' })).status, 201);
+				const booted = await call('alice', 'GET', 'Memory/bootstrap?budget=8000');
+				strictEqual(booted.status, 200, JSON.stringify(booted.body));
+				const sections = booted.body.memories.map((entry: any) => entry.section);
+				const at = sections.indexOf('consumerOrientation');
+				ok(at !== -1 && at < sections.indexOf('recent'), JSON.stringify(sections));
+				deepStrictEqual(booted.body.memories[at], {
+					title: 'Orientation',
+					content: 'for alice within 8000',
+					section: 'consumerOrientation',
+				});
+			});
+
+			test("the consumer's annotator adds per-hit data to the plugin's search", async () => {
+				const id = memId(`note-${moduleLoader}`);
+				const created = await call('alice', 'PUT', `Memory/${id}`, {
+					title: 'x',
+					content: 'sandpiper probing',
+					visibility: 'shared',
+				});
+				strictEqual(created.status, 201, JSON.stringify(created.body));
+				const searched = await call('alice', 'GET', 'Memory/?q=sandpiper');
+				strictEqual(searched.status, 200, JSON.stringify(searched.body));
+				const hit = searched.body.memories.find((memory: any) => memory.id === id);
+				deepStrictEqual(hit?.consumerNote, { by: 'alice', readable: true });
+				const listed = await call('alice', 'GET', 'Memory/?limit=50');
+				ok(
+					listed.body.memories.every((memory: any) => !('consumerNote' in memory)),
+					'a listing is not annotated',
+				);
+			});
+
+			test("the consumer's scanMemories reads every memory through the plugin and resumes after a row", async () => {
+				const probe = await call('alice', 'GET', 'ScanProbe/');
+				strictEqual(probe.status, 200, JSON.stringify(probe.body));
+				ok(probe.body.ids.length >= 2, JSON.stringify(probe.body));
+				deepStrictEqual(probe.body.resumed, probe.body.ids.slice(1));
+				strictEqual(probe.body.embedded, true);
+			});
 		},
 	);
 }

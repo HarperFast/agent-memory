@@ -10,7 +10,7 @@ Shared, permissioned, live memory for agents and people, as a Harper plugin.
 - Customer-content flag: a `global` write that names a configured customer, or matches a configured host pattern, is committed but readable only by its owner and `customer:*` readers until a reviewer rescopes or confirms it; an optional model check runs after commit
 - Live updates: Level 1 real-time subscriptions on `/Memory` and `/Memory/<id>` (SSE, WebSocket) with delivery-time read checks, and Level 2 watches (`POST /Memory/watch`, `watch=true` on search/bootstrap) delivered with own `needsReview` flags on `/MemoryEvents`
 - MCP surface (`mcp: true`): `remember`, `revise`, `recall`, `get`, `withdraw`, `pin`, `unpin`, `confirm`, `confirm-scope`, `watch` tools and `memory:///{id}` resource
-- Extension points: `registerMemorySink` runs inside the lifecycle transaction for apps that mirror memories elsewhere, `setPrincipalResolver` maps app-defined identities, and `resolvePrincipal` / `canReadLabels` let other components authorize with the same identity and grants
+- Extension points: `registerMemorySink` runs inside the lifecycle transaction for apps that mirror memories elsewhere, `setPrincipalResolver` maps app-defined identities, `resolvePrincipal` / `canReadLabels` let other components authorize with the same identity and grants, and `scanMemories`, `registerBootstrapSection` and `registerSearchAnnotator` let a plugin build derived data over memories and add it to bootstrap and search results
 
 Status: v0 (0.x releases may change contracts; see [CHANGELOG.md](CHANGELOG.md)). Design and contracts:
 [DESIGN.md](DESIGN.md).
@@ -172,6 +172,42 @@ const principal = await resolvePrincipal(context);
 const visible = records.filter((record) => canReadLabels(principal, record.scopes));
 ```
 
+### Derived data: scan, bootstrap sections, search annotations
+
+A plugin that builds something over memories (topic summaries, say) reads them with `scanMemories`, stays current
+with a sink, and serves its output beside memories:
+
+```js
+import {
+	canReadLabels,
+	registerBootstrapSection,
+	registerSearchAnnotator,
+	scanMemories,
+} from '@harperfast/agent-memory';
+
+// Every active, unexpired memory as stored (embedding included), oldest first. Pass the last row's
+// { createdAt, id } as `after` to resume; `includeInactive: true` also yields superseded, withdrawn and expired rows.
+for await (const memory of scanMemories({ after: savedCursor })) await index(memory);
+
+// Packed into GET /Memory/bootstrap after pinned and needsReview, before recent, within the caller's budget.
+registerBootstrapSection({
+	name: 'orientation',
+	render: async ({ principal, q, budgetChars, context }) =>
+		(await topicsFor(principal, budgetChars)).map((topic) => ({ title: topic.title, content: topic.summary })),
+});
+
+// Adds hit.summaries to GET /Memory/?q= and MCP recall results; cannot add, drop or reorder hits.
+registerSearchAnnotator({
+	name: 'summaries',
+	annotate: async ({ principal, hits, context }) => new Map(await summariesFor(principal, hits)),
+});
+```
+
+The scan takes no principal: it is for trusted plugin code. Sections and annotators receive the caller's principal,
+and agent-memory shows what they return as is, so they must show a caller only what that caller may read: all of
+the memories a summary draws on, judged by their current scopes and content flags. A section or annotator that
+throws is left out and logged; the request still succeeds. Contract: [DESIGN.md](DESIGN.md#extension-points).
+
 `read` and `write` list the effective grant patterns: `user:<id>`, exact labels and namespace wildcards, with
 role and user grants merged and patterns that grant nothing dropped. A super_user's lists do not enumerate its
 access; check `superUser`, or let `canReadLabels` do it. `canReadLabels` is the label rule only (any label
@@ -179,7 +215,7 @@ matches), and accepts only a principal `resolvePrincipal` returned. Contract: [D
 
 ### From another app
 
-These four functions also work in an app that imports the package without listing the plugin, while
+These functions also work in an app that imports the package without listing the plugin, while
 agent-memory runs as its own app on the same Harper, for example so it can be upgraded separately. That app's
 copy of the package registers with the running plugin and asks it to resolve principals. Its sinks run inside the
 plugin's lifecycle transaction, and its authorization matches the plugin's routes even when the two versions
@@ -193,7 +229,8 @@ differ. This needs:
 - Exactly one app listing the plugin in its `config.yaml`. A second one fails to load. Which of the two loads
   first can differ from worker to worker, so remove one.
 - A version of this package newer than 0.1.3 in the importing app. 0.1.3 and earlier keep registrations to
-  themselves.
+  themselves. Bootstrap sections and search annotators also need a running plugin newer than 0.1.4; beside 0.1.4
+  they are never used, and registering one logs a warning.
 
 To move the plugin out of a host app:
 

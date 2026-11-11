@@ -1,6 +1,8 @@
 import * as harper from 'harper';
+import type { BootstrapSection, SearchAnnotator } from './extensions.ts';
 import type { PrincipalResolver } from './principal.ts';
 import type { Principal } from './scopes.ts';
+import type { ScanOptions } from './search.ts';
 import type { MemorySink } from './sinks.ts';
 import { PACKAGE_VERSION } from './version.ts';
 
@@ -12,12 +14,17 @@ export interface MemoryRuntime {
 	readonly version: string;
 	resolvePrincipal(context: any): Promise<Principal>;
 	canReadLabels(principal: Principal, labels: readonly string[] | null | undefined): boolean;
+	// Absent from a runtime published by 0.1.4 or earlier, which also never renders sections or runs annotators.
+	scanMemories?(options?: ScanOptions): AsyncIterable<Record<string, unknown>>;
 }
 
 export interface MemoryDomain {
 	readonly sinks: MemorySink[];
 	resolver: PrincipalResolver | undefined;
 	runtime: MemoryRuntime | undefined;
+	// Absent from a domain an older copy created; added on first use.
+	bootstrapSections?: BootstrapSection[];
+	searchAnnotators?: SearchAnnotator[];
 }
 
 interface Anchor {
@@ -34,6 +41,7 @@ const UNSCOPED_COPY =
 let memo: MemoryDomain | undefined;
 let scoped = false;
 let warnedUnscoped = false;
+let warnedOldRuntime = false;
 let checkedRuntime: MemoryRuntime | undefined;
 
 function isObject(value: unknown): value is object {
@@ -95,6 +103,17 @@ export function noteRegistration(): void {
 	const shared = anchor();
 	shared.unscopedRegistration = true;
 	if (shared.scopedRuntime) warnUnscopedOnce();
+}
+
+/** For a section or annotator registration: an older running plugin never reads them, so say so once. */
+export function noteExtensionRegistration(): void {
+	noteRegistration();
+	const runtime = domain().runtime;
+	if (warnedOldRuntime || runtime === undefined || typeof runtime.scanMemories === 'function') return;
+	warnedOldRuntime = true;
+	warn(
+		`@harperfast/agent-memory: the running plugin is ${runtime.version}, which never renders bootstrap sections or runs search annotators; upgrade it to use them`,
+	);
 }
 
 export function publishRuntime(runtime: MemoryRuntime): void {

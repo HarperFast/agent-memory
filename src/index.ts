@@ -4,10 +4,23 @@ import { resolvePrincipal as resolveHere } from './principal.ts';
 import { MEMORY_RESOURCES, MemoryMcpResource } from './resource.ts';
 import { domain, foreignRuntime, publishRuntime, type MemoryRuntime } from './runtime.ts';
 import { canReadLabels as canReadLabelsHere, compiledHere, type Principal } from './scopes.ts';
+import { scanMemories as scanHere, type ScanOptions } from './search.ts';
 import { applySettings, parseSettings } from './settings.ts';
 import { PACKAGE_VERSION } from './version.ts';
 
 export { registerMemorySink, type MemorySink } from './sinks.ts';
+export {
+	registerBootstrapSection,
+	registerSearchAnnotator,
+	type BootstrapItem,
+	type BootstrapRenderInput,
+	type BootstrapSection,
+	type BootstrapSectionOutput,
+	type SearchAnnotateInput,
+	type SearchAnnotations,
+	type SearchAnnotator,
+} from './extensions.ts';
+export type { ScanOptions } from './search.ts';
 export { setPrincipalResolver, type PrincipalResolver, type PrincipalResolution } from './principal.ts';
 export type { Principal } from './scopes.ts';
 
@@ -15,6 +28,7 @@ const RUNTIME: MemoryRuntime = Object.freeze({
 	version: PACKAGE_VERSION,
 	resolvePrincipal: resolveHere,
 	canReadLabels: canReadLabelsHere,
+	scanMemories: scanHere,
 });
 
 /**
@@ -42,6 +56,17 @@ export function canReadLabels(principal: Principal, labels: readonly string[] | 
 	return runtime && !compiledHere(principal)
 		? runtime.canReadLabels(principal, labels)
 		: canReadLabelsHere(principal, labels);
+}
+
+/**
+ * Every memory row as stored, oldest `createdAt` first, then by id: active and unexpired ones, or every row with
+ * `includeInactive`. `after` (the last row's `createdAt` and `id`) resumes strictly after that row. For trusted
+ * in-process code building derived data: it takes no principal and applies no scope rule. Read by the running
+ * plugin, even one in another app (DESIGN.md, Extension points).
+ */
+export function scanMemories(options?: ScanOptions): AsyncIterable<Record<string, unknown>> {
+	const runtime = foreignRuntime(RUNTIME);
+	return runtime?.scanMemories ? runtime.scanMemories(options) : scanHere(options);
 }
 
 function routePathFor(basePath: string, resource: { path: string }): string {

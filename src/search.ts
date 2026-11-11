@@ -1,6 +1,7 @@
 import { logger } from 'harper';
 import { badRequest, memoryError } from './errors.ts';
 import { recordWatches, WATCH_DEFAULT_TTL_SECONDS } from './events.ts';
+import { registeredBootstrapSections, renderBootstrapSections } from './extensions.ts';
 import {
 	BOOTSTRAP_PINNED_LIMIT,
 	embedTexts,
@@ -38,7 +39,7 @@ const BOOTSTRAP_REVIEW_LIMIT = 20;
 // Bounds the rows a bootstrap inspects when most of a caller's flags name sources it can no longer read.
 const BOOTSTRAP_REVIEW_SCAN = 5 * BOOTSTRAP_REVIEW_LIMIT;
 
-const VIEW_FIELDS = [
+export const VIEW_FIELDS = [
 	'id',
 	'title',
 	'content',
@@ -146,6 +147,9 @@ export function parseSearchParams(params: URLSearchParams): SearchParams {
 }
 
 const EARLIEST = new Date(-8.64e15);
+const SCAN_PAGE = 100;
+// Vectors are only comparable within one model's space, so a builder needs the model beside the vector.
+const SCAN_FIELDS = [...VIEW_FIELDS, 'embedding', 'embeddingModel'];
 
 export function createdOrderConditions(
 	comparator: 'less_than' | 'greater_than',
@@ -170,6 +174,54 @@ export function unexpiredCondition(now: Date): Condition {
 		{ attribute: 'validUntil', comparator: 'equals', value: null },
 		{ attribute: 'validUntil', comparator: 'greater_than', value: now },
 	]);
+}
+
+export interface ScanOptions {
+	after?: { createdAt: Date | string | number; id: string };
+	includeInactive?: boolean;
+}
+
+/**
+ * Every stored memory row in `createdAt`, then id, order, for trusted in-process builders: no principal, no scope
+ * conditions. Paged, so a slow consumer never holds a read open across the walk; a walk, not a snapshot.
+ */
+export async function* scanMemories(options: ScanOptions = {}): AsyncGenerator<Record<string, unknown>> {
+	let after: CreatedPosition | undefined;
+	if (options.after !== undefined) {
+		// A Date from another app's realm is not a Date to Harper; this one is.
+		const createdAt = new Date(options.after?.createdAt as any);
+		if (Number.isNaN(createdAt.getTime()) || typeof options.after?.id !== 'string') {
+			throw new TypeError('scanMemories: after must be { createdAt, id } from a scanned row');
+		}
+		after = { createdAt, id: options.after.id };
+	}
+	const filter: Condition[] = options.includeInactive
+		? []
+		: [{ attribute: 'status', comparator: 'equals', value: STATUS_ACTIVE }, unexpiredCondition(new Date())];
+	const Memory = memoryTable();
+	for (;;) {
+		const page = await collect(
+			Memory.search(
+				{
+					conditions: [
+						...(after
+							? createdOrderConditions('greater_than', after)
+							: [{ attribute: 'createdAt', comparator: 'greater_than_equal', value: EARLIEST }]),
+						...filter,
+					],
+					enforceExecutionOrder: true,
+					sort: { attribute: 'createdAt', next: { attribute: 'id' } },
+					select: SCAN_FIELDS,
+					limit: SCAN_PAGE,
+				},
+				{ authorize: false },
+			),
+		);
+		yield* page;
+		if (page.length < SCAN_PAGE) return;
+		const last = page[page.length - 1];
+		after = { createdAt: last.createdAt, id: last.id };
+	}
 }
 
 function filterConditions(params: SearchParams, principal: Principal, now = new Date()): Condition[] {
@@ -524,9 +576,45 @@ export async function bootstrapMemories(params: BootstrapParams, principal: Prin
 		if (chunk.length > 0) await admit();
 		return visible;
 	};
-	const [pinned, needsReview, recent, relevant] = await Promise.all([
-		loadPinned(),
-		loadNeedsReview(),
+	const seen = new Set<string>();
+	const memories: Record<string, unknown>[] = [];
+	let used = 0;
+	const fits = (title: unknown, content: unknown) => {
+		const size = String(title ?? '').length + String(content ?? '').length;
+		if (used + size > params.budget) return false;
+		used += size;
+		return true;
+	};
+	const pack = (section: string, records: readonly MemoryView[]) => {
+		for (const memory of records) {
+			if (seen.has(memory.id) || !fits(memory.title, memory.content)) continue;
+			seen.add(memory.id);
+			memories.push({ ...memory, section });
+		}
+	};
+	const sections = registeredBootstrapSections();
+	// Contributed sections render once pinned and needsReview have packed, so they know the budget left, while recent
+	// and relevant still load. One Promise.all observes every stage's rejection.
+	const head = Promise.all([loadPinned(), loadNeedsReview()]).then(async ([pinned, needsReview]) => {
+		pack('pinned', pinned);
+		pack('needsReview', needsReview);
+		if (sections.length === 0) return;
+		const rendered = await renderBootstrapSections(sections, {
+			principal,
+			q: params.q,
+			budgetChars: params.budget - used,
+			context,
+		});
+		for (const { name, items } of rendered) {
+			// No id: clients must not watch, cache or deduplicate contributed text as a memory.
+			for (const item of items) {
+				if (fits(item.title, item.content))
+					memories.push({ title: item.title ?? null, content: item.content, section: name });
+			}
+		}
+	});
+	const [, recent, relevant] = await Promise.all([
+		head,
 		collect(
 			Memory.search(
 				{
@@ -555,31 +643,8 @@ export async function bootstrapMemories(params: BootstrapParams, principal: Prin
 				).then((hits) => hits.map(({ score: _score, ...memory }) => memory))
 			: [],
 	]);
-	const seen = new Set<unknown>();
-	const memories = [];
-	let used = 0;
-	for (const [section, records] of [
-		['pinned', pinned],
-		['needsReview', needsReview],
-		['recent', recent],
-		['relevant', relevant],
-	] as const) {
-		for (const memory of records) {
-			if (seen.has(memory.id)) continue;
-			const size = String(memory.title ?? '').length + String(memory.content ?? '').length;
-			if (used + size > params.budget) continue;
-			seen.add(memory.id);
-			used += size;
-			memories.push({ ...memory, section });
-		}
-	}
-	if (params.watch) {
-		await recordWatches(
-			memories.map((memory) => memory.id),
-			principal,
-			WATCH_DEFAULT_TTL_SECONDS,
-			context,
-		);
-	}
+	pack('recent', recent);
+	pack('relevant', relevant);
+	if (params.watch) await recordWatches([...seen], principal, WATCH_DEFAULT_TTL_SECONDS, context);
 	return { memories, budget: params.budget, used };
 }

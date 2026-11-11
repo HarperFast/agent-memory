@@ -38,6 +38,7 @@ allowlists, idempotent `PUT` create/revise with `If-Match` revision precondition
 | Customer-content flag and quarantine (`customerContentCheck` option)                                             | implemented (`src/quarantine.ts`)   |
 | Supersession backfill: candidates for an existing memory, links between existing memories, created-order cursor  | implemented (`src/lifecycle.ts`)    |
 | Package exports reaching the plugin from another app (Extension points, Across apps)                             | implemented (`src/runtime.ts`)      |
+| `scanMemories`, bootstrap sections and search annotators for derived plugins (Extension points)                  | implemented (`src/extensions.ts`)   |
 
 ## Data model
 
@@ -492,7 +493,8 @@ lease, since a batch writes up to 100 rows and flags their citers inside one tra
   `contentFlagged = true`, the review queue of a cleared reviewer (an uncleared caller sees only its own). Results include `supersededBy` when `includeSuperseded` is set,
   and `needsReview` under the Provenance visibility rule; withdrawn memories never appear (except to a `super_user` passing `includeWithdrawn=true`, below). The vector lane has no distance cutoff, so it contributes the
   nearest readable memories whatever their distance. Passing `watch=true` records a `MemoryWatch` (with
-  the default 1 h TTL) for every memory id returned in the result.
+  the default 1 h TTL) for every memory id returned in the result. A search with `q` (REST, or MCP `recall`) also
+  carries each registered search annotator's value for a hit (Extension points); a listing without `q` carries none.
 - **Full-text query boundary** (observed locally on Harper 5.3.2, native fulltext 0.5.0):
   `Array.from({ length: 65 }, (_, i) => 'w' + i).join(' ')` is only 249 characters but is rejected;
   64 distinct analyzed terms succeed. Native `any` reports
@@ -562,10 +564,10 @@ true` puts `@embed`'s HNSW index on the native plane). Harper 5.3 makes a query 
   `principal.id`, newest pin first, whose target memory is active, unexpired and readable by the caller), then the caller's own
   memories that need review (section `needsReview`: up to 20 the caller may see, newest flag first,
   through the indexed `needsReviewSince`, from at most the 100 newest flags, so hidden flags cannot make a
-  bootstrap scan without bound), then the caller's recent
+  bootstrap scan without bound), then the sections other plugins registered (Extension points), then the caller's recent
   memories, then memories relevant to `q`, deduplicated and packed into a character budget (title +
   content; default 8000). Expired memories (`validUntil <= now`) are excluded from every section.
-  A memory that does not fit is skipped rather than ending the pack. Passing `watch=true` records a
+  A memory or contributed item that does not fit is skipped rather than ending the pack. Passing `watch=true` records a
   `MemoryWatch` (default 1 h TTL) for every memory id returned across all sections. Used at session start.
 - Ranking may add recency decay and retrieval/citation counts later; decay is a ranking function only,
   never deletion.
@@ -673,6 +675,53 @@ as REST:
   sink registered or unregistered during a dispatch takes effect from the next one. An idempotent
   `PUT` retry calls no sink. harper-eye uses it for the interim Reflex source-row handoff until memory is a
   Reflex lane.
+- `scanMemories({ after?, includeInactive? })` — an async iterable of `Memory` rows as stored (the view's fields with
+  their stored types, plus `embedding` and `embeddingModel`), oldest `createdAt` first, then id. By default only
+  `active` rows unexpired when the scan starts; `includeInactive: true` yields every row, superseded, withdrawn and
+  expired ones included. `after: { createdAt, id }`, the last row a caller saw, resumes strictly after it with the
+  `?order=created` tie-break, so rows sharing a `createdAt` are neither skipped nor repeated. It takes no principal
+  and applies no scope rule: it is the one read outside the guarded routes, for trusted in-process plugin code
+  building derived data, and no route reaches it. It reads in pages of 100 (`SCAN_PAGE`) with a context of its own
+  (`authorize: false`), so a consumer that pauses between rows holds no read open. It is a walk, not a snapshot
+  or a change feed: a row revised, withdrawn or expiring behind the cursor is not revisited, a row created with an
+  earlier `createdAt` (an import keeping its source time) lands behind it, and expiry makes no sink call. A derived
+  store therefore stays current from a sink registered before its walk starts, compares `revision` before applying
+  a scanned row over sink-driven state, and after a gap in which its sink did not run walks again from the start
+  with `includeInactive`.
+- `registerBootstrapSection({ name, render })` returns an unregister function. `render({ principal, q, budgetChars,
+context })` (sync or async) returns `{ text }`, an array of `{ title?, content }` items in priority order, or
+  nothing. Sections render after `pinned` and `needsReview` have packed, so `budgetChars` is the budget they left;
+  sections render concurrently, so each is told the same remainder. Their items pack, in registration order,
+  between `needsReview` and `recent`, each counted like a memory (title + content) and skipped when it does not
+  fit, never truncated; `{ text }` is one item, and agent-memory measures it. A packed item is an element of
+  `memories` that agent-memory builds as exactly `{ title, content, section: <name> }`. Clients frame it as stored
+  data like any memory. It carries no `id`, so clients never watch, cache or deduplicate it as a memory and
+  `watch=true` watches memory ids only; and no `author`, `scopes` or `revision`, so contributed text cannot borrow
+  a principal's attribution. A client that charges framing per entry (the Claude Code plugin does) can omit an
+  item that filled `budgetChars`; several smaller items in priority order lose only their tail. A section that
+  throws, rejects, or returns anything else is omitted and logged at most once a minute per name; bootstrap still
+  answers. `name` matches `^[A-Za-z][A-Za-z0-9_-]{0,63}$`, is not a built-in section, and is unique in the domain;
+  otherwise registration throws a `TypeError`. Bootstrap has no MCP tool.
+- `registerSearchAnnotator({ name, annotate })` returns an unregister function. `annotate({ principal, hits,
+context })` (sync or async) returns a `Map` from memory id to a JSON value, or nothing; each hit whose id the
+  map holds with a value other than `undefined` gains it as `hit[name]`. It runs for searches with `q` (REST and
+  MCP `recall`), not for listings (the `order=created` walk feeds Copy between instances, whose import rejects
+  unknown fields) or bootstrap's `relevant` search. `hits` is one deep-frozen copy of the results shared by every
+  annotator, and agent-memory merges by id in its own order, so an annotator cannot add, remove, reorder or edit a
+  hit. The map is read through `Map.prototype`, so a `Map` from another app's realm works, and each value is copied
+  through JSON inside the annotator's error boundary, so a value the response could not serialize (a cycle, a
+  `BigInt`, a throwing `toJSON`) skips that annotator like a throw or a non-`Map` result: logged at most once a
+  minute per name, and the search still answers. `name` follows the section rule and is not a field a hit carries
+  (the view's fields and `score`); a later version that adds a hit field of the same name rejects that
+  registration. With no annotator registered, results go out untouched.
+- **Contributed output is the contributor's to authorize.** Sections and annotators get the resolved principal,
+  and agent-memory does not filter what they return. `canReadLabels` is the label test only: ownership, withdrawal
+  and the customer-content quarantine (`contentFlag`; clearance is `superUser` or the `customer:*` read wildcard in
+  `principal.read`) are rule 1's other parts, and `scanMemories` yields flagged and private rows. Text derived from
+  several memories is shown only to a reader of all of them, checked against the sources' current state: a
+  rescope, flag or withdrawal reaches the contributor through its sink before its derived text is rebuilt, so it
+  must stop serving that text then, not after the rebuild.
+- Sections and annotators are awaited, like sinks, with no time bound: a slow one delays the response.
 - `setPrincipalResolver(fn)` — see Identity.
 - `resolvePrincipal(context)` — the caller behind a request context, resolved exactly as the plugin's own routes
   resolve it (custom resolver, else the Harper user and its `ScopeGrant` rows, read on every call). It resolves
@@ -700,19 +749,23 @@ as REST:
   loaders. All live apps on a worker share that pair. A deploy-validation candidate loads into its own
   `Resources`, and an app with branched databases has its own `databases`, so neither reaches the live plugin.
   Within a domain:
-  - Sinks and the principal resolver live in the domain, so every copy registers where the plugin dispatches,
-    whatever order the apps load in. The last `setPrincipalResolver` from any app wins.
-  - `handleApplication` publishes `{ version, resolvePrincipal, canReadLabels }` (the plugin's own functions)
-    once `configure()` succeeds, and never for an `isTransientValidation` scope. The exported `resolvePrincipal`
-    calls it when present, else resolves locally. `canReadLabels` is answered by the copy that compiled the
+  - Sinks, the principal resolver, bootstrap sections and search annotators live in the domain, so every copy
+    registers where the plugin dispatches, whatever order the apps load in. The last `setPrincipalResolver` from
+    any app wins. The section and annotator lists are added on first use (`??=`), since an older copy may have
+    created the domain object without them.
+  - `handleApplication` publishes `{ version, resolvePrincipal, canReadLabels, scanMemories }` (the plugin's own
+    functions) once `configure()` succeeds, and never for an `isTransientValidation` scope. The exported
+    `resolvePrincipal` and `scanMemories` call it when present, else run locally. A runtime without `scanMemories`
+    is 0.1.4 or earlier, which never renders sections or runs annotators: registering one beside it warns once
+    (`noteExtensionRegistration`), and a scan runs locally. `canReadLabels` is answered by the copy that compiled the
     principal (`compiledHere`), so a principal resolved before the plugin published keeps working. A different
     major version warns once and still delegates. The plugin's own routes call their functions directly; only
     `src/index.ts` forwards.
   - A second plugin instance in a domain throws before mounting: one resolver and one sink list cannot serve two
     hosts' registrations. Each worker decides independently which instance loaded first. The check,
     `configure()` and the publish run with no `await` between them.
-  - The anchor, the domain object, `MemoryRuntime` and the sink and resolver call shapes are a protocol between
-    package versions. They only gain members; an incompatible change needs a new anchor key.
+  - The anchor, the domain object, `MemoryRuntime` and the sink, resolver, section and annotator call shapes are a
+    protocol between package versions. They only gain members; an incompatible change needs a new anchor key.
   - A copy whose `harper` has no `resources` was loaded without an app scope (`moduleLoader` `native` or
     `compartment`, or `dependencyLoader: native`). It keeps a private domain, as every copy did before, so two
     such copies in different apps never meet. Mixed with a scoped plugin, whichever side comes second warns

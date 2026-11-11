@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { badRequest, isCallerSafe, memoryError, normalizeError, notFound } from './errors.ts';
 import { WATCH_MAX_IDS, WATCH_MAX_TTL_SECONDS, watchMemories } from './events.ts';
+import { annotateSearchHits } from './extensions.ts';
 import {
 	confirmMemory,
 	confirmScopeMemory,
@@ -407,7 +408,9 @@ export const MEMORY_MCP_METHODS = {
 	mcpRecall(params: unknown, context: unknown) {
 		return runMcpTool('recall', context, async (principal, ctx) => {
 			const searchParams = parseRecallParams(params);
-			const memories = await searchMemories(searchParams, principal, mcpLifecycleContext(ctx));
+			const searchContext = mcpLifecycleContext(ctx);
+			const memories = await searchMemories(searchParams, principal, searchContext);
+			if (searchParams.q) await annotateSearchHits(memories, principal, searchContext);
 			return { memories };
 		});
 	},
