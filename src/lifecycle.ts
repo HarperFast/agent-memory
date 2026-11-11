@@ -1,4 +1,4 @@
-import { databases, models, transaction } from 'harper';
+import { databases, logger, models, transaction } from 'harper';
 import { badRequest, isCallerSafe, memoryError, notFound, type MemoryError } from './errors.ts';
 import { checkedText, matchCustomerContent } from './patterns.ts';
 import { activeDependentIds, CLEARED_REVIEW, flagDependents, forReader, reviewFlagFor } from './provenance.ts';
@@ -327,13 +327,98 @@ export function embeddingInput(text: string, max = getSettings().embeddingInputC
 	return text.slice(0, code >= 0xd800 && code <= 0xdbff ? max - 1 : max);
 }
 
-type EmbeddingSettings = Pick<Settings, 'embeddingModel' | 'embeddingInputChars' | 'embeddingTruncate'>;
+type EmbeddingSettings = Pick<
+	Settings,
+	'embeddingModel' | 'embeddingInputChars' | 'embeddingFallbackChars' | 'embeddingTruncate'
+>;
 type EmbedCallOptions = { model: string; inputType: 'document' | 'query'; signal?: AbortSignal };
 
-// Core makes `truncate` a required capability: a backend that cannot truncate refuses the call, so it is asked for
-// only when the setting says the model can.
-export function embedOptions(options: EmbedCallOptions, truncate: boolean): EmbedCallOptions & { truncate?: true } {
-	return truncate ? { ...options, truncate: true } : options;
+const TRUNCATE_RECHECK_MS = 5 * 60_000;
+// Keyed by settings snapshot, so a configuration reload asks the model again.
+const truncateRefusedUntil = new WeakMap<EmbeddingSettings, number>();
+const truncateRefusalWarned = new Set<string>();
+let coreTruncates = true;
+
+// A core before harper#3706 builds this backend without the `truncate` capability and ignores the option on a call.
+export function probeCoreTruncate(): boolean {
+	const spec = {
+		name: 'agent-memory-truncate-probe',
+		embed: async () => ({ status: 'completed' as const, output: [] as Float32Array[] }),
+		truncate: true,
+	};
+	try {
+		coreTruncates = (models.defineBackend(spec).capabilities() as { truncate?: boolean }).truncate === true;
+	} catch {
+		coreTruncates = false;
+	}
+	return coreTruncates;
+}
+
+// Core's own refusal of a backend without the capability, thrown before any request; nothing else is retried.
+function refusesTruncate(error: unknown): error is Error {
+	const { name, message } = (error ?? {}) as { name?: unknown; message?: unknown };
+	return (
+		name === 'ModelCapabilityError' && typeof message === 'string' && message.endsWith(" does not support 'truncate'")
+	);
+}
+
+function shouldAskToTruncate(settings: EmbeddingSettings): boolean {
+	if (!coreTruncates) return false;
+	const until = truncateRefusedUntil.get(settings);
+	if (until === undefined) return true;
+	const now = Date.now();
+	if (until > now) return false;
+	// This caller asks again; the rest stay on the fallback until it is answered.
+	truncateRefusedUntil.set(settings, now + TRUNCATE_RECHECK_MS);
+	return true;
+}
+
+function warnTruncateRefused(model: string, fallbackChars: number, refusal: Error): void {
+	const key = `${model}\0${fallbackChars}`;
+	if (truncateRefusalWarned.has(key) || !logger.warn) return;
+	logger.warn(
+		`[agent-memory] embeddingModel "${model}" cannot truncate (${refusal.message}); embedding the first ` +
+			`${fallbackChars} characters instead (limits.embeddingFallbackChars). To let the model cut at its own window, ` +
+			"give that backend the truncate capability (for a vLLM 0.18+ entry, truncation: 'vllm'); to stop asking, " +
+			'set embeddingTruncate: false together with an embeddingInputChars the model accepts.',
+	);
+	truncateRefusalWarned.add(key);
+}
+
+const cutTo = (input: string | string[], max: number) =>
+	typeof input === 'string' ? embeddingInput(input, max) : input.map((text) => embeddingInput(text, max));
+
+export function embedTexts(
+	input: string | string[],
+	options: EmbedCallOptions,
+	settings: EmbeddingSettings,
+	truncate: boolean,
+): Promise<Float32Array[]> {
+	if (!truncate) return models.embed(cutTo(input, settings.embeddingInputChars), options);
+	return embedTruncating(input, options, settings);
+}
+
+// `truncate` is a required capability in core, and `embeddingInputChars` may exceed the window when the model is
+// expected to cut. A model that cannot gets one attempt cut to a bound meant to fit without its cut.
+async function embedTruncating(
+	input: string | string[],
+	options: EmbedCallOptions,
+	settings: EmbeddingSettings,
+): Promise<Float32Array[]> {
+	const fallbackChars = Math.min(settings.embeddingInputChars, settings.embeddingFallbackChars);
+	if (shouldAskToTruncate(settings)) {
+		const truncating = { ...options, truncate: true };
+		try {
+			const vectors = await models.embed(cutTo(input, settings.embeddingInputChars), truncating);
+			truncateRefusedUntil.delete(settings);
+			return vectors;
+		} catch (error) {
+			if (!refusesTruncate(error)) throw error;
+			truncateRefusedUntil.set(settings, Date.now() + TRUNCATE_RECHECK_MS);
+			warnTruncateRefused(options.model, fallbackChars, error);
+		}
+	}
+	return models.embed(cutTo(input, fallbackChars), options);
 }
 
 // Every plugin write carries the vector it embedded before its transaction; a write that carries none is
@@ -345,12 +430,11 @@ async function embedWithRecordModel(record: any, hook?: { signal?: AbortSignal }
 	const settings = getSettings();
 	const model = record.embeddingModel ?? DEFAULT_EMBEDDING_MODEL;
 	// `embeddingTruncate` describes the configured model, not one a row was recorded under before a change.
-	const [vector] = await models.embed(
-		embeddingInput(String(record.content), settings.embeddingInputChars),
-		embedOptions(
-			{ model, inputType: 'document', signal: hook?.signal },
-			settings.embeddingTruncate && model === settings.embeddingModel,
-		),
+	const [vector] = await embedTexts(
+		String(record.content),
+		{ model, inputType: 'document', signal: hook?.signal },
+		settings,
+		settings.embeddingTruncate && model === settings.embeddingModel,
 	);
 	return vector ? Array.from(vector) : undefined;
 }
@@ -363,11 +447,7 @@ export function ensureEmbedder(Memory: any): void {
 
 export async function embedContents(contents: string[], settings: EmbeddingSettings): Promise<number[][]> {
 	const model = settings.embeddingModel;
-	const inputs = contents.map((content) => embeddingInput(content, settings.embeddingInputChars));
-	const vectors = await models.embed(
-		inputs,
-		embedOptions({ model, inputType: 'document' }, settings.embeddingTruncate),
-	);
+	const vectors = await embedTexts(contents, { model, inputType: 'document' }, settings, settings.embeddingTruncate);
 	// The table's embedder would embed again, under the write's locks, for a missing or empty vector.
 	if (vectors?.length !== contents.length || vectors.some((vector) => !vector?.length)) {
 		throw new Error(`embedding model "${model}" returned no vector`);

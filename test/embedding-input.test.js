@@ -1,6 +1,6 @@
-import { afterEach, beforeEach, describe, it } from 'node:test';
+import { afterEach, beforeEach, describe, it, mock } from 'node:test';
 import assert from 'node:assert/strict';
-import { __test, databases, models } from 'harper';
+import { __test, databases, logger, models } from 'harper';
 import { MemoryImportResource, MemoryMcpResource, MemoryResource } from '../dist/resource.js';
 import { applySettings, parseSettings } from '../dist/settings.js';
 
@@ -266,6 +266,247 @@ describe('embeddingTruncate', () => {
 			[
 				[1, { model: 'default', inputType: 'document', truncate: true }],
 				[1, { model: 'default', inputType: 'document', truncate: true }],
+			],
+		);
+	});
+});
+
+describe('embeddingTruncate on a backend that cannot truncate', () => {
+	// Harper 5.4 refuses `truncate: true` for a backend without the capability before sending any request.
+	const refusal = (backend = 'default', capability = 'truncate') =>
+		Object.assign(new Error(`Backend '${backend}' does not support '${capability}'`), { name: 'ModelCapabilityError' });
+	let warnings;
+	let failWith;
+	let truncates;
+	const warn = logger.warn;
+
+	beforeEach(() => {
+		warnings = [];
+		failWith = undefined;
+		truncates = false;
+		logger.warn = (...args) => warnings.push(args.join(' '));
+		models.embed = (input, options) => {
+			const texts = Array.isArray(input) ? input : [input];
+			sent.push({ texts, options });
+			if (options.truncate === true && !truncates) throw refusal();
+			const failure = failWith?.(options);
+			if (failure !== undefined) throw failure;
+			if (texts.some((text) => text.length > limit)) {
+				throw Object.assign(new Error("OpenAI /embeddings returned HTTP 400: This model's maximum context length"), {
+					upstreamStatus: 400,
+				});
+			}
+			return embed.call(models, texts, options);
+		};
+	});
+
+	afterEach(() => {
+		logger.warn = warn;
+		mock.timers.reset();
+	});
+
+	const refusedModel = (name, limits = {}) =>
+		applySettings(
+			parseSettings({
+				embeddingModel: name,
+				embeddingTruncate: true,
+				limits: { embeddingInputChars: 12_000, ...limits },
+			}),
+		);
+	const optionsOf = (from = 0) =>
+		sent.slice(from).map(({ texts, options }) => [texts[0].length, options.truncate === true]);
+
+	it('commits the write, embedding the head cut to embeddingFallbackChars, and warns once', async () => {
+		refusedModel('refused-write');
+		const content = prose(20_000);
+		const resource = new MemoryMcpResource();
+		const remembered = await resource.mcpRemember(
+			{ title: 'long', content, visibility: 'shared' },
+			{ user: aliceUser },
+		);
+		assert.equal(remembered.created, true);
+		assert.equal(storedContent(remembered.id), content);
+		assert.deepEqual(sent, [
+			{ texts: [content.slice(0, 12_000)], options: { model: 'refused-write', inputType: 'document', truncate: true } },
+			{ texts: [content.slice(0, 4_000)], options: { model: 'refused-write', inputType: 'document' } },
+		]);
+		assert.equal(warnings.length, 1);
+		assert.match(warnings[0], /embeddingModel "refused-write" cannot truncate/);
+		assert.match(warnings[0], /Backend 'default' does not support 'truncate'/);
+		assert.match(warnings[0], /first 4000 characters/);
+		assert.match(warnings[0], /truncation: 'vllm'/);
+		assert.match(warnings[0], /embeddingTruncate: false.*embeddingInputChars/);
+
+		await resource.mcpRevise({ id: remembered.id, revision: 1, content: prose(9_000) }, { user: aliceUser });
+		assert.deepEqual(optionsOf(2), [[4_000, false]]);
+		assert.equal(warnings.length, 1);
+	});
+
+	it('falls back for an import batch and a search query, keeping the vector lane', async () => {
+		refusedModel('refused-batch');
+		const response = await MemoryImportResource.post(
+			queryTarget(''),
+			{
+				rows: [
+					{ id: 'imported-row-0001', ownerId: 'root', content: prose(15_000), scopes: ['global'], status: 'active' },
+					{ id: 'imported-row-0002', ownerId: 'root', content: 'short', scopes: ['global'], status: 'active' },
+				],
+			},
+			{ user: superUser },
+		);
+		assert.equal(response.status, 200, JSON.stringify(await response.clone().json()));
+		assert.deepEqual(
+			sent.map(({ texts, options }) => [texts.map((text) => text.length), options.truncate === true]),
+			[
+				[[12_000, 5], true],
+				[[4_000, 5], false],
+			],
+		);
+		applySettings(
+			parseSettings({
+				embeddingModel: 'refused-query',
+				embeddingTruncate: true,
+				limits: { embeddingInputChars: 800, embeddingFallbackChars: 500 },
+			}),
+		);
+		const q = prose(900);
+		const searched = await MemoryResource.get(queryTarget(`q=${encodeURIComponent(q)}`, { rest: '' }), {
+			user: superUser,
+		});
+		assert.equal(searched.status, 200);
+		assert.deepEqual(optionsOf(2), [
+			[800, true],
+			[500, false],
+		]);
+		assert.equal(sent.at(-1).options.inputType, 'query');
+		assert.ok(
+			__test.searchLog.some(({ query }) => query.sort?.attribute === 'embedding'),
+			'the vector lane ran',
+		);
+	});
+
+	it('never sends more than embeddingInputChars on the fallback', async () => {
+		refusedModel('refused-small-cap', { embeddingInputChars: 3_000, embeddingFallbackChars: 5_000 });
+		await new MemoryMcpResource().mcpRemember({ title: 't', content: prose(9_000) }, { user: aliceUser });
+		assert.deepEqual(optionsOf(), [
+			[3_000, true],
+			[3_000, false],
+		]);
+	});
+
+	it('asks again five minutes after a refusal, from one caller at a time, and truncates once the backend can', async () => {
+		mock.timers.enable({ apis: ['Date'], now: Date.UTC(2026, 10, 10) });
+		refusedModel('rechecked');
+		const resource = new MemoryMcpResource();
+		await resource.mcpRemember({ title: 't', content: 'first' }, { user: aliceUser });
+		const hook = (content) =>
+			databases.memory.Memory.embedders.embedding({ content, embeddingModel: 'rechecked' }, { signal: undefined });
+		mock.timers.tick(4 * 60_000);
+		await hook('within the window');
+		assert.deepEqual(optionsOf(2), [[17, false]]);
+
+		mock.timers.tick(60_000 + 1);
+		truncates = true;
+		await Promise.all([hook('recheck one'), hook('recheck two')]);
+		assert.deepEqual(
+			sent.slice(3).map(({ options }) => options.truncate === true),
+			[true, false],
+		);
+		await hook('after the recheck');
+		assert.equal(sent.at(-1).options.truncate, true);
+		assert.equal(warnings.length, 1);
+	});
+
+	it('keeps the downgrade when the recheck is refused again, without warning again', async () => {
+		mock.timers.enable({ apis: ['Date'], now: Date.UTC(2026, 10, 10) });
+		refusedModel('refused-again');
+		const hook = (content) =>
+			databases.memory.Memory.embedders.embedding({ content, embeddingModel: 'refused-again' }, { signal: undefined });
+		await new MemoryMcpResource().mcpRemember({ title: 't', content: 'first' }, { user: aliceUser });
+		mock.timers.tick(5 * 60_000 + 1);
+		await hook('recheck');
+		await hook('after');
+		assert.deepEqual(
+			sent.slice(2).map(({ options }) => options.truncate === true),
+			[true, false, false],
+		);
+		assert.equal(warnings.length, 1);
+	});
+
+	it('warns once the warn level is on, and again when the fallback bound changes', async () => {
+		const resource = new MemoryMcpResource();
+		logger.warn = undefined;
+		refusedModel('quiet-at-first');
+		await resource.mcpRemember({ title: 't', content: 'first' }, { user: aliceUser });
+		logger.warn = (...args) => warnings.push(args.join(' '));
+		refusedModel('quiet-at-first');
+		await resource.mcpRemember({ title: 't', content: 'second' }, { user: aliceUser });
+		refusedModel('quiet-at-first');
+		await resource.mcpRemember({ title: 't', content: 'third' }, { user: aliceUser });
+		refusedModel('quiet-at-first', { embeddingFallbackChars: 2_000 });
+		await resource.mcpRemember({ title: 't', content: 'fourth' }, { user: aliceUser });
+		assert.equal(warnings.length, 2);
+		assert.match(warnings[0], /first 4000 characters/);
+		assert.match(warnings[1], /first 2000 characters/);
+	});
+
+	it('asks again after a configuration reload', async () => {
+		refusedModel('reloaded');
+		const resource = new MemoryMcpResource();
+		await resource.mcpRemember({ title: 't', content: 'first' }, { user: aliceUser });
+		refusedModel('reloaded');
+		await resource.mcpRemember({ title: 't', content: 'second' }, { user: aliceUser });
+		assert.deepEqual(
+			sent.map(({ options }) => options.truncate === true),
+			[true, false, true, false],
+		);
+	});
+
+	it('fails the write as before on a real backend failure, without retrying or downgrading', async () => {
+		const failures = [
+			Object.assign(new TypeError('fetch failed'), { cause: new Error('connect ECONNREFUSED') }),
+			Object.assign(new Error('OpenAI /embeddings returned HTTP 503'), { upstreamStatus: 503 }),
+			refusal('default', 'embed'),
+			Object.assign(new Error("Backend 'default' does not support 'truncate'"), { name: 'Error' }),
+			null,
+		];
+		applySettings(parseSettings({ embeddingTruncate: true }));
+		truncates = true;
+		for (const failure of failures) {
+			failWith = () => failure;
+			sent = [];
+			const before = __test.stores.get('Memory').size;
+			await assert.rejects(new MemoryMcpResource().mcpRemember({ title: 't', content: 'x' }, { user: aliceUser }));
+			assert.equal(sent.length, 1, String(failure?.message));
+			assert.equal(__test.stores.get('Memory').size, before);
+		}
+		assert.deepEqual(
+			warnings.filter((warning) => /truncate/.test(warning)),
+			[],
+		);
+	});
+
+	it('surfaces a failure of the fallback call itself', async () => {
+		refusedModel('down-after-refusal');
+		failWith = (options) =>
+			options.truncate === true ? undefined : Object.assign(new TypeError('fetch failed'), { cause: 'ECONNREFUSED' });
+		await assert.rejects(new MemoryMcpResource().mcpRemember({ title: 't', content: 'x' }, { user: aliceUser }));
+		assert.equal(sent.length, 2);
+		assert.equal(__test.stores.get('Memory').size, 0);
+	});
+
+	it('passes the table hook signal to both attempts', async () => {
+		refusedModel('signalled');
+		await new MemoryMcpResource().mcpRemember({ title: 't', content: 'installs the hook' }, { user: aliceUser });
+		sent = [];
+		applySettings(parseSettings({ embeddingModel: 'signalled', embeddingTruncate: true }));
+		const signal = new AbortController().signal;
+		await databases.memory.Memory.embedders.embedding({ content: 'hook', embeddingModel: 'signalled' }, { signal });
+		assert.deepEqual(
+			sent.map(({ options }) => options),
+			[
+				{ model: 'signalled', inputType: 'document', signal, truncate: true },
+				{ model: 'signalled', inputType: 'document', signal },
 			],
 		);
 	});

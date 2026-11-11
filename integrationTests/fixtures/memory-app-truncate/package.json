@@ -1,0 +1,6 @@
+{
+	"name": "agent-memory-truncate-fixture-app",
+	"private": true,
+	"type": "module",
+	"description": "Integration-test host app with embeddingTruncate on and a backend that cannot truncate. scripts/install-fixtures.js installs the packed @harperfast/agent-memory into it."
+}

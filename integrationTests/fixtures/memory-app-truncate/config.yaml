@@ -1,0 +1,14 @@
+rest: true
+
+graphqlSchema:
+  files: 'schema.graphql'
+
+jsResource:
+  files: 'resources.js'
+
+'@harperfast/agent-memory':
+  package: '@harperfast/agent-memory'
+  embeddingModel: prefixed
+  embeddingTruncate: true
+  limits:
+    embeddingInputChars: 12000

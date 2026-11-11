@@ -8,7 +8,8 @@ jsResource:
 '@harperfast/agent-memory':
   package: '@harperfast/agent-memory'
   embeddingModel: nomic-prefixed
-  # Each node's models.embedding.default entry must set truncation: 'vllm' first (README, Embedding truncation).
+  # vLLM cuts only when each node's models.embedding.default entry sets truncation: 'vllm'; until then the plugin
+  # embeds the first limits.embeddingFallbackChars (default 4000) characters (README, Embedding truncation).
   embeddingTruncate: true
   mcp: true
   # The engineering cluster runs with replication.recordLocks on.

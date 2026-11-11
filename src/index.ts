@@ -1,4 +1,5 @@
-import { models, type Scope } from 'harper';
+import type { Scope } from 'harper';
+import { probeCoreTruncate } from './lifecycle.ts';
 import { MEMORY_RESOURCES, MemoryMcpResource } from './resource.ts';
 import { applySettings, parseSettings } from './settings.ts';
 
@@ -11,20 +12,6 @@ export {
 } from './principal.ts';
 export { canReadLabels, type Principal } from './scopes.ts';
 
-// A core before harper#3706 builds this backend without the `truncate` capability and ignores the option on a call.
-function coreCanTruncate(): boolean {
-	const spec = {
-		name: 'agent-memory-truncate-probe',
-		embed: async () => ({ status: 'completed' as const, output: [] as Float32Array[] }),
-		truncate: true,
-	};
-	try {
-		return (models.defineBackend(spec).capabilities() as { truncate?: boolean }).truncate === true;
-	} catch {
-		return false;
-	}
-}
-
 function routePathFor(basePath: string, resource: { path: string }): string {
 	return resource.path.replace(/^\/Memory(?=\/|$|(?:Events|Mcp)\b)/, basePath);
 }
@@ -34,6 +21,7 @@ export async function handleApplication(scope: Scope): Promise<void> {
 	if (!resources) throw new Error('@harperfast/agent-memory: scope.resources is unavailable');
 	let mountedPath: string | undefined;
 	let mountedMcp = false;
+	let warnedCoreTruncate: string | undefined;
 
 	// Validates before publishing anything, so a rejected reload leaves the previous configuration serving.
 	const configure = () => {
@@ -69,10 +57,14 @@ export async function handleApplication(scope: Scope): Promise<void> {
 		mountedPath = settings.urlPath;
 		mountedMcp = settings.mcp;
 		applySettings(settings);
-		if (settings.embeddingTruncate && !coreCanTruncate()) {
-			scope.logger.warn?.(
-				'@harperfast/agent-memory: embeddingTruncate needs Harper 5.4 or later; this Harper ignores it, so only limits.embeddingInputChars bounds embedding input',
-			);
+		if (settings.embeddingTruncate && !probeCoreTruncate() && scope.logger.warn) {
+			const fallbackChars = Math.min(settings.embeddingInputChars, settings.embeddingFallbackChars);
+			const warning =
+				`@harperfast/agent-memory: embeddingTruncate needs Harper 5.4 or later; this Harper ignores it, so ` +
+				`embeddingModel "${settings.embeddingModel}" embeds the first ${fallbackChars} characters ` +
+				'(limits.embeddingFallbackChars)';
+			if (warning !== warnedCoreTruncate) scope.logger.warn(warning);
+			warnedCoreTruncate = warning;
 		}
 	};
 
