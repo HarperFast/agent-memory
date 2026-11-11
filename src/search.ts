@@ -595,7 +595,7 @@ export async function bootstrapMemories(params: BootstrapParams, principal: Prin
 	};
 	const sections = registeredBootstrapSections();
 	// Contributed sections render once pinned and needsReview have packed, so they know the budget left, while recent
-	// and relevant still load. One Promise.all observes every stage's rejection.
+	// and relevant still load. Awaiting head on its own would leave a recent or relevant rejection unobserved.
 	const head = Promise.all([loadPinned(), loadNeedsReview()]).then(([pinned, needsReview]) => {
 		pack('pinned', pinned);
 		pack('needsReview', needsReview);

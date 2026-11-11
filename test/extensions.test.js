@@ -574,6 +574,24 @@ describe('registerSearchAnnotator', () => {
 		);
 	});
 
+	it('answers without annotations when the hits cannot be copied for annotators', async () => {
+		await seedHits();
+		let calls = 0;
+		register(registerSearchAnnotator, {
+			name: 'summaries',
+			annotate: () => {
+				calls++;
+				return undefined;
+			},
+		});
+		const hits = await searchMemories(parseSearchParams(new URLSearchParams('q=heron')), alice, context);
+		hits[0].uncloneable = () => {};
+		await annotateSearchHits(hits, alice, context);
+		assert.equal(calls, 0);
+		assert.ok(hits.every((hit) => !('summaries' in hit)));
+		assert.match(errors[0][0], /"snapshot"/);
+	});
+
 	it("reads a Map from another app's realm and copies its values out", async () => {
 		const [first] = await seedHits();
 		const value = { node: 'n1' };

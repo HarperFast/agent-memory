@@ -159,7 +159,14 @@ async function runAnnotators(
 	principal: Principal,
 	context: object,
 ): Promise<void> {
-	const input = Object.freeze({ principal, hits: deepFreeze(structuredClone(hits)), context });
+	let snapshot: Record<string, unknown>[];
+	try {
+		snapshot = deepFreeze(structuredClone(hits));
+	} catch (error) {
+		reportFailure('search annotation', 'snapshot', error);
+		return;
+	}
+	const input = Object.freeze({ principal, hits: snapshot, context });
 	const results = await Promise.all(
 		annotators.map(async (annotator) => {
 			const name = annotator.name;
