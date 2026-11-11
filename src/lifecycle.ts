@@ -376,13 +376,13 @@ function shouldAskToTruncate(settings: EmbeddingSettings): boolean {
 function warnTruncateRefused(model: string, fallbackChars: number, refusal: Error): void {
 	const key = `${model}\0${fallbackChars}`;
 	if (truncateRefusalWarned.has(key) || !logger.warn) return;
-	truncateRefusalWarned.add(key);
 	logger.warn(
 		`[agent-memory] embeddingModel "${model}" cannot truncate (${refusal.message}); embedding the first ` +
 			`${fallbackChars} characters instead (limits.embeddingFallbackChars). To let the model cut at its own window, ` +
 			"give that backend the truncate capability (for a vLLM 0.18+ entry, truncation: 'vllm'); to stop asking, " +
 			'set embeddingTruncate: false together with an embeddingInputChars the model accepts.',
 	);
+	truncateRefusalWarned.add(key);
 }
 
 const cutTo = (input: string | string[], max: number) =>
