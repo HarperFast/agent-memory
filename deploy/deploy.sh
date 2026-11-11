@@ -1,6 +1,4 @@
 #!/usr/bin/env bash
-# Deploy an agent-memory host app: pack the plugin from this checkout, vendor it into the env dir's app, and
-# run deploy_component (replicated) through the operations socket inside one node's container.
 # Access is the SSH key (root on the node's host); no Harper password is used. The host and container are
 # never defaulted: this repo is public, so they come from the environment.
 set -euo pipefail
@@ -45,7 +43,7 @@ node -e 'process.stdout.write(JSON.stringify({operation:"deploy_component",proje
 
 echo "deploying $(basename "$tarball") as $PROJECT via $HOST"
 QMATCH="$(printf %q "$MATCH")"
-RESULT="$(ssh -o ProxyJump=none "root@$HOST" "C=\$(docker ps --format '{{.Names}}' | grep -F $QMATCH | head -1); \
+RESULT="$(ssh -o ProxyJump=none "root@$HOST" "C=\$(docker ps --format '{{.Names}}' | grep -F -- $QMATCH | head -1); \
   [ -n \"\$C\" ] || { echo no running container matches $QMATCH >&2; exit 1; }; \
   docker exec -i \"\$C\" curl -sS --unix-socket /home/harperdb/harper/operations-server http://localhost \
   -H 'content-type: application/json' -d @-" <"$work/op.json")"

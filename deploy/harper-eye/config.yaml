@@ -1,4 +1,3 @@
-# agent-memory as its own app on the cluster that hosts the harper-eye app (README).
 jsResource:
   files: 'resources.js'
 
