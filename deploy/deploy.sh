@@ -44,8 +44,9 @@ tar -C "$work/app" -czf "$work/app.tgz" .
 node -e 'process.stdout.write(JSON.stringify({operation:"deploy_component",project:process.argv[2],payload:require("fs").readFileSync(process.argv[1]).toString("base64"),replicated:true,restart:true}))' "$work/app.tgz" "$PROJECT" >"$work/op.json"
 
 echo "deploying $(basename "$tarball") as $PROJECT via $HOST"
-RESULT="$(ssh -o ProxyJump=none "root@$HOST" "C=\$(docker ps --format '{{.Names}}' | grep -F $(printf %q "$MATCH") | head -1); \
-  [ -n \"\$C\" ] || { echo 'no running agent-memory container' >&2; exit 1; }; \
+QMATCH="$(printf %q "$MATCH")"
+RESULT="$(ssh -o ProxyJump=none "root@$HOST" "C=\$(docker ps --format '{{.Names}}' | grep -F $QMATCH | head -1); \
+  [ -n \"\$C\" ] || { echo no running container matches $QMATCH >&2; exit 1; }; \
   docker exec -i \"\$C\" curl -sS --unix-socket /home/harperdb/harper/operations-server http://localhost \
   -H 'content-type: application/json' -d @-" <"$work/op.json")"
 # The SSH session banner can precede the response; the operation's JSON is the last line.

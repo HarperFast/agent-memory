@@ -32,9 +32,10 @@ BODY="$(USERNAME="$USERNAME" ROLE="$ROLE" PASS="$PASS" OP="$OP" node -e '
 const e=process.env;
 process.stdout.write(JSON.stringify({operation:e.OP, username:e.USERNAME, password:e.PASS, role:e.ROLE, active:true}));')"
 
+QMATCH="$(printf %q "$MATCH")"
 RESULT="$(printf '%s' "$BODY" | ssh -o ProxyJump=none "root@$HOST" \
-  "C=\$(docker ps --format '{{.Names}}' | grep -F $(printf %q "$MATCH") | head -1); \
-  [ -n \"\$C\" ] || { echo 'no running agent-memory container' >&2; exit 1; }; \
+  "C=\$(docker ps --format '{{.Names}}' | grep -F $QMATCH | head -1); \
+  [ -n \"\$C\" ] || { echo no running container matches $QMATCH >&2; exit 1; }; \
   docker exec -i \"\$C\" curl -sS --unix-socket /home/harperdb/harper/operations-server http://localhost -H content-type:application/json -d @-")"
 # The SSH session banner can precede the response; the operation's JSON is the last line.
 RESULT="$RESULT" node -e 'const r=JSON.parse(process.env.RESULT.trim().split("\n").pop()); if (r.error) { console.error("cluster refused:", JSON.stringify(r)); process.exit(1); }'

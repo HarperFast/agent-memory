@@ -5,14 +5,10 @@ that hosts the harper-eye app ("Eye"), so the plugin upgrades separately from Ey
 [`../engineering`](../engineering/README.md): the same `nomic-prefixed` backend in `resources.js`, with the
 differences below.
 
-| Setting                         | Value                   | Why                                                                                                 |
-| ------------------------------- | ----------------------- | --------------------------------------------------------------------------------------------------- |
-| `lockScope`                     | `node`                  | the cluster has no `replication.recordLocks`; `cluster` would answer every lifecycle write with 503 |
-| `supersession.mode`             | `suggest`               | candidates on `PUT`, no automatic supersession                                                      |
-| `mcp`                           | `true`                  | tools on Harper's `/mcp` endpoint                                                                   |
-| `embeddingTruncate`             | `true`                  | the model cuts at its own token window when it can                                                  |
-| `limits.embeddingInputChars`    | `12000`                 | request bound only, above what 2,048 tokens cover                                                   |
-| `limits.embeddingFallbackChars` | `4000` (plugin default) | the bound when the model cannot truncate                                                            |
+The only option that differs is `lockScope: node`: this cluster has no `replication.recordLocks`, and `cluster`
+would answer every lifecycle write with 503. Across nodes, two revisions at one revision can both succeed
+([DESIGN.md](../../DESIGN.md#lifecycle)). Truncation is on with the plugin's 4,000-character fallback
+(`limits.embeddingFallbackChars`), MCP is on, and supersession is `suggest`.
 
 ## Deploying
 
@@ -48,7 +44,8 @@ from worker to worker. Deploy this app together with the Eye PR that removes Eye
 1. Before: Eye's own dependency on `@harperfast/agent-memory` is 0.1.4 or later and deployed, so its package
    functions keep reaching the plugin once it runs as a separate app ([From another app](../../README.md#from-another-app)).
 2. Before: compare this `config.yaml`'s plugin options with those Eye's `config.yaml` sets for the plugin now,
-   and differ only on purpose.
+   and differ only on purpose. Also check that Eye's registered backend for that `embeddingModel` adds the same
+   prefixes as `resources.js`; a mismatch ranks searches worse and logs nothing.
 3. Deploy Eye with the plugin entry removed.
 4. Immediately run `deploy/deploy.sh deploy/harper-eye`. Memory calls fail between 3 and 4.
 5. Search and write one memory through each node.

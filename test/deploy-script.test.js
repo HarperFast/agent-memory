@@ -47,12 +47,18 @@ describe('deploy/engineering/provision-user.sh', () => {
 });
 
 describe('deploy/ in a public repo', () => {
+	const files = readdirSync(deployDir, { recursive: true, withFileTypes: true })
+		.filter((entry) => entry.isFile())
+		.map((entry) => join(entry.parentPath, entry.name));
+
 	it('names no Fabric host', () => {
-		const files = readdirSync(deployDir, { recursive: true, withFileTypes: true }).filter((entry) => entry.isFile());
 		assert.ok(files.length > 0);
-		for (const file of files) {
-			const path = join(file.parentPath, file.name);
-			assert.doesNotMatch(readFileSync(path, 'utf8'), /harperfabric\.com/, path);
+		for (const path of files) assert.doesNotMatch(readFileSync(path, 'utf8'), /harperfabric\.com/, path);
+	});
+
+	it('gives the target variables no default', () => {
+		for (const path of files.filter((file) => file.endsWith('.sh'))) {
+			assert.doesNotMatch(readFileSync(path, 'utf8'), /\$\{AGENT_MEMORY_\w+:-[^}]/, path);
 		}
 	});
 });
