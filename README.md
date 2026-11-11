@@ -177,6 +177,31 @@ role and user grants merged and patterns that grant nothing dropped. A super_use
 access; check `superUser`, or let `canReadLabels` do it. `canReadLabels` is the label rule only (any label
 matches), and accepts only a principal `resolvePrincipal` returned. Contract: [DESIGN.md](DESIGN.md#extension-points).
 
+### From another app
+
+These four functions also work in an app that imports the package without listing the plugin, while
+agent-memory runs as its own app on the same Harper, for example so it can be upgraded separately. That app's
+copy of the package registers with the running plugin and asks it to resolve principals. Its sinks run inside the
+plugin's lifecycle transaction, and its authorization matches the plugin's routes even when the two versions
+differ. This needs:
+
+- Both apps on Harper's shared worker pool: agent-memory must not be `isolated`.
+- Harper's default module loading: `applications.moduleLoader` `vm-current-context` (the default) or `vm`, and
+  `applications.dependencyLoader` unset or `app`. Under the `native` or `compartment` loader, or
+  `dependencyLoader: native`, each copy keeps its own state, as before, and a copy registering beside a running
+  plugin logs a warning.
+- Exactly one app listing the plugin in its `config.yaml`. A second one fails to load.
+- A version of this package newer than 0.1.3 in the importing app. 0.1.3 and earlier keep registrations to
+  themselves.
+
+To move the plugin out of a host app:
+
+1. Upgrade the host app's dependency first. It keeps working in-app.
+2. In one deploy, add the agent-memory app, with the plugin options moved into its `config.yaml`, and remove
+   the plugin entry from the host app.
+
+Rolling the host back to 0.1.3 or earlier stops its sinks.
+
 ## Claude Code plugin
 
 The repository ships a Claude Code plugin in [`claude-plugin/`](claude-plugin/) (registered in

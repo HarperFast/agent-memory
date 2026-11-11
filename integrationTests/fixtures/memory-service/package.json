@@ -1,0 +1,6 @@
+{
+	"name": "agent-memory-fixture-service",
+	"private": true,
+	"type": "module",
+	"description": "Integration-test app that runs the plugin on its own, beside memory-consumer. scripts/install-fixtures.js installs the packed @harperfast/agent-memory into it."
+}

@@ -1,9 +1,9 @@
+import { domain, noteRegistration } from './runtime.ts';
+
 export interface MemorySink {
 	write?(memory: Record<string, unknown>, context: object): unknown;
 	withdraw?(memory: Record<string, unknown>, context: object): unknown;
 }
-
-const sinks: MemorySink[] = [];
 
 /**
  * Called inside the lifecycle transaction for every memory row a lifecycle operation changes. A write the sink
@@ -14,6 +14,8 @@ const sinks: MemorySink[] = [];
  * function.
  */
 export function registerMemorySink(sink: MemorySink): () => void {
+	noteRegistration();
+	const sinks = domain().sinks;
 	sinks.push(sink);
 	return () => {
 		const index = sinks.indexOf(sink);
@@ -22,7 +24,7 @@ export function registerMemorySink(sink: MemorySink): () => void {
 }
 
 export function hasSinks(): boolean {
-	return sinks.length > 0;
+	return domain().sinks.length > 0;
 }
 
 /** Dispatches to the sinks registered when it starts; an unregister during dispatch takes effect on the next one. */
@@ -31,5 +33,5 @@ export async function notifySinks(
 	memory: Record<string, unknown>,
 	context: object,
 ): Promise<void> {
-	for (const sink of sinks.slice()) await sink[kind]?.(memory, context);
+	for (const sink of domain().sinks.slice()) await sink[kind]?.(memory, context);
 }

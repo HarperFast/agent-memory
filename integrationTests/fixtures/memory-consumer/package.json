@@ -1,0 +1,6 @@
+{
+	"name": "agent-memory-fixture-consumer",
+	"private": true,
+	"type": "module",
+	"description": "Integration-test app that imports @harperfast/agent-memory without hosting the plugin. scripts/install-fixtures.js installs its own packed copy."
+}

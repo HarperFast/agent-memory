@@ -1,5 +1,6 @@
 import { databases, logger } from 'harper';
 import { memoryError } from './errors.ts';
+import { domain, noteRegistration } from './runtime.ts';
 import { createPrincipal, type GrantPatterns, type Principal } from './scopes.ts';
 
 export interface PrincipalResolution {
@@ -19,14 +20,13 @@ export type PrincipalResolver = (
 	next: () => Promise<PrincipalResolution | undefined>,
 ) => PrincipalResolution | undefined | Promise<PrincipalResolution | undefined>;
 
-let resolver: PrincipalResolver | undefined;
-
 export function setPrincipalResolver(fn: PrincipalResolver | undefined): void {
-	resolver = fn;
+	noteRegistration();
+	domain().resolver = fn;
 }
 
 export function hasCustomPrincipalResolver(): boolean {
-	return resolver !== undefined;
+	return domain().resolver !== undefined;
 }
 
 function grantRows(): any {
@@ -71,6 +71,7 @@ function warnRejectedPattern(pattern: unknown): void {
  * throwing resolver rejects with its own error.
  */
 export async function resolvePrincipal(context: any): Promise<Principal> {
+	const resolver = domain().resolver;
 	const resolution = resolver
 		? await resolver(context, () => resolveHarperUser(context))
 		: await resolveHarperUser(context);

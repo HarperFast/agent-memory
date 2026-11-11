@@ -1,0 +1,4 @@
+# A second app listing the plugin beside memory-service: whichever loads second on a worker must fail to load.
+'@harperfast/agent-memory':
+  package: '@harperfast/agent-memory'
+  urlPath: 'MemoryDup'

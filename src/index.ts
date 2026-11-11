@@ -1,16 +1,41 @@
 import type { Scope } from 'harper';
 import { probeCoreTruncate } from './lifecycle.ts';
+import { resolvePrincipal as resolveHere } from './principal.ts';
 import { MEMORY_RESOURCES, MemoryMcpResource } from './resource.ts';
+import { domain, foreignRuntime, publishRuntime, type MemoryRuntime } from './runtime.ts';
+import { canReadLabels as canReadLabelsHere, compiledHere, type Principal } from './scopes.ts';
 import { applySettings, parseSettings } from './settings.ts';
+import { PACKAGE_VERSION } from './version.ts';
 
 export { registerMemorySink, type MemorySink } from './sinks.ts';
-export {
-	resolvePrincipal,
-	setPrincipalResolver,
-	type PrincipalResolver,
-	type PrincipalResolution,
-} from './principal.ts';
-export { canReadLabels, type Principal } from './scopes.ts';
+export { setPrincipalResolver, type PrincipalResolver, type PrincipalResolution } from './principal.ts';
+export type { Principal } from './scopes.ts';
+
+const RUNTIME: MemoryRuntime = Object.freeze({
+	version: PACKAGE_VERSION,
+	resolvePrincipal: resolveHere,
+	canReadLabels: canReadLabelsHere,
+});
+
+/**
+ * The caller behind a request context: the custom resolver's answer, else the Harper user and its `ScopeGrant`
+ * rows. Rejects with a 401 `principal_required` MemoryError when there is no caller; a failed grant read or a
+ * throwing resolver rejects with its own error. Resolved by the running plugin, even one in another app; by this
+ * copy when none runs beside it (DESIGN.md, Extension points).
+ */
+export function resolvePrincipal(context: any): Promise<Principal> {
+	const runtime = foreignRuntime(RUNTIME);
+	return runtime ? runtime.resolvePrincipal(context) : resolveHere(context);
+}
+
+/**
+ * Rule 1's label test: any of `labels` matches a read pattern, or the principal is super_user. Missing labels match
+ * nothing. Answered by the copy of the package that resolved `principal`; any other object throws a TypeError.
+ */
+export function canReadLabels(principal: Principal, labels: readonly string[] | null | undefined): boolean {
+	const runtime = compiledHere(principal) ? undefined : foreignRuntime(RUNTIME);
+	return runtime ? runtime.canReadLabels(principal, labels) : canReadLabelsHere(principal, labels);
+}
 
 function routePathFor(basePath: string, resource: { path: string }): string {
 	return resource.path.replace(/^\/Memory(?=\/|$|(?:Events|Mcp)\b)/, basePath);
@@ -19,6 +44,12 @@ function routePathFor(basePath: string, resource: { path: string }): string {
 export async function handleApplication(scope: Scope): Promise<void> {
 	const resources = scope.resources;
 	if (!resources) throw new Error('@harperfast/agent-memory: scope.resources is unavailable');
+	const owner = domain().runtime;
+	if (owner !== undefined && owner !== RUNTIME) {
+		throw new Error(
+			`@harperfast/agent-memory: version ${owner.version} of this plugin already serves these apps; list it in only one app's config.yaml`,
+		);
+	}
 	let mountedPath: string | undefined;
 	let mountedMcp = false;
 	let warnedCoreTruncate: string | undefined;
@@ -69,6 +100,9 @@ export async function handleApplication(scope: Scope): Promise<void> {
 	};
 
 	configure();
+	// The ownership check, configure() and this publish run with no await between them, so two apps loading
+	// concurrently cannot both pass the check.
+	if (!scope.isTransientValidation) publishRuntime(RUNTIME);
 	scope.options.on('change', () => {
 		try {
 			configure();
