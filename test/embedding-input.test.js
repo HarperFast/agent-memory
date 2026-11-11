@@ -433,6 +433,23 @@ describe('embeddingTruncate on a backend that cannot truncate', () => {
 		assert.equal(warnings.length, 1);
 	});
 
+	it('warns once the warn level is on, and again when the fallback bound changes', async () => {
+		const resource = new MemoryMcpResource();
+		logger.warn = undefined;
+		refusedModel('quiet-at-first');
+		await resource.mcpRemember({ title: 't', content: 'first' }, { user: aliceUser });
+		logger.warn = (...args) => warnings.push(args.join(' '));
+		refusedModel('quiet-at-first');
+		await resource.mcpRemember({ title: 't', content: 'second' }, { user: aliceUser });
+		refusedModel('quiet-at-first');
+		await resource.mcpRemember({ title: 't', content: 'third' }, { user: aliceUser });
+		refusedModel('quiet-at-first', { embeddingFallbackChars: 2_000 });
+		await resource.mcpRemember({ title: 't', content: 'fourth' }, { user: aliceUser });
+		assert.equal(warnings.length, 2);
+		assert.match(warnings[0], /first 4000 characters/);
+		assert.match(warnings[1], /first 2000 characters/);
+	});
+
 	it('asks again after a configuration reload', async () => {
 		refusedModel('reloaded');
 		const resource = new MemoryMcpResource();

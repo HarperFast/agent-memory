@@ -374,9 +374,10 @@ function shouldAskToTruncate(settings: EmbeddingSettings): boolean {
 }
 
 function warnTruncateRefused(model: string, fallbackChars: number, refusal: Error): void {
-	if (truncateRefusalWarned.has(model)) return;
-	truncateRefusalWarned.add(model);
-	logger.warn?.(
+	const key = `${model}\0${fallbackChars}`;
+	if (truncateRefusalWarned.has(key) || !logger.warn) return;
+	truncateRefusalWarned.add(key);
+	logger.warn(
 		`[agent-memory] embeddingModel "${model}" cannot truncate (${refusal.message}); embedding the first ` +
 			`${fallbackChars} characters instead (limits.embeddingFallbackChars). To let the model cut at its own window, ` +
 			"give that backend the truncate capability (for a vLLM 0.18+ entry, truncation: 'vllm'); to stop asking, " +
@@ -387,15 +388,23 @@ function warnTruncateRefused(model: string, fallbackChars: number, refusal: Erro
 const cutTo = (input: string | string[], max: number) =>
 	typeof input === 'string' ? embeddingInput(input, max) : input.map((text) => embeddingInput(text, max));
 
-// `truncate` is a required capability in core, and `embeddingInputChars` may exceed the window when the model is
-// expected to cut. A model that cannot gets one attempt cut to a bound meant to fit without its cut.
-export async function embedTexts(
+export function embedTexts(
 	input: string | string[],
 	options: EmbedCallOptions,
 	settings: EmbeddingSettings,
 	truncate: boolean,
 ): Promise<Float32Array[]> {
 	if (!truncate) return models.embed(cutTo(input, settings.embeddingInputChars), options);
+	return embedTruncating(input, options, settings);
+}
+
+// `truncate` is a required capability in core, and `embeddingInputChars` may exceed the window when the model is
+// expected to cut. A model that cannot gets one attempt cut to a bound meant to fit without its cut.
+async function embedTruncating(
+	input: string | string[],
+	options: EmbedCallOptions,
+	settings: EmbeddingSettings,
+): Promise<Float32Array[]> {
 	const fallbackChars = Math.min(settings.embeddingInputChars, settings.embeddingFallbackChars);
 	if (shouldAskToTruncate(settings)) {
 		const truncating = { ...options, truncate: true };

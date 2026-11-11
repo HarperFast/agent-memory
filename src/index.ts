@@ -21,7 +21,7 @@ export async function handleApplication(scope: Scope): Promise<void> {
 	if (!resources) throw new Error('@harperfast/agent-memory: scope.resources is unavailable');
 	let mountedPath: string | undefined;
 	let mountedMcp = false;
-	let warnedCoreTruncate = false;
+	let warnedCoreTruncate: string | undefined;
 
 	// Validates before publishing anything, so a rejected reload leaves the previous configuration serving.
 	const configure = () => {
@@ -57,11 +57,14 @@ export async function handleApplication(scope: Scope): Promise<void> {
 		mountedPath = settings.urlPath;
 		mountedMcp = settings.mcp;
 		applySettings(settings);
-		if (settings.embeddingTruncate && !probeCoreTruncate() && !warnedCoreTruncate) {
-			warnedCoreTruncate = true;
-			scope.logger.warn?.(
-				'@harperfast/agent-memory: embeddingTruncate needs Harper 5.4 or later; this Harper ignores it, so embedding input is cut to the smaller of limits.embeddingInputChars and limits.embeddingFallbackChars',
-			);
+		if (settings.embeddingTruncate && !probeCoreTruncate() && scope.logger.warn) {
+			const fallbackChars = Math.min(settings.embeddingInputChars, settings.embeddingFallbackChars);
+			const warning =
+				`@harperfast/agent-memory: embeddingTruncate needs Harper 5.4 or later; this Harper ignores it, so ` +
+				`embeddingModel "${settings.embeddingModel}" embeds the first ${fallbackChars} characters ` +
+				'(limits.embeddingFallbackChars)';
+			if (warning !== warnedCoreTruncate) scope.logger.warn(warning);
+			warnedCoreTruncate = warning;
 		}
 	};
 

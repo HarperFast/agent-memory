@@ -91,10 +91,10 @@ describe('handleApplication', () => {
 			name: spec.name,
 			capabilities: () => (withTruncate ? { embed: true, truncate: spec.truncate } : { embed: true }),
 		});
-		const warningsFor = async (options, reload) => {
+		const warningsFor = async (options, ...reloads) => {
 			const harness = fakeScope(options);
 			await handleApplication(harness.scope);
-			if (reload) harness.setOptions(reload);
+			for (const reload of reloads) harness.setOptions(reload);
 			return harness.warnings.map(([message]) => message);
 		};
 		const embedLong = async () => {
@@ -107,11 +107,16 @@ describe('handleApplication', () => {
 			for (const defineBackend of [undefined, defineBackendOf(false)]) {
 				models.defineBackend = defineBackend;
 				const options = { embeddingTruncate: true, limits: { embeddingInputChars: 12_000 } };
-				const warnings = await warningsFor(options, { ...options, mcp: true });
+				const warnings = await warningsFor(
+					options,
+					{ ...options, mcp: true },
+					{ ...options, embeddingModel: 'second' },
+				);
 				assert.equal(getSettings().embeddingTruncate, true);
-				assert.equal(warnings.length, 1);
+				assert.equal(warnings.length, 2);
 				assert.match(warnings[0], /embeddingTruncate needs Harper 5\.4/);
-				assert.match(warnings[0], /limits\.embeddingFallbackChars/);
+				assert.match(warnings[0], /embeddingModel "default" embeds the first 4000 characters/);
+				assert.match(warnings[1], /embeddingModel "second"/);
 				assert.deepEqual(await embedLong(), [[4_000, false]]);
 			}
 			models.defineBackend = defineBackendOf(true);
