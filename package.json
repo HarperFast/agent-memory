@@ -39,7 +39,8 @@
 		"install:fixtures": "node scripts/install-fixtures.js",
 		"test:integration": "harper-integration-test-run \"integrationTests/**/*.test.ts\"",
 		"format:check": "prettier --check .",
-		"format:write": "prettier --write ."
+		"format:write": "prettier --write .",
+		"version": "node scripts/sync-version.mjs && git add src/version.ts"
 	},
 	"devDependencies": {
 		"@anthropic-ai/sdk": "^0.135.0",
