@@ -13,7 +13,9 @@ import { __test, databases, logger, resources } from 'harper';
 import * as plugin from '../dist/index.js';
 import { putMemory, withdrawMemory } from '../dist/lifecycle.js';
 import { resolvePrincipal as pluginResolvePrincipal } from '../dist/principal.js';
+import { MemoryMcpResource, MemoryResource } from '../dist/resource.js';
 import { canReadLabels as pluginCanReadLabels } from '../dist/scopes.js';
+import { bootstrapMemories, scanMemories as pluginScanMemories } from '../dist/search.js';
 
 const ANCHOR = Symbol.for('@harperfast/agent-memory');
 const stubUrl = new URL('./helpers/harper-stub.mjs', import.meta.url).href;
@@ -133,6 +135,21 @@ describe('a second copy of the package', () => {
 		assert.throws(() => pluginCanReadLabels(earlyPrincipal, ['global']), TypeError);
 	});
 
+	it('scans with its own code, and holds a section and an annotator registered before any plugin loads', async () => {
+		const scan = copy.scanMemories();
+		assert.notEqual(Object.getPrototypeOf(scan), pluginScanMemories.prototype);
+		for await (const _row of scan);
+		copy.registerBootstrapSection({
+			name: 'early',
+			render: ({ principal }) => [{ content: `early for ${principal.id}` }],
+		});
+		copy.registerSearchAnnotator({
+			name: 'earlyNote',
+			annotate: ({ hits }) => new Map(hits.map((hit) => [hit.id, 'early'])),
+		});
+		assert.equal(warnings.length, 0);
+	});
+
 	it('reaches the plugin with a sink and a resolver registered before the plugin loads', async () => {
 		const calls = [];
 		copy.registerMemorySink({
@@ -197,6 +214,57 @@ describe('a second copy of the package', () => {
 		);
 	});
 
+	it("uses the copy's sections and annotators in the plugin's bootstrap and search, and scans through the plugin", async () => {
+		const unregisterSection = copy.registerBootstrapSection({
+			name: 'late',
+			render: ({ budgetChars }) => ({ text: `late with ${budgetChars}` }),
+		});
+		const unregisterAnnotator = copy.registerSearchAnnotator({
+			name: 'lateNote',
+			annotate: ({ principal, hits }) =>
+				new Map(hits.map((hit) => [hit.id, { by: principal.id, readable: copy.canReadLabels(principal, hit.scopes) }])),
+		});
+		const alice = await pluginResolvePrincipal(member('alice'));
+		const id = idFor('annotated');
+		await putMemory(id, input('kestrel hovering'), alice, {});
+
+		const booted = await bootstrapMemories({ budget: 8000 }, alice, {});
+		assert.deepEqual(
+			booted.memories.filter((entry) => entry.id === undefined).map((entry) => [entry.section, entry.content]),
+			[
+				['early', 'early for alice'],
+				['late', 'late with 8000'],
+			],
+		);
+
+		const response = await MemoryResource.get(new URLSearchParams('q=kestrel'), member('alice'));
+		const [hit] = (await response.json()).memories;
+		assert.equal(hit.id, id);
+		assert.equal(hit.earlyNote, 'early');
+		assert.deepEqual(hit.lateNote, { by: 'alice', readable: true });
+		const recalled = await new MemoryMcpResource().mcpRecall({ q: 'kestrel' }, member('alice'));
+		assert.deepEqual(recalled.memories[0].lateNote, { by: 'alice', readable: true });
+
+		const scan = copy.scanMemories();
+		assert.equal(Object.getPrototypeOf(scan), pluginScanMemories.prototype);
+		const rows = [];
+		for await (const row of scan) rows.push(row);
+		assert.ok(rows.some((row) => row.id === id && Array.isArray(row.embedding)));
+		const resumed = [];
+		for await (const row of copy.scanMemories({ after: { createdAt: rows[0].createdAt, id: rows[0].id } })) {
+			resumed.push(row.id);
+		}
+		assert.deepEqual(
+			resumed,
+			rows.slice(1).map((row) => row.id),
+		);
+
+		unregisterSection();
+		unregisterAnnotator();
+		const after = await bootstrapMemories({ budget: 8000 }, alice, {});
+		assert.ok(!after.memories.some((entry) => entry.section === 'late'));
+	});
+
 	it('stops a sink unregistered through the copy', async () => {
 		const calls = [];
 		const unregister = copy.registerMemorySink({ write: (memory) => calls.push(memory.id) });
@@ -231,11 +299,20 @@ describe('a second copy of the package', () => {
 		for (const other of [candidate, branch]) {
 			other.registerMemorySink({ write: (memory) => calls.push(memory.id) });
 			other.setPrincipalResolver(() => ({ id: 'intruder', superUser: true }));
+			other.registerBootstrapSection({ name: 'intruder', render: () => [{ content: 'intruder' }] });
+			other.registerSearchAnnotator({
+				name: 'intruder',
+				annotate: ({ hits }) => new Map(hits.map((hit) => [hit.id, 1])),
+			});
 		}
 		const erin = await pluginResolvePrincipal(member('erin'));
 		assert.equal(erin.id, 'agent-erin');
 		await putMemory(idFor('apart'), input('apart'), erin, {});
 		assert.deepEqual(calls, []);
+		const booted = await bootstrapMemories({ budget: 8000 }, erin, {});
+		assert.ok(!booted.memories.some((entry) => entry.section === 'intruder'));
+		const searched = await (await MemoryResource.get(new URLSearchParams('q=apart'), member('erin'))).json();
+		assert.ok(searched.memories.length > 0 && searched.memories.every((hit) => !('intruder' in hit)));
 
 		const viaBranch = await branch.resolvePrincipal(member('erin'));
 		assert.equal(viaBranch.id, 'intruder');

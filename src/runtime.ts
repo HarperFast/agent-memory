@@ -1,6 +1,8 @@
 import * as harper from 'harper';
+import type { BootstrapSection, SearchAnnotator } from './extensions.ts';
 import type { PrincipalResolver } from './principal.ts';
 import type { Principal } from './scopes.ts';
+import type { ScanOptions } from './search.ts';
 import type { MemorySink } from './sinks.ts';
 import { PACKAGE_VERSION } from './version.ts';
 
@@ -12,12 +14,17 @@ export interface MemoryRuntime {
 	readonly version: string;
 	resolvePrincipal(context: any): Promise<Principal>;
 	canReadLabels(principal: Principal, labels: readonly string[] | null | undefined): boolean;
+	// Absent from a runtime published by 0.1.4 or earlier, which also never renders sections or runs annotators.
+	scanMemories?(options?: ScanOptions): AsyncIterable<Record<string, unknown>>;
 }
 
 export interface MemoryDomain {
 	readonly sinks: MemorySink[];
 	resolver: PrincipalResolver | undefined;
 	runtime: MemoryRuntime | undefined;
+	// Absent from a domain an older copy created; added on first use.
+	bootstrapSections?: BootstrapSection[];
+	searchAnnotators?: SearchAnnotator[];
 }
 
 interface Anchor {
@@ -34,6 +41,7 @@ const UNSCOPED_COPY =
 let memo: MemoryDomain | undefined;
 let scoped = false;
 let warnedUnscoped = false;
+let warnedOldRuntime: MemoryRuntime | undefined;
 let checkedRuntime: MemoryRuntime | undefined;
 
 function isObject(value: unknown): value is object {
@@ -97,6 +105,33 @@ export function noteRegistration(): void {
 	if (shared.scopedRuntime) warnUnscopedOnce();
 }
 
+function warnIfOldRuntime(runtime: MemoryRuntime | undefined): void {
+	if (runtime === undefined || runtime === warnedOldRuntime || typeof runtime.scanMemories === 'function') return;
+	const { bootstrapSections, searchAnnotators } = domain();
+	if (!bootstrapSections?.length && !searchAnnotators?.length) return;
+	warnedOldRuntime = runtime;
+	warn(
+		`@harperfast/agent-memory: the running plugin is ${runtime.version}, which never renders bootstrap sections or runs search annotators; upgrade it to use them`,
+	);
+}
+
+export function noteExtensionRegistered(): void {
+	const target = domain();
+	warnIfOldRuntime(target.runtime);
+	if (target.runtime !== undefined || Object.getOwnPropertyDescriptor(target, 'runtime')?.set) return;
+	// A plugin from 0.1.4 or earlier never reads these lists, and publishes with a plain assignment this setter sees.
+	let runtime: MemoryRuntime | undefined;
+	Object.defineProperty(target, 'runtime', {
+		configurable: true,
+		enumerable: true,
+		get: () => runtime,
+		set: (value: MemoryRuntime | undefined) => {
+			runtime = value;
+			warnIfOldRuntime(value);
+		},
+	});
+}
+
 export function publishRuntime(runtime: MemoryRuntime): void {
 	domain().runtime = runtime;
 	if (!scoped) return;
@@ -116,6 +151,7 @@ export function foreignRuntime(own: MemoryRuntime): MemoryRuntime | undefined {
 	if (runtime === undefined || runtime === own) return undefined;
 	if (runtime !== checkedRuntime) {
 		checkedRuntime = runtime;
+		warnIfOldRuntime(runtime);
 		if (major(runtime.version) !== OWN_MAJOR) {
 			warn(
 				`@harperfast/agent-memory: this app imports ${PACKAGE_VERSION} but the running plugin is ${runtime.version}; calls go to the running plugin`,

@@ -2,6 +2,7 @@
 import { Resource } from 'harper';
 import { badRequest, memoryError, normalizeError, notFound } from './errors.ts';
 import { subscribeMemory, subscribeMemoryEvents, watchMemories, type SubscriptionStream } from './events.ts';
+import { annotateSearchHits } from './extensions.ts';
 import { importMemories } from './import.ts';
 import {
 	confirmMemory,
@@ -211,6 +212,8 @@ export class MemoryResource extends MemoryEndpoint {
 			if (target?.rest) throw notFound();
 			const params = parseSearchParams(target);
 			const memories = await searchMemories(params, principal, ctx);
+			const annotating = params.q ? annotateSearchHits(memories, principal, ctx) : undefined;
+			if (annotating) await annotating;
 			// An older server ignores the parameter, so a full export needs this to know withdrawn rows were included.
 			return json(params.includeWithdrawn ? { memories, includeWithdrawn: true } : { memories });
 		});
