@@ -1007,7 +1007,8 @@ detection into a one-off, reviewed cleanup of history that arrived without its l
   budget. The server's `budget` counts title + content only, so the hook requests `bootstrapRequestBudget`: 60% of
   the budget left after its wrapper and banners, since title + content measured ~64% of a rendered memory entry.
   Typical responses then fit whole; `formatInjectionBlock({ ordered: true })` stops at the first entry that does
-  not fit rather than skipping ahead to a smaller, lower-priority one. The share is a client-side estimate: an entry
+  not fit rather than skipping ahead to a smaller, lower-priority one. The offline cache path keeps skipping
+  ahead: the cache was packed for an earlier request budget, not this one. The share is a client-side estimate: an entry
   longer than the request budget is not returned even when it alone would fit the injection, and many very short
   entries can still overflow; only the server counting framing per entry would make the injection exact. The
   hook also keeps the tail it did not inject in `watchedIds`, so a later flag on one of those memories is not

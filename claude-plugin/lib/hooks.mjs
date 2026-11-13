@@ -341,7 +341,6 @@ export async function handleSessionStart(input = {}, options = {}) {
 		banners: [staleBanner, ...banners],
 		budget: config.bootstrapBudget,
 		nonce: options.nonce,
-		ordered: true,
 	});
 	recordMemoriesInState(state, cached.memories, formatted.includedMemories);
 	saveSessionState(config, sessionId, state);

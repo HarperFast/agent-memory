@@ -638,6 +638,24 @@ describe('SessionStart bootstrap hook and read-through cache', () => {
 				packed.filter((entry) => entry.id).map((entry) => entry.id),
 			);
 			assert.ok(loadBootstrapCache(config).memories.every((m) => typeof m.id === 'string'));
+
+			// The cache was packed for an earlier budget, so the offline path keeps checking smaller entries.
+			saveBootstrapCache(config, [
+				{ id: 'mem_cached_pin_big_01', title: 'Big', content: 'b'.repeat(5000), section: 'pinned', revision: 1 },
+				{ id: 'mem_cached_pin_small2', title: 'Small', content: 'fits', section: 'pinned', revision: 1 },
+			]);
+			const offline = await handleSessionStart(
+				{ session_id: 'sess-packed', source: 'resume' },
+				{
+					config,
+					env,
+					spawnFollower: false,
+					fetchImpl: async () => {
+						throw new Error('ECONNREFUSED');
+					},
+				},
+			);
+			assert.ok(offline.hookSpecificOutput.additionalContext.includes('mem_cached_pin_small2'));
 		} finally {
 			rmSync(tmp, { recursive: true, force: true });
 		}
