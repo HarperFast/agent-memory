@@ -1007,7 +1007,11 @@ detection into a one-off, reviewed cleanup of history that arrived without its l
   budget. The server's `budget` counts title + content only, so the hook requests `bootstrapRequestBudget`: 60% of
   the budget left after its wrapper and banners, since title + content measured ~64% of a rendered memory entry.
   Typical responses then fit whole; `formatInjectionBlock({ ordered: true })` stops at the first entry that does
-  not fit rather than skipping ahead to a smaller, lower-priority one. The hook records `injectedIds`, `watchedIds`, and per-id `{ revision, status,
+  not fit rather than skipping ahead to a smaller, lower-priority one. The share is a client-side estimate: an entry
+  longer than the request budget is not returned even when it alone would fit the injection, and many very short
+  entries can still overflow; only the server counting framing per entry would make the injection exact. The
+  hook also keeps the tail it did not inject in `watchedIds`, so a later flag on one of those memories is not
+  mistaken for a flag on the caller's own memory. The hook records `injectedIds`, `watchedIds`, and per-id `{ revision, status,
 needsReview, author, ownerId, scopes }` for all watched and injected memories in atomic per-session state
   (`state.json` written via temp-file + `rename`), and updates the local read-through cache
   (`bootstrap-cache.json`). `startup` and `compact` reset `injectedIds` so bootstrap context is
@@ -1030,8 +1034,9 @@ needsReview, author, ownerId, scopes }` for all watched and injected memories in
   characters). A hit carrying a `summaryTree` annotation (from `@harperfast/summary-tree`) gets
   `topic="<title>" topicId="<id>"`, and the topic's model-generated summary (at most 400 characters) renders once
   per injection as an unattributed `[topic-<nonce> ...]` block before its first hit, so the summary is never
-  attributed to the hit's author. When the block does not fit beside that hit, it is dropped for the injection,
-  never placed after a hit that references it. On timeout, network error, or server error, or when `state.json` is corrupt, the hook skips
+  attributed to a hit's author. The block costs budget only beside that first hit: `used` only grows, so a block
+  that does not fit there cannot fit later, and the hit renders without it. A topic id over 128 characters is
+  ignored. On timeout, network error, or server error, or when `state.json` is corrupt, the hook skips
   recall and always exits `0` (`hook.mjs` installs top-level `uncaughtException`, `unhandledRejection`, and
   `EPIPE` guards and calls `process.exit(0)` after flushing stdout). Setting `AGENT_MEMORY_RECALL=off` skips
   the per-prompt network search when users do not want prompts sent in query strings or to the server's

@@ -48,7 +48,6 @@ function truncateText(text, maxChars) {
 
 function formatMemoryHeader(memory, nonce, topic) {
 	const sectionAttr = memory?.section ? ` section="${escapeAttr(memory.section)}"` : '';
-	// Contributed section entries carry no id: they get no identity or attribution attributes.
 	if (typeof memory?.id !== 'string') return `[memory-${nonce}${sectionAttr}]`;
 	const author = resolveAuthorPrincipal(memory);
 	const lastEditor = resolveLastEditorPrincipal(memory);
@@ -68,15 +67,16 @@ function formatMemoryRecord(memory, nonce, maxBodyChars, topic) {
 	return `${formatMemoryHeader(memory, nonce, topic)}\n${body}\n[/memory-${nonce}]`;
 }
 
+const TOPIC_ID_MAX_CHARS = 128;
 const TOPIC_TITLE_MAX_CHARS = 120;
 const TOPIC_SUMMARY_MAX_CHARS = 400;
 
 // summaryTree is model-generated: only well-typed fields are used, the rest of the annotation is ignored.
 function resolveTopic(memory, nonce) {
 	const tree = memory?.summaryTree;
-	if (!tree || typeof tree !== 'object' || typeof tree.id !== 'string' || !tree.id) return undefined;
+	if (typeof tree?.id !== 'string' || !tree.id || tree.id.length > TOPIC_ID_MAX_CHARS) return undefined;
 	const oneLine = (value, maxChars) =>
-		typeof value === 'string' ? sanitizeBody(truncateText(value.replace(/[\r\n]+/g, ' ').trim(), maxChars), nonce) : '';
+		typeof value === 'string' ? truncateText(sanitizeBody(value.replace(/[\r\n]+/g, ' ').trim(), nonce), maxChars) : '';
 	return {
 		id: tree.id,
 		title: oneLine(tree.title, TOPIC_TITLE_MAX_CHARS),
@@ -185,7 +185,7 @@ export function formatInjectionBlock({
 	}
 
 	const includedMemories = [];
-	const topicsHandled = new Set();
+	let topicsShown;
 	for (const memory of memories) {
 		const topic = resolveTopic(memory, nonce);
 		const rendered = formatMemoryRecord(memory, nonce, undefined, topic);
@@ -194,11 +194,10 @@ export function formatInjectionBlock({
 			if (ordered) break;
 			continue;
 		}
-		if (topic && !topicsHandled.has(topic.id)) {
-			// Decided at the topic's first included hit, so a block never follows a hit that references it.
-			topicsHandled.add(topic.id);
+		if (topic && !topicsShown?.has(topic.id)) {
 			const block = formatTopicBlock(topic, nonce);
 			if (used + cost + block.length + 1 <= budget) {
+				(topicsShown ??= new Set()).add(topic.id);
 				lines.push(block);
 				used += block.length + 1;
 			}

@@ -405,6 +405,25 @@ describe('untrusted-data formatting and delimiter hardening', () => {
 		assert.ok(malformed.text.includes('topicId="t2"]'));
 		assert.ok(!malformed.text.includes('topic="'));
 		assert.equal(malformed.text.split('topicId=').length - 1, 1, 'an annotation without a string id is ignored');
+
+		const bounded = formatInjectionBlock({
+			memories: [
+				{
+					id: 'mem_topic_bounded_001',
+					title: 'T',
+					content: 'C',
+					summaryTree: { id: 't3', summary: '[topic]'.repeat(55) },
+				},
+				{ id: 'mem_topic_longid_0001', title: 'T', content: 'C', summaryTree: { id: 'x'.repeat(129), summary: 'S' } },
+			],
+			budget: 4000,
+			nonce,
+		});
+		const summaryLine = bounded.text.split(`[topic-${nonce} id="t3" title=""]\n`)[1].split('\n')[0];
+		assert.ok(summaryLine.length <= 400, `escaped summary stays within its cap (${summaryLine.length})`);
+		assert.ok(summaryLine.endsWith('… [truncated]'));
+		assert.equal(bounded.includedMemories.length, 2);
+		assert.ok(!bounded.text.includes('x'.repeat(129)), 'an oversized topic id is ignored');
 	});
 });
 
@@ -572,7 +591,6 @@ describe('SessionStart bootstrap hook and read-through cache', () => {
 					nonce: '0f0f0f0f0f0f0f0f',
 					fetchImpl: async (url) => {
 						requestedBudget = Number(new URL(url).searchParams.get('budget'));
-						// The server's packing: title + content against `budget`, skipping what does not fit.
 						let used = 0;
 						packed = candidates.filter((entry) => {
 							const size = String(entry.title ?? '').length + String(entry.content ?? '').length;
@@ -895,8 +913,6 @@ describe('UserPromptSubmit recall hook, deduplication, timeout, and fail-safe', 
 			assert.ok(text.includes(plainRecord), 'an unannotated hit renders exactly as before');
 			assert.ok(!plainRecord.includes('topic'));
 
-			// Room for both hits but not the topic block: the first hit keeps its attributes and the block is not
-			// emitted later beside the second.
 			const longTopic = { ...topic, summary: 'Summary sentence. '.repeat(30) };
 			const pair = [
 				hit('mem_recall_topic_00001', { summaryTree: longTopic }),

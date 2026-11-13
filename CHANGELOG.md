@@ -8,9 +8,11 @@ All notable changes to `@harperfast/agent-memory` are documented here. The forma
 
 ### Fixed
 
-- Claude Code plugin: session start now injects everything bootstrap returns, in the server's order, within
-  `AGENT_MEMORY_BOOTSTRAP_BUDGET`. It used to drop about 40% of the entries at the default budget, because the
-  server counts only title + content while the injection also carries the plugin's framing.
+- Claude Code plugin: session start asks the server for 60% of `AGENT_MEMORY_BOOTSTRAP_BUDGET` (after its wrapper)
+  as title + content, leaving room for its framing, and injects entries in the server's order. A typical response
+  is now injected whole; on `main` about 40% of the entries were dropped at the default budget, because the server
+  counts only title + content. An entry longer than the request budget (about 2200 characters at the default) is
+  no longer returned, and a response of many very short entries can still lose its tail.
 - Claude Code plugin: bootstrap section entries (such as summary-tree's `orientation`) render with only their
   `section`, instead of as a memory with `id="unknown"` and `author="unknown"`.
 
