@@ -222,6 +222,29 @@ export async function* scanMemories(options: ScanOptions = {}): AsyncGenerator<R
 	}
 }
 
+// One `or` query per page of ids rather than a get each. Contract: `getMemories` in src/index.ts.
+export async function getMemories(ids: readonly string[]): Promise<Record<string, unknown>[]> {
+	const wanted = [...new Set(Array.from(ids))];
+	if (!wanted.every((id) => typeof id === 'string')) throw new TypeError('getMemories: ids must be strings');
+	const Memory = memoryTable();
+	const found = new Map<string, Record<string, unknown>>();
+	for (let start = 0; start < wanted.length; start += SCAN_PAGE) {
+		const page = wanted.slice(start, start + SCAN_PAGE);
+		const rows = await collect(
+			Memory.search(
+				{
+					conditions: [anyOf(page.map((id) => ({ attribute: 'id', comparator: 'equals', value: id })))],
+					select: SCAN_FIELDS,
+					limit: page.length,
+				},
+				{ authorize: false },
+			),
+		);
+		for (const row of rows) found.set(row.id, row);
+	}
+	return wanted.map((id) => found.get(id)).filter((row) => row !== undefined);
+}
+
 function filterConditions(params: SearchParams, principal: Principal, now = new Date()): Condition[] {
 	const statuses = params.includeSuperseded ? [STATUS_ACTIVE, STATUS_SUPERSEDED] : [STATUS_ACTIVE];
 	if (params.includeWithdrawn) statuses.push(STATUS_WITHDRAWN);

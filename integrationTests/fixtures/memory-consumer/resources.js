@@ -1,5 +1,6 @@
 import {
 	canReadLabels,
+	getMemories,
 	registerBootstrapSection,
 	registerMemorySink,
 	registerSearchAnnotator,
@@ -52,8 +53,11 @@ export class ScanProbe extends Resource {
 		for await (const row of scanMemories({ after: { createdAt: rows[0].createdAt, id: rows[0].id } })) {
 			resumed.push(row.id);
 		}
+		const fetched = await getMemories([rows.at(-1).id, 'mem-absent', rows[0].id]);
 		return {
 			ids: rows.map((row) => row.id),
+			fetched: fetched.map((row) => row.id),
+			fetchedEmbedded: fetched.every((row) => row.embedding?.length > 0 && row.embeddingModel === 'default'),
 			resumed,
 			embedded: rows.every((row) => row.embedding?.length > 0 && row.embeddingModel === 'default'),
 		};

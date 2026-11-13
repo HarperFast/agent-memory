@@ -14,6 +14,7 @@ import * as plugin from '../dist/index.js';
 import { putMemory, withdrawMemory } from '../dist/lifecycle.js';
 import { resolvePrincipal as pluginResolvePrincipal } from '../dist/principal.js';
 import { MemoryMcpResource, MemoryResource } from '../dist/resource.js';
+import { domain } from '../dist/runtime.js';
 import { canReadLabels as pluginCanReadLabels } from '../dist/scopes.js';
 import { bootstrapMemories, scanMemories as pluginScanMemories } from '../dist/search.js';
 
@@ -258,6 +259,24 @@ describe('a second copy of the package', () => {
 			resumed,
 			rows.slice(1).map((row) => row.id),
 		);
+		const published = domain().runtime;
+		const forwarded = [];
+		domain().runtime = {
+			...published,
+			getMemories: (ids) => (forwarded.push(ids), published.getMemories(ids)),
+		};
+		let fetched;
+		try {
+			fetched = await copy.getMemories([id, idFor('absent')]);
+		} finally {
+			domain().runtime = published;
+		}
+		assert.deepEqual(forwarded, [[id, idFor('absent')]]);
+		assert.deepEqual(
+			fetched.map((row) => row.id),
+			[id],
+		);
+		assert.ok(Array.isArray(fetched[0].embedding));
 
 		unregisterSection();
 		unregisterAnnotator();

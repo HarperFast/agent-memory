@@ -38,7 +38,7 @@ allowlists, idempotent `PUT` create/revise with `If-Match` revision precondition
 | Customer-content flag and quarantine (`customerContentCheck` option)                                             | implemented (`src/quarantine.ts`)   |
 | Supersession backfill: candidates for an existing memory, links between existing memories, created-order cursor  | implemented (`src/lifecycle.ts`)    |
 | Package exports reaching the plugin from another app (Extension points, Across apps)                             | implemented (`src/runtime.ts`)      |
-| `scanMemories`, bootstrap sections and search annotators for derived plugins (Extension points)                  | implemented (`src/extensions.ts`)   |
+| `scanMemories`, `getMemories`, bootstrap sections and search annotators for derived plugins (Extension points)   | implemented (`src/extensions.ts`)   |
 
 ## Data model
 
@@ -68,8 +68,8 @@ database).
 - `MemoryWatch` — a principal's time-bounded interest in specific memories (live updates).
 
 See `schema/memory.graphql`. The table is not `@export`ed: every read and write goes through the
-`Memory` resource so the rules below have exactly one enforcement point. The one exception is `scanMemories`
-(Extension points), an unguarded read for trusted in-process plugins that no route reaches.
+`Memory` resource so the rules below have exactly one enforcement point. The exceptions are `scanMemories` and
+`getMemories` (Extension points), unguarded reads for trusted in-process plugins that no route reaches.
 
 Server-owned fields: `ownerId`, `status`, `revision`, `author`, `lastEditor`, `supersededBy`,
 `autoSupersedes`, `evidenceMemoryIds`, `needsReview`, `needsReviewSince`, `confirmed`, `contentFlag`,
@@ -689,6 +689,13 @@ as REST:
   store therefore stays current from a sink registered before its walk starts, compares `revision` before applying
   a scanned row over sink-driven state, and after a gap in which its sink did not run walks again from the start
   with `includeInactive`.
+- `getMemories(ids)` — a promise of the `Memory` rows with those ids, shaped as `scanMemories` yields them (stored
+  fields, `embedding` and `embeddingModel` included) and in every status, as `scanMemories({ includeInactive: true })`:
+  the caller applies eligibility. Rows follow the order of `ids`, a repeated id once, and an id with no row is left
+  out. It reads in queries of at most 100 ids (`SCAN_PAGE`), not a get per id, takes no principal and applies no
+  scope rule, like `scanMemories`. A derived plugin that re-reads members it already tracks calls it, instead of
+  keeping a second copy of memory text and vectors that withdrawal, `contentFlag` and rescoping would also have to
+  clear. A non-string id rejects with a `TypeError`.
 - `registerBootstrapSection({ name, render })` returns an unregister function. `render({ principal, q, budgetChars,
 context })` (sync or async) returns `{ text }`, an array of `{ title?, content }` items in priority order, or
   nothing. Sections render after `pinned` and `needsReview` have packed, so `budgetChars` is the budget they left;
@@ -717,11 +724,11 @@ context })` (sync or async) returns a `Map` from memory id to a JSON value, or n
 - **Contributed output is the contributor's to authorize.** Sections and annotators get the resolved principal,
   and agent-memory does not filter what they return. `canReadLabels` is the label test only: ownership, withdrawal
   and the customer-content quarantine (`contentFlag`; clearance is `superUser` or the `customer:*` read wildcard in
-  `principal.read`) are rule 1's other parts, and `scanMemories` yields flagged and private rows. Text derived from
+  `principal.read`) are rule 1's other parts, and `scanMemories` and `getMemories` yield flagged and private rows. Text derived from
   several memories is shown only to a reader of all of them, checked against the sources' current state: a
   rescope, flag or withdrawal reaches the contributor through its sink before its derived text is rebuilt, so it
   must stop serving that text then, not after the rebuild.
-- Contributors (sections, annotators, `scanMemories` callers) are trusted in-process code, as sinks are:
+- Contributors (sections, annotators, `scanMemories` and `getMemories` callers) are trusted in-process code, as sinks are:
   agent-memory contains their failures, a throw or a rejection, but does not defend against the values they
   return or the objects they are handed. They are awaited with no time bound, so a slow one delays the response.
 - `setPrincipalResolver(fn)` — see Identity.
@@ -755,13 +762,13 @@ context })` (sync or async) returns a `Map` from memory id to a JSON value, or n
     registers where the plugin dispatches, whatever order the apps load in. The last `setPrincipalResolver` from
     any app wins. The section and annotator lists are added on first use (`??=`), since an older copy may have
     created the domain object without them.
-  - `handleApplication` publishes `{ version, resolvePrincipal, canReadLabels, scanMemories }` (the plugin's own
+  - `handleApplication` publishes `{ version, resolvePrincipal, canReadLabels, scanMemories, getMemories }` (the plugin's own
     functions) once `configure()` succeeds, and never for an `isTransientValidation` scope. The exported
-    `resolvePrincipal` and `scanMemories` call it when present, else run locally. A runtime without `scanMemories`
+    `resolvePrincipal`, `scanMemories` and `getMemories` call it when present, else run locally. A runtime without `scanMemories`
     is 0.1.4 or earlier, which never renders sections or runs annotators: registering one beside it warns once
     per runtime (`warnIfOldRuntime`). A registration made before any plugin published turns the domain's `runtime`
     into an accessor whose setter runs the same check (`noteExtensionRegistered`), since an older plugin publishes
-    with a plain assignment; reads and writes of `runtime` behave as before. A scan beside an older runtime runs
+    with a plain assignment; reads and writes of `runtime` behave as before. A scan or `getMemories` beside an older runtime runs
     locally. `canReadLabels` is answered by the copy that compiled the
     principal (`compiledHere`), so a principal resolved before the plugin published keeps working. A different
     major version warns once and still delegates. The plugin's own routes call their functions directly; only

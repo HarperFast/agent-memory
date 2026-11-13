@@ -226,12 +226,14 @@ for (const moduleLoader of ['vm-current-context', 'vm']) {
 				);
 			});
 
-			test("the consumer's scanMemories reads every memory through the plugin and resumes after a row", async () => {
+			test("the consumer's scanMemories reads every memory through the plugin, resumes after a row and fetches by id", async () => {
 				const probe = await call('alice', 'GET', 'ScanProbe/');
 				strictEqual(probe.status, 200, JSON.stringify(probe.body));
 				ok(probe.body.ids.length >= 2, JSON.stringify(probe.body));
 				deepStrictEqual(probe.body.resumed, probe.body.ids.slice(1));
 				strictEqual(probe.body.embedded, true);
+				deepStrictEqual(probe.body.fetched, [probe.body.ids.at(-1), probe.body.ids[0]]);
+				strictEqual(probe.body.fetchedEmbedded, true);
 			});
 		},
 	);

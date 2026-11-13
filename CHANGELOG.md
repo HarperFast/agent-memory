@@ -11,6 +11,9 @@ All notable changes to `@harperfast/agent-memory` are documented here. The forma
 - `scanMemories({ after?, includeInactive? })` reads every memory as stored, embedding included, oldest `createdAt`
   first, for a trusted plugin building derived data (a first build, or a rebuild after it was not loaded). It
   resumes after a given row without skipping or repeating rows that share a timestamp.
+- `getMemories(ids)` reads memories by id as stored, embedding included, in every status and in the order asked, for
+  a trusted plugin that re-reads members it tracks instead of copying their text and vectors. Unknown ids are left
+  out. It reaches the running plugin from another app, like `scanMemories`.
 - `registerBootstrapSection({ name, render })` adds a section to `GET /Memory/bootstrap`, after `pinned` and
   `needsReview` and before `recent`, rendered for each caller within the budget those sections left. Its items come
   back as `memories` entries with a `section` and no `id`, so existing clients show them as stored data without a
