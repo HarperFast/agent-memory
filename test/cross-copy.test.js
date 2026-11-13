@@ -277,7 +277,6 @@ describe('a second copy of the package', () => {
 			[id],
 		);
 		assert.ok(Array.isArray(fetched[0].embedding));
-		// A runtime from 0.1.4 or earlier has no getMemories: the copy reads with its own code.
 		domain().runtime = { ...published, getMemories: undefined };
 		try {
 			assert.deepEqual(

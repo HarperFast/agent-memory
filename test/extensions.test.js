@@ -131,11 +131,11 @@ describe('getMemories', () => {
 		}
 	});
 
-	it('answers an empty list without a query, and rejects an id that is not a string', async () => {
+	it('answers an empty list without a query, and rejects ids that are not an array of strings', async () => {
 		__test.searchLog.length = 0;
 		assert.deepEqual(await getMemories([]), []);
 		assert.equal(__test.searchLog.length, 0);
-		await assert.rejects(getMemories(['mem-a', 7]), TypeError);
+		for (const ids of [['mem-a', 7], 'mem-a', 7, new Set(['mem-a'])]) await assert.rejects(getMemories(ids), TypeError);
 	});
 });
 

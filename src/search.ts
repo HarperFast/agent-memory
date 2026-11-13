@@ -222,11 +222,11 @@ export async function* scanMemories(options: ScanOptions = {}): AsyncGenerator<R
 	}
 }
 
-// A query, not a get each: it projects exactly `SCAN_FIELDS`, so a row's shape is scan's by construction.
-// Contract: `getMemories` in src/index.ts.
 export async function getMemories(ids: readonly string[]): Promise<Record<string, unknown>[]> {
-	const wanted = [...new Set(Array.from(ids))];
-	if (!wanted.every((id) => typeof id === 'string')) throw new TypeError('getMemories: ids must be strings');
+	if (!Array.isArray(ids) || !ids.every((id) => typeof id === 'string')) {
+		throw new TypeError('getMemories: ids must be an array of strings');
+	}
+	const wanted = [...new Set(ids)];
 	const Memory = memoryTable();
 	const found = new Map<string, Record<string, unknown>>();
 	for (let start = 0; start < wanted.length; start += SCAN_PAGE) {

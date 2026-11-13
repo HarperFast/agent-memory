@@ -16,7 +16,6 @@ export interface MemoryRuntime {
 	canReadLabels(principal: Principal, labels: readonly string[] | null | undefined): boolean;
 	// Absent from a runtime published by 0.1.4 or earlier, which also never renders sections or runs annotators.
 	scanMemories?(options?: ScanOptions): AsyncIterable<Record<string, unknown>>;
-	// Absent from a runtime published by 0.1.4 or earlier.
 	getMemories?(ids: readonly string[]): Promise<Record<string, unknown>[]>;
 }
 
