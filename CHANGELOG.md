@@ -6,6 +6,8 @@ All notable changes to `@harperfast/agent-memory` are documented here. The forma
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-11-12
+
 ### Added
 
 - `scanMemories({ after?, includeInactive? })` reads every memory as stored, embedding included, oldest `createdAt`
@@ -136,6 +138,7 @@ First npm release. Requires Harper 5.3.1 or later (`harper` peer dependency) on 
   `setPrincipalResolver` (map app-defined identities), and `resolvePrincipal` / `canReadLabels` (authorize
   other components with the same identity and grants).
 
+[0.1.5]: https://github.com/HarperFast/agent-memory/releases/tag/v0.1.5
 [0.1.4]: https://github.com/HarperFast/agent-memory/releases/tag/v0.1.4
 [0.1.3]: https://github.com/HarperFast/agent-memory/releases/tag/v0.1.3
 [0.1.2]: https://github.com/HarperFast/agent-memory/releases/tag/v0.1.2
