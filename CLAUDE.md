@@ -5,6 +5,6 @@ update it in the same PR when a rule changes. Follow the harper-engineering-guid
 Harper DLC for every PR.
 
 - Plugin shape mirrors `@harperfast/oauth`: `config.yaml` declares `pluginModule` + `graphqlSchema`.
-- The `Memory` table is never `@export`ed; the `Memory` resource is the only reader/writer, except `scanMemories`,
-  the unguarded read for trusted in-process plugins that no route reaches.
+- The `Memory` table is never `@export`ed; the `Memory` resource is the only reader/writer, except `scanMemories` and `getMemories`,
+  the unguarded reads for trusted in-process plugins that no route reaches.
 - Scope enforcement is pushed into queries as conditions, never applied as a post-filter on top-k.

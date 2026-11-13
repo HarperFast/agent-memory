@@ -4,7 +4,7 @@ import { resolvePrincipal as resolveHere } from './principal.ts';
 import { MEMORY_RESOURCES, MemoryMcpResource } from './resource.ts';
 import { domain, foreignRuntime, publishRuntime, type MemoryRuntime } from './runtime.ts';
 import { canReadLabels as canReadLabelsHere, compiledHere, type Principal } from './scopes.ts';
-import { scanMemories as scanHere, type ScanOptions } from './search.ts';
+import { getMemories as getHere, scanMemories as scanHere, type ScanOptions } from './search.ts';
 import { applySettings, parseSettings } from './settings.ts';
 import { PACKAGE_VERSION } from './version.ts';
 
@@ -29,6 +29,7 @@ const RUNTIME: MemoryRuntime = Object.freeze({
 	resolvePrincipal: resolveHere,
 	canReadLabels: canReadLabelsHere,
 	scanMemories: scanHere,
+	getMemories: getHere,
 });
 
 /**
@@ -67,6 +68,22 @@ export function canReadLabels(principal: Principal, labels: readonly string[] | 
 export function scanMemories(options?: ScanOptions): AsyncIterable<Record<string, unknown>> {
 	const runtime = foreignRuntime(RUNTIME);
 	return runtime?.scanMemories ? runtime.scanMemories(options) : scanHere(options);
+}
+
+/**
+ * The memories with these ids, as `scanMemories({ includeInactive: true })` yields them: every status, stored fields
+ * with `embedding` and `embeddingModel`. Rows come back in the order of `ids` (a repeated id once); ids with no row
+ * are left out. For trusted in-process code: it takes no principal and applies no scope rule. Read by the running
+ * plugin, even one in another app (DESIGN.md, Extension points).
+ */
+export function getMemories(ids: readonly string[]): Promise<Record<string, unknown>[]> {
+	let runtime: MemoryRuntime | undefined;
+	try {
+		runtime = foreignRuntime(RUNTIME);
+	} catch (error) {
+		return Promise.reject(error);
+	}
+	return runtime?.getMemories ? runtime.getMemories(ids) : getHere(ids);
 }
 
 function routePathFor(basePath: string, resource: { path: string }): string {

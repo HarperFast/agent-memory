@@ -9,7 +9,7 @@ import { loadBootstrapCache, loadSessionState } from '../claude-plugin/lib/cache
 import { resolveConfig } from '../claude-plugin/lib/config.mjs';
 import { handleSessionStart } from '../claude-plugin/lib/hooks.mjs';
 import { annotateSearchHits } from '../dist/extensions.js';
-import { registerBootstrapSection, registerSearchAnnotator, scanMemories } from '../dist/index.js';
+import { getMemories, registerBootstrapSection, registerSearchAnnotator, scanMemories } from '../dist/index.js';
 import { pinMemory, putMemory, withdrawMemory } from '../dist/lifecycle.js';
 import { MemoryBootstrapResource, MemoryMcpResource, MemoryResource } from '../dist/resource.js';
 import { domain } from '../dist/runtime.js';
@@ -47,6 +47,96 @@ beforeEach(async () => {
 afterEach(() => {
 	for (const unregister of unregisters.splice(0)) unregister();
 	logger.error = originalError;
+});
+
+describe('getMemories', () => {
+	const seedRow = (id, overrides = {}) =>
+		__test.stores.get('Memory').set(id, {
+			id,
+			title: id,
+			content: `content of ${id}`,
+			scopes: ['global', 'team:a'],
+			ownerId: 'alice',
+			status: 'active',
+			revision: 1,
+			embedding: [id.length, 1],
+			embeddingModel: 'default',
+			validUntil: null,
+			createdAt: new Date(Date.UTC(2026, 0, 1)),
+			updatedAt: new Date(Date.UTC(2026, 0, 1)),
+			...overrides,
+		});
+
+	it('returns rows in the order asked, with the vector, its model and the scopes, and leaves out unknown ids', async () => {
+		for (const id of ['mem-a', 'mem-bb', 'mem-ccc']) seedRow(id);
+		const rows = await getMemories(['mem-ccc', 'mem-missing', 'mem-a', 'mem-ccc']);
+		assert.deepEqual(
+			rows.map((row) => row.id),
+			['mem-ccc', 'mem-a'],
+		);
+		assert.deepEqual(rows[0].embedding, [7, 1]);
+		assert.equal(rows[0].embeddingModel, 'default');
+		assert.deepEqual(rows[0].scopes, ['global', 'team:a']);
+		assert.ok(rows[0].createdAt instanceof Date);
+	});
+
+	it('returns withdrawn, superseded, expired, flagged and review-pending rows', async () => {
+		seedRow('mem-withdrawn', { status: 'withdrawn' });
+		seedRow('mem-superseded', { status: 'superseded', supersededBy: idFor('next') });
+		seedRow('mem-expired', { validUntil: new Date('2020-01-01T00:00:00Z') });
+		seedRow('mem-flagged', {
+			needsReview: true,
+			contentFlag: { kind: 'possible-customer-detail', since: '2026-01-01T00:00:00.000Z', source: 'pattern' },
+		});
+		const rows = await getMemories(['mem-withdrawn', 'mem-superseded', 'mem-expired', 'mem-flagged']);
+		assert.deepEqual(
+			rows.map((row) => row.status),
+			['withdrawn', 'superseded', 'active', 'active'],
+		);
+		assert.equal(rows[3].needsReview, true);
+		assert.equal(rows[3].contentFlag.kind, 'possible-customer-detail');
+		assert.equal(rows[2].validUntil.getUTCFullYear(), 2020);
+	});
+
+	it('reads in queries of at most 100 ids, keeping the order across them', async () => {
+		const ids = Array.from({ length: 230 }, (_, i) => `mem-${String(i).padStart(4, '0')}`);
+		for (const id of ids) seedRow(id);
+		const asked = [...ids].reverse();
+		__test.searchLog.length = 0;
+		assert.deepEqual(
+			(await getMemories(asked)).map((row) => row.id),
+			asked,
+		);
+		const queries = __test.searchLog.filter((entry) => entry.table === 'Memory');
+		assert.deepEqual(
+			queries.map((entry) => entry.query.limit),
+			[100, 100, 30],
+		);
+	});
+
+	it('rejects the whole call when a later query fails, rather than returning the earlier rows', async () => {
+		const ids = Array.from({ length: 150 }, (_, i) => `mem-${String(i).padStart(4, '0')}`);
+		for (const id of ids) seedRow(id);
+		const Memory = databases.memory.Memory;
+		const search = Memory.search;
+		let calls = 0;
+		Memory.search = function (...args) {
+			if (++calls === 2) throw new Error('read failed');
+			return search.apply(this, args);
+		};
+		try {
+			await assert.rejects(getMemories(ids), /read failed/);
+		} finally {
+			Memory.search = search;
+		}
+	});
+
+	it('answers an empty list without a query, and rejects ids that are not an array of strings', async () => {
+		__test.searchLog.length = 0;
+		assert.deepEqual(await getMemories([]), []);
+		assert.equal(__test.searchLog.length, 0);
+		for (const ids of [['mem-a', 7], 'mem-a', 7, new Set(['mem-a'])]) await assert.rejects(getMemories(ids), TypeError);
+	});
 });
 
 describe('scanMemories', () => {

@@ -10,7 +10,7 @@ Shared, permissioned, live memory for agents and people, as a Harper plugin.
 - Customer-content flag: a `global` write that names a configured customer, or matches a configured host pattern, is committed but readable only by its owner and `customer:*` readers until a reviewer rescopes or confirms it; an optional model check runs after commit
 - Live updates: Level 1 real-time subscriptions on `/Memory` and `/Memory/<id>` (SSE, WebSocket) with delivery-time read checks, and Level 2 watches (`POST /Memory/watch`, `watch=true` on search/bootstrap) delivered with own `needsReview` flags on `/MemoryEvents`
 - MCP surface (`mcp: true`): `remember`, `revise`, `recall`, `get`, `withdraw`, `pin`, `unpin`, `confirm`, `confirm-scope`, `watch` tools and `memory:///{id}` resource
-- Extension points: `registerMemorySink` runs inside the lifecycle transaction for apps that mirror memories elsewhere, `setPrincipalResolver` maps app-defined identities, `resolvePrincipal` / `canReadLabels` let other components authorize with the same identity and grants, and `scanMemories`, `registerBootstrapSection` and `registerSearchAnnotator` let a plugin build derived data over memories and add it to bootstrap and search results
+- Extension points: `registerMemorySink` runs inside the lifecycle transaction for apps that mirror memories elsewhere, `setPrincipalResolver` maps app-defined identities, `resolvePrincipal` / `canReadLabels` let other components authorize with the same identity and grants, and `scanMemories`, `getMemories`, `registerBootstrapSection` and `registerSearchAnnotator` let a plugin build derived data over memories and add it to bootstrap and search results
 
 Status: v0 (0.x releases may change contracts; see [CHANGELOG.md](CHANGELOG.md)). Design and contracts:
 [DESIGN.md](DESIGN.md).
@@ -180,6 +180,7 @@ with a sink, and serves its output beside memories:
 ```js
 import {
 	canReadLabels,
+	getMemories,
 	registerBootstrapSection,
 	registerSearchAnnotator,
 	scanMemories,
@@ -188,6 +189,9 @@ import {
 // Every active, unexpired memory as stored (embedding included), oldest first. Pass the last row's
 // { createdAt, id } as `after` to resume; `includeInactive: true` also yields superseded, withdrawn and expired rows.
 for await (const memory of scanMemories({ after: savedCursor })) await index(memory);
+
+// The rows for ids you already track, in that order, in every status; ids with no row are left out.
+const members = await getMemories(cluster.memoryIds);
 
 // Packed into GET /Memory/bootstrap after pinned and needsReview, before recent, within the caller's budget.
 registerBootstrapSection({
