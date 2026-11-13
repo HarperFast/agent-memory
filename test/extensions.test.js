@@ -114,6 +114,23 @@ describe('getMemories', () => {
 		);
 	});
 
+	it('rejects the whole call when a later query fails, rather than returning the earlier rows', async () => {
+		const ids = Array.from({ length: 150 }, (_, i) => `mem-${String(i).padStart(4, '0')}`);
+		for (const id of ids) seedRow(id);
+		const Memory = databases.memory.Memory;
+		const search = Memory.search;
+		let calls = 0;
+		Memory.search = function (...args) {
+			if (++calls === 2) throw new Error('read failed');
+			return search.apply(this, args);
+		};
+		try {
+			await assert.rejects(getMemories(ids), /read failed/);
+		} finally {
+			Memory.search = search;
+		}
+	});
+
 	it('answers an empty list without a query, and rejects an id that is not a string', async () => {
 		__test.searchLog.length = 0;
 		assert.deepEqual(await getMemories([]), []);

@@ -222,7 +222,8 @@ export async function* scanMemories(options: ScanOptions = {}): AsyncGenerator<R
 	}
 }
 
-// One `or` query per page of ids rather than a get each. Contract: `getMemories` in src/index.ts.
+// A query, not a get each: it projects exactly `SCAN_FIELDS`, so a row's shape is scan's by construction.
+// Contract: `getMemories` in src/index.ts.
 export async function getMemories(ids: readonly string[]): Promise<Record<string, unknown>[]> {
 	const wanted = [...new Set(Array.from(ids))];
 	if (!wanted.every((id) => typeof id === 'string')) throw new TypeError('getMemories: ids must be strings');

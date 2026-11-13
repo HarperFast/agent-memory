@@ -695,7 +695,9 @@ as REST:
   out. It reads in queries of at most 100 ids (`SCAN_PAGE`), not a get per id, takes no principal and applies no
   scope rule, like `scanMemories`. A derived plugin that re-reads members it already tracks calls it, instead of
   keeping a second copy of memory text and vectors that withdrawal, `contentFlag` and rescoping would also have to
-  clear. A non-string id rejects with a `TypeError`.
+  clear. A non-string id rejects with a `TypeError`, and a failed read rejects the whole call, never a partial list. It reads each row as it
+  is when its query runs: rows are not a snapshot of one moment, so a plugin building output from several rows fences
+  its publication against sink invalidations and rechecks eligibility.
 - `registerBootstrapSection({ name, render })` returns an unregister function. `render({ principal, q, budgetChars,
 context })` (sync or async) returns `{ text }`, an array of `{ title?, content }` items in priority order, or
   nothing. Sections render after `pinned` and `needsReview` have packed, so `budgetChars` is the budget they left;
