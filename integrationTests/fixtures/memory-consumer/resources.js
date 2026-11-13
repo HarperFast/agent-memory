@@ -45,6 +45,25 @@ registerSearchAnnotator({
 		new Map(hits.map((hit) => [hit.id, { by: principal.id, readable: canReadLabels(principal, hit.scopes) }])),
 });
 
+// The shape @harperfast/summary-tree annotates hits with, for the Claude Code plugin's recall rendering.
+registerSearchAnnotator({
+	name: 'summaryTree',
+	annotate: ({ hits }) =>
+		new Map(
+			hits.map((hit) => [
+				hit.id,
+				{
+					id: 'topic-shorebirds',
+					title: 'Shorebirds',
+					summary: 'Roosting and probing notes.',
+					level: 1,
+					memberCount: 2,
+					parentId: null,
+				},
+			]),
+		),
+});
+
 export class ScanProbe extends Resource {
 	static async get() {
 		const rows = [];

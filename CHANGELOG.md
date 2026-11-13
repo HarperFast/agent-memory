@@ -6,6 +6,19 @@ All notable changes to `@harperfast/agent-memory` are documented here. The forma
 
 ## [Unreleased]
 
+### Fixed
+
+- Claude Code plugin: session start now injects everything bootstrap returns, in the server's order, within
+  `AGENT_MEMORY_BOOTSTRAP_BUDGET`. It used to drop about 40% of the entries at the default budget, because the
+  server counts only title + content while the injection also carries the plugin's framing.
+- Claude Code plugin: bootstrap section entries (such as summary-tree's `orientation`) render with only their
+  `section`, instead of as a memory with `id="unknown"` and `author="unknown"`.
+
+### Added
+
+- Claude Code plugin: recall hits carrying a `summaryTree` annotation show their topic (`topic`, `topicId`) and the
+  topic's summary once per injection, sanitized like memory bodies.
+
 ## [0.1.5] - 2026-11-12
 
 ### Added

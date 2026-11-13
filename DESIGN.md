@@ -708,8 +708,8 @@ context })` (sync or async) returns `{ text }`, an array of `{ title?, content }
   `memories` that agent-memory builds as exactly `{ title, content, section: <name> }`. Clients frame it as stored
   data like any memory. It carries no `id`, so clients never watch, cache or deduplicate it as a memory and
   `watch=true` watches memory ids only; and no `author`, `scopes` or `revision`, so contributed text cannot borrow
-  a principal's attribution. A client that charges framing per entry (the Claude Code plugin does) can omit an
-  item that filled `budgetChars`; several smaller items in priority order lose only their tail. A section that
+  a principal's attribution. A client that charges framing per entry (the Claude Code plugin does) asks for a
+  budget net of its framing; an entry it still cannot fit takes only the entries after it. A section that
   throws, rejects, or returns anything else is omitted and logged at most once a minute per name; bootstrap still
   answers. `name` matches `^[A-Za-z][A-Za-z0-9_-]{0,63}$`, is not a built-in section, and is unique in the domain;
   otherwise registration throws a `TypeError`. Bootstrap has no MCP tool.
@@ -1002,10 +1002,12 @@ detection into a one-off, reviewed cleanup of history that arrived without its l
     before `SessionStart` hooks run. When `AGENT_MEMORY_URL` is found only in `~/.config/agent-memory/env`,
     `SessionStart` injects a configuration notice reminding the user to export it in their shell or settings.
 - **Bootstrap hook (`SessionStart`: `startup`, `resume`, `compact`)**: calls
-  `GET /Memory/bootstrap?budget=<chars>&watch=true` (default budget `4000` characters via
-  `AGENT_MEMORY_BOOTSTRAP_BUDGET`, timeout `3000` ms via `AGENT_MEMORY_BOOTSTRAP_TIMEOUT_MS`), formats
-  returned memories within the character budget (counting wrapper overhead and skipping oversized records to
-  continue checking smaller ones), records `injectedIds`, `watchedIds`, and per-id `{ revision, status,
+  `GET /Memory/bootstrap?budget=<chars>&watch=true` (injection budget `4000` characters via
+  `AGENT_MEMORY_BOOTSTRAP_BUDGET`, timeout `3000` ms via `AGENT_MEMORY_BOOTSTRAP_TIMEOUT_MS`), and the injection is an in-order prefix of the response within that
+  budget. The server's `budget` counts title + content only, so the hook requests `bootstrapRequestBudget`: 60% of
+  the budget left after its wrapper and banners, since title + content measured ~64% of a rendered memory entry.
+  Typical responses then fit whole; `formatInjectionBlock({ ordered: true })` stops at the first entry that does
+  not fit rather than skipping ahead to a smaller, lower-priority one. The hook records `injectedIds`, `watchedIds`, and per-id `{ revision, status,
 needsReview, author, ownerId, scopes }` for all watched and injected memories in atomic per-session state
   (`state.json` written via temp-file + `rename`), and updates the local read-through cache
   (`bootstrap-cache.json`). `startup` and `compact` reset `injectedIds` so bootstrap context is
@@ -1025,7 +1027,11 @@ needsReview, author, ownerId, scopes }` for all watched and injected memories in
   `AbortSignal` deadline (default `1500` ms via `AGENT_MEMORY_RECALL_TIMEOUT_MS`, clamped to `<= 2000` ms and
   backed by a `3` s command timeout in `hooks.json`). Only active (`status === 'active'`) memories not yet in
   `state.injectedIds` are injected as recalled records within `AGENT_MEMORY_RECALL_BUDGET` (default `2000`
-  characters). On timeout, network error, or server error, or when `state.json` is corrupt, the hook skips
+  characters). A hit carrying a `summaryTree` annotation (from `@harperfast/summary-tree`) gets
+  `topic="<title>" topicId="<id>"`, and the topic's model-generated summary (at most 400 characters) renders once
+  per injection as an unattributed `[topic-<nonce> ...]` block before its first hit, so the summary is never
+  attributed to the hit's author. When the block does not fit beside that hit, it is dropped for the injection,
+  never placed after a hit that references it. On timeout, network error, or server error, or when `state.json` is corrupt, the hook skips
   recall and always exits `0` (`hook.mjs` installs top-level `uncaughtException`, `unhandledRejection`, and
   `EPIPE` guards and calls `process.exit(0)` after flushing stdout). Setting `AGENT_MEMORY_RECALL=off` skips
   the per-prompt network search when users do not want prompts sent in query strings or to the server's
@@ -1061,11 +1067,13 @@ needsReview, author, ownerId, scopes }` for all watched and injected memories in
     budget; any overflow notices are persisted in `state.pendingNotices` for subsequent turns.
 - **Untrusted-data injection format (`claude-plugin/lib/format.mjs`)**: every injected memory and change
   notice carries `id`, `author` (`author.principalId`, plus `lastEditor` when different), `scopes`,
-  `revision`, and `needsReview` (`"true"` or `"false"`) inside a per-call random nonced wrapper
+  `revision`, and `needsReview` (`"true"` or `"false"`); a contributed bootstrap section entry (no `id`) carries
+  only `section`, so derived text never borrows an identity or attribution. All of it sits inside a per-call random nonced wrapper
   (`<agent-memory-data-<nonce> role="stored-data" notice="...">...</agent-memory-data-<nonce>>` and
   `[memory-<nonce> ...]...[/memory-<nonce>]`). Attribute values escape quotes, brackets, angle brackets, and
   newlines, and any occurrence of the nonce or tag names in memory bodies is scrubbed so stored content
-  cannot break out of the data block or masquerade as instructions.
+  cannot break out of the data block or masquerade as instructions; `memory` and `topic` delimiters in bodies are
+  escaped whatever their nonce.
 - **Read-through offline cache (`bootstrap-cache.json`)**: stores only `pinned` (`section === 'pinned'`) and
   private (`user:*`) memories from the last successful `/Memory/bootstrap` snapshot authoritatively under
   `AGENT_MEMORY_CACHE_DIR` (`0700` dir, `0600` file, bounded by `AGENT_MEMORY_CACHE_MAX_AGE_MS`, default `24`
