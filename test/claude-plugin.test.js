@@ -424,6 +424,19 @@ describe('untrusted-data formatting and delimiter hardening', () => {
 		assert.ok(summaryLine.endsWith('… [truncated]'));
 		assert.equal(bounded.includedMemories.length, 2);
 		assert.ok(!bounded.text.includes('x'.repeat(129)), 'an oversized topic id is ignored');
+		const astral = formatInjectionBlock({
+			memories: [
+				{
+					id: 'mem_topic_astral_0001',
+					title: 'T',
+					content: 'C',
+					summaryTree: { id: 't4', summary: 'b'.repeat(386) + '𐐀'.repeat(10) },
+				},
+			],
+			budget: 4000,
+			nonce,
+		});
+		assert.ok(astral.text.isWellFormed(), 'truncation does not split a surrogate pair');
 	});
 });
 
@@ -923,7 +936,9 @@ describe('UserPromptSubmit recall hook, deduplication, timeout, and fail-safe', 
 				full.indexOf(`[topic-${nonce}`),
 				full.indexOf(`[/topic-${nonce}]`) + `[/topic-${nonce}]`.length,
 			);
-			const tight = await recall(full.length - longBlock.length, pair);
+			const shortBlock = `[topic-${nonce} id="node-7" title="Deploy pipeline" memories="12"]\nS\n[/topic-${nonce}]`;
+			pair[1] = hit('mem_recall_topic_00002', { summaryTree: { ...longTopic, summary: 'S' } });
+			const tight = await recall(full.length - longBlock.length + shortBlock.length + 1, pair);
 			const tightText = tight.hookSpecificOutput.additionalContext;
 			assert.ok(tightText.includes('id="mem_recall_topic_00001"'));
 			assert.ok(tightText.includes('id="mem_recall_topic_00002"'));

@@ -1034,8 +1034,7 @@ needsReview, author, ownerId, scopes }` for all watched and injected memories in
   characters). A hit carrying a `summaryTree` annotation (from `@harperfast/summary-tree`) gets
   `topic="<title>" topicId="<id>"`, and the topic's model-generated summary (at most 400 characters) renders once
   per injection as an unattributed `[topic-<nonce> ...]` block before its first hit, so the summary is never
-  attributed to a hit's author. The block costs budget only beside that first hit: `used` only grows, so a block
-  that does not fit there cannot fit later, and the hit renders without it. A topic id over 128 characters is
+  attributed to a hit's author. The block is placed beside that first hit or not at all in the injection, so it never follows a hit that references it. A topic id over 128 characters is
   ignored. On timeout, network error, or server error, or when `state.json` is corrupt, the hook skips
   recall and always exits `0` (`hook.mjs` installs top-level `uncaughtException`, `unhandledRejection`, and
   `EPIPE` guards and calls `process.exit(0)` after flushing stdout). Setting `AGENT_MEMORY_RECALL=off` skips

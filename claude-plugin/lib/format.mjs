@@ -43,7 +43,7 @@ export function isNeedsReview(memory) {
 function truncateText(text, maxChars) {
 	if (typeof maxChars !== 'number' || text.length <= maxChars) return text;
 	const suffix = '… [truncated]';
-	return text.slice(0, Math.max(0, maxChars - suffix.length)) + suffix;
+	return text.slice(0, Math.max(0, maxChars - suffix.length)).replace(/[\uD800-\uDBFF]$/, '') + suffix;
 }
 
 function formatMemoryHeader(memory, nonce, topic) {
@@ -185,7 +185,7 @@ export function formatInjectionBlock({
 	}
 
 	const includedMemories = [];
-	let topicsShown;
+	let topicsPlaced;
 	for (const memory of memories) {
 		const topic = resolveTopic(memory, nonce);
 		const rendered = formatMemoryRecord(memory, nonce, undefined, topic);
@@ -194,10 +194,11 @@ export function formatInjectionBlock({
 			if (ordered) break;
 			continue;
 		}
-		if (topic && !topicsShown?.has(topic.id)) {
+		if (topic && !topicsPlaced?.has(topic.id)) {
+			// Placed at the topic's first included hit or not at all, so a block never follows a hit that references it.
+			(topicsPlaced ??= new Set()).add(topic.id);
 			const block = formatTopicBlock(topic, nonce);
 			if (used + cost + block.length + 1 <= budget) {
-				(topicsShown ??= new Set()).add(topic.id);
 				lines.push(block);
 				used += block.length + 1;
 			}
