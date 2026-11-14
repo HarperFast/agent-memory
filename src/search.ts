@@ -518,7 +518,6 @@ export interface BootstrapParams {
 	q?: string;
 	budget: number;
 	entryOverhead?: number;
-	/** Separate because a client frames a contributed item without a memory's provenance attributes. */
 	sectionItemOverhead?: number;
 	watch?: boolean;
 }

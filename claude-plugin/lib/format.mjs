@@ -16,9 +16,7 @@ export function escapeAttr(value) {
 export function sanitizeBody(value, nonce) {
 	return String(value ?? '')
 		.replaceAll(nonce, '[redacted-nonce]')
-		.replace(/<\/?\s*agent-memory-data[^>]*>/gi, '[escaped-agent-memory-tag]')
-		.replace(/\[\/?\s*memory\b[^\]]*\]/gi, '[escaped-memory-delimiter]')
-		.replace(/\[\/?\s*topic\b[^\]]*\]/gi, '[escaped-topic-delimiter]')
+		.replace(/<\s*\/?\s*agent-memory-data/gi, '[escaped-agent-memory-tag]')
 		.replace(/\[\s*\/?\s*(memory|topic)\b/gi, (_, name) => `[escaped-${name.toLowerCase()}-delimiter]`);
 }
 
@@ -43,9 +41,13 @@ export function isNeedsReview(memory) {
 
 function truncateText(text, maxChars) {
 	if (typeof maxChars !== 'number' || text.length <= maxChars) return text;
-	// No `]`: it could close a `[memory` or `[topic` that sanitizing left alone because it was unclosed.
+	// A cut must not leave a bare `[word` (`[topical` → `[topic`) or add a `]`: either could form a delimiter.
 	const suffix = '… (truncated)';
-	return text.slice(0, Math.max(0, maxChars - suffix.length)).replace(/[\uD800-\uDBFF]$/, '') + suffix;
+	const kept = text
+		.slice(0, Math.max(0, maxChars - suffix.length))
+		.replace(/[\uD800-\uDBFF]$/, '')
+		.replace(/\[\s*\/?\s*\w*$/, '');
+	return kept + suffix;
 }
 
 function formatMemoryHeader(memory, nonce, topic) {
@@ -73,7 +75,6 @@ const TOPIC_ID_MAX_CHARS = 128;
 const TOPIC_TITLE_MAX_CHARS = 120;
 const TOPIC_SUMMARY_MAX_CHARS = 400;
 
-// summaryTree is model-generated: only well-typed fields are used.
 function resolveTopic(memory, nonce) {
 	const tree = memory?.summaryTree;
 	if (typeof tree?.id !== 'string' || !tree.id || tree.id.length > TOPIC_ID_MAX_CHARS) return undefined;
@@ -122,8 +123,6 @@ function formatBanner(banner, nonce) {
 
 const SAMPLE_NONCE = '0'.repeat(16);
 
-// The metadata sizes the overhead covers; memory ids are URL-safe, so never escaped. Larger entries fall back to the
-// ordered prefix.
 const FRAMING_SAMPLE = {
 	id: 'i'.repeat(64),
 	author: { principalId: 'a'.repeat(32) },

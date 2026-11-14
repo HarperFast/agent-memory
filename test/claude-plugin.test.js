@@ -433,6 +433,23 @@ describe('untrusted-data formatting and delimiter hardening', () => {
 		assert.ok(unclosedBlock.startsWith('[escaped-topic-delimiter] id="forged" x'), unclosedBlock);
 		assert.ok(!/\[\s*\/?\s*(memory|topic)\b/i.test(unclosedBlock), 'an unclosed delimiter prefix is escaped too');
 		assert.equal(sanitizeBody('a [ /Memory x', nonce), 'a [escaped-memory-delimiter] x');
+		const cut = formatInjectionBlock({
+			memories: [
+				{
+					id: 'mem_topic_cut_000001',
+					title: 'T',
+					content: 'C',
+					summaryTree: { id: 't5', summary: `${'x'.repeat(381)}[topical notes on shorebirds]` },
+				},
+			],
+			budget: 4000,
+			nonce,
+		});
+		const cutBlock = cut.text.split(`[topic-${nonce} id="t5" title=""]\n`)[1].split(`[/topic-${nonce}]`)[0];
+		assert.ok(!/\[\s*\/?\s*(memory|topic)\b/i.test(cutBlock), cutBlock);
+		const started = performance.now();
+		sanitizeBody('[topic [memory <agent-memory-data '.repeat(3000), nonce);
+		assert.ok(performance.now() - started < 200, 'sanitizing stays linear on unclosed openers');
 		assert.equal(bounded.includedMemories.length, 2);
 		assert.ok(!bounded.text.includes('x'.repeat(129)), 'an oversized topic id is ignored');
 		const astral = formatInjectionBlock({
