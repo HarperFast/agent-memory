@@ -450,6 +450,11 @@ describe('untrusted-data formatting and delimiter hardening', () => {
 		const started = performance.now();
 		sanitizeBody('[topic [memory <agent-memory-data '.repeat(3000), nonce);
 		sanitizeBody(`[${' '.repeat(50_000)}<${' '.repeat(50_000)}`, nonce);
+		formatInjectionBlock({
+			memories: [{ id: 'mem_whitespace_run_01', content: `[${' '.repeat(35_000)}!${'x'.repeat(20_000)}` }],
+			budget: 50_000,
+			nonce,
+		});
 		assert.ok(performance.now() - started < 200, 'sanitizing stays linear on unclosed openers');
 		assert.equal(bounded.includedMemories.length, 2);
 		assert.ok(!bounded.text.includes('x'.repeat(129)), 'an oversized topic id is ignored');

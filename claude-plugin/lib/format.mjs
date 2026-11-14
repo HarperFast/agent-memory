@@ -46,7 +46,7 @@ function truncateText(text, maxChars) {
 	const kept = text
 		.slice(0, Math.max(0, maxChars - suffix.length))
 		.replace(/[\uD800-\uDBFF]$/, '')
-		.replace(/\[\s*\/?\s*\w*$/, '');
+		.replace(/\[\s*(?:\/\s*)?\w*$/, '');
 	return kept + suffix;
 }
 
