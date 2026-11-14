@@ -16,8 +16,8 @@ export function escapeAttr(value) {
 export function sanitizeBody(value, nonce) {
 	return String(value ?? '')
 		.replaceAll(nonce, '[redacted-nonce]')
-		.replace(/<\s*\/?\s*agent-memory-data/gi, '[escaped-agent-memory-tag]')
-		.replace(/\[\s*\/?\s*(memory|topic)\b/gi, (_, name) => `[escaped-${name.toLowerCase()}-delimiter]`);
+		.replace(/<\s*(?:\/\s*)?agent-memory-data/gi, '[escaped-agent-memory-tag]')
+		.replace(/\[\s*(?:\/\s*)?(memory|topic)\b/gi, (_, name) => `[escaped-${name.toLowerCase()}-delimiter]`);
 }
 
 export function resolveAuthorPrincipal(memory) {
