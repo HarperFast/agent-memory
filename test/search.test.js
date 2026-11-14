@@ -135,17 +135,43 @@ describe('parseSearchParams', () => {
 		}
 	});
 
-	it('bounds the bootstrap budget and validates watch', () => {
-		assert.deepEqual(parseBootstrapParams(new URLSearchParams('')), { q: undefined, budget: 8000, watch: false });
+	it('bounds the bootstrap budget and entry overhead, and validates watch', () => {
+		assert.deepEqual(parseBootstrapParams(new URLSearchParams('')), {
+			q: undefined,
+			budget: 8000,
+			entryOverhead: 0,
+			sectionItemOverhead: 0,
+			watch: false,
+		});
 		assert.deepEqual(parseBootstrapParams(new URLSearchParams('watch=true')), {
 			q: undefined,
 			budget: 8000,
+			entryOverhead: 0,
+			sectionItemOverhead: 0,
 			watch: true,
 		});
-		assert.throws(
-			() => parseBootstrapParams(new URLSearchParams('budget=100001')),
-			(error) => error.statusCode === 400,
+		assert.equal(parseBootstrapParams(new URLSearchParams('entryOverhead=0')).entryOverhead, 0);
+		assert.equal(parseBootstrapParams(new URLSearchParams('entryOverhead=10000')).entryOverhead, 10_000);
+		assert.equal(parseBootstrapParams(new URLSearchParams('entryOverhead=300')).sectionItemOverhead, 300);
+		assert.equal(
+			parseBootstrapParams(new URLSearchParams('entryOverhead=300&sectionItemOverhead=0')).sectionItemOverhead,
+			0,
 		);
+		for (const bad of [
+			'budget=100001',
+			'budget=0',
+			'entryOverhead=-1',
+			'entryOverhead=10001',
+			'entryOverhead=1.5',
+			'sectionItemOverhead=10001',
+			'entryOverhead=300&sectionItemOverhead=%20',
+		]) {
+			assert.throws(
+				() => parseBootstrapParams(new URLSearchParams(bad)),
+				(error) => error.statusCode === 400,
+				bad,
+			);
+		}
 		assert.throws(
 			() => parseBootstrapParams(new URLSearchParams('watch=1')),
 			(error) => error.statusCode === 400,
@@ -743,6 +769,32 @@ describe('bootstrapMemories', () => {
 		);
 		assert.ok(!result.memories.some((memory) => memory.id === large.id));
 		assert.ok(result.used <= 200);
+	});
+
+	it('charges entryOverhead to every packed memory', async () => {
+		const pin = await create(root, 'pin', { content: 'p'.repeat(100), visibility: 'shared' });
+		await pinMemory(pin.id, {}, alice, context);
+		const mine = await create(alice, 'mine', { content: 'm'.repeat(100) });
+		const pinSize = 'pin'.length + 100;
+		const mineSize = 'mine'.length + 100;
+
+		const both = await bootstrapMemories({ budget: pinSize + mineSize + 100, entryOverhead: 50 }, alice, context);
+		assert.deepEqual(
+			both.memories.map((memory) => memory.id),
+			[pin.id, mine.id],
+		);
+		assert.equal(both.used, pinSize + mineSize + 100);
+
+		const oneShort = await bootstrapMemories({ budget: pinSize + mineSize + 99, entryOverhead: 50 }, alice, context);
+		assert.deepEqual(
+			oneShort.memories.map((memory) => memory.id),
+			[pin.id],
+		);
+		assert.equal(oneShort.used, pinSize + 50);
+
+		const uncharged = await bootstrapMemories({ budget: pinSize + mineSize }, alice, context);
+		assert.equal(uncharged.memories.length, 2);
+		assert.equal(uncharged.used, pinSize + mineSize);
 	});
 
 	it('isolates pins per reader and excludes expired memories from every bootstrap section', async () => {

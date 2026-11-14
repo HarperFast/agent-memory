@@ -6,6 +6,28 @@ All notable changes to `@harperfast/agent-memory` are documented here. The forma
 
 ## [Unreleased]
 
+### Fixed
+
+- Claude Code plugin: session start injects every entry the server packed, in the server's order, within
+  `AGENT_MEMORY_BOOTSTRAP_BUDGET`, for entries whose metadata is within its framing estimate. It sends that estimate
+  as `entryOverhead` and `sectionItemOverhead`, so the server packs only what fits; before, about 40% of the entries were dropped at the default budget, because
+  the server counted only title + content. A long pin that fits the budget is injected and kept in the offline cache
+  ([#52](https://github.com/HarperFast/agent-memory/issues/52)), unless it comes within about 100 characters of the
+  budget. Against a server without these parameters, or for an entry with larger metadata, the plugin injects an
+  in-order prefix of the response within the budget.
+- Claude Code plugin: bootstrap section entries (such as summary-tree's `orientation`) render with only their
+  `section`, instead of as a memory with `id="unknown"` and `author="unknown"`.
+
+### Added
+
+- `GET /Memory/bootstrap?entryOverhead=&sectionItemOverhead=`: characters a client adds around each memory and each
+  contributed section item it renders (`0..10000`, default `0`; `sectionItemOverhead` defaults to `entryOverhead`).
+  Each packed entry is charged title + content + its overhead, so a client that frames entries can ask for its exact
+  injection budget. `used` includes the charge. Bootstrap sections receive `itemOverheadChars`, and `budgetChars` is
+  now the room for one item, net of that overhead (unchanged when it is `0`).
+- Claude Code plugin: recall hits carrying a `summaryTree` annotation show their topic (`topic`, `topicId`) and the
+  topic's summary once per injection, sanitized like memory bodies.
+
 ## [0.1.5] - 2026-11-12
 
 ### Added

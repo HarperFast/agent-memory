@@ -317,6 +317,7 @@ describe('registerBootstrapSection', () => {
 		const headChars = ['guide', 'pinned guide', 'citer', 'my conclusion'].join('').length;
 		assert.equal(calls.length, 1);
 		assert.equal(calls[0].budgetChars, 8000 - headChars);
+		assert.equal(calls[0].itemOverheadChars, 0);
 		assert.equal(calls[0].principal, alice);
 		assert.equal(calls[0].q, 'tapir');
 		assert.equal(calls[0].context, context);
@@ -345,6 +346,49 @@ describe('registerBootstrapSection', () => {
 		const over = await bootstrapMemories({ q: 'tapir', budget: 100 }, alice, context);
 		assert.ok(!over.memories.some((entry) => entry.section === 'orientation'));
 		assert.ok(over.used <= 100);
+	});
+
+	it('charges sectionItemOverhead per section item and tells a section the room for one item', async () => {
+		await setUp();
+		const calls = [];
+		register(registerBootstrapSection, {
+			name: 'orientation',
+			render: (input) => {
+				calls.push(input);
+				return { text: 'o'.repeat(input.budgetChars) };
+			},
+		});
+		const headChars = ['guide', 'pinned guide', 'citer', 'my conclusion'].join('').length;
+		const single = await bootstrapMemories(
+			{ q: 'tapir', budget: 500, entryOverhead: 40, sectionItemOverhead: 25 },
+			alice,
+			context,
+		);
+		assert.equal(calls[0].itemOverheadChars, 25);
+		assert.equal(calls[0].budgetChars, 500 - headChars - 2 * 40 - 25);
+		assert.deepEqual(
+			single.memories.map((entry) => entry.section),
+			['pinned', 'needsReview', 'orientation'],
+		);
+		assert.equal(single.used, 500);
+
+		unregisters.pop()();
+		register(registerBootstrapSection, {
+			name: 'orientation',
+			render: ({ budgetChars, itemOverheadChars }) => {
+				calls.push({ itemOverheadChars });
+				const half = Math.floor((budgetChars - itemOverheadChars) / 2);
+				return [{ content: 'a'.repeat(half) }, { content: 'b'.repeat(half) }, { content: 'c' }];
+			},
+		});
+		const several = await bootstrapMemories({ q: 'tapir', budget: 500, entryOverhead: 40 }, alice, context);
+		assert.equal(calls[1].itemOverheadChars, 40, 'sectionItemOverhead defaults to entryOverhead');
+		const contributed = several.memories.filter((entry) => entry.section === 'orientation');
+		assert.deepEqual(
+			contributed.map((entry) => entry.content[0]),
+			['a', 'b'],
+		);
+		assert.ok(several.used <= 500);
 	});
 
 	it('omits a section that throws, rejects or returns another shape, logging each at most once a minute', async () => {

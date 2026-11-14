@@ -13,7 +13,7 @@ import {
 } from './cache.mjs';
 import { QUERY_MAX_CHARS, resolveConfig } from './config.mjs';
 import { ensureFollowerRunning } from './follower.mjs';
-import { formatInjectionBlock, isNeedsReview, resolveAuthorPrincipal } from './format.mjs';
+import { bootstrapRequest, formatInjectionBlock, isNeedsReview, resolveAuthorPrincipal } from './format.mjs';
 
 const VALID_BOOTSTRAP_SOURCES = new Set(['startup', 'resume', 'compact']);
 const NOTICE_EVENT_KINDS = new Set(['superseded', 'revised', 'withdrawn', 'flagged']);
@@ -258,7 +258,8 @@ export async function handleSessionStart(input = {}, options = {}) {
 		banners.push('~/.config/agent-memory/env is group- or world-readable; run chmod 600 ~/.config/agent-memory/env.');
 	}
 
-	const url = `${config.baseUrl}/Memory/bootstrap?budget=${encodeURIComponent(config.bootstrapBudget)}&watch=true`;
+	const request = bootstrapRequest(config.bootstrapBudget, banners);
+	const url = `${config.baseUrl}/Memory/bootstrap?budget=${request.budget}&entryOverhead=${request.entryOverhead}&sectionItemOverhead=${request.sectionItemOverhead}&watch=true`;
 	let response;
 	try {
 		response = await fetchImpl(url, {
@@ -304,6 +305,7 @@ export async function handleSessionStart(input = {}, options = {}) {
 				banners,
 				budget: config.bootstrapBudget,
 				nonce: options.nonce,
+				ordered: true,
 			});
 			recordMemoriesInState(state, memories, formatted.includedMemories);
 			saveSessionState(config, sessionId, state);

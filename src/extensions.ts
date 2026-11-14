@@ -11,7 +11,10 @@ export interface BootstrapItem {
 export interface BootstrapRenderInput {
 	readonly principal: Principal;
 	readonly q: string | undefined;
+	/** Title + content room for one item: the budget left, net of one item's overhead. */
 	readonly budgetChars: number;
+	/** Charged per item on top of its title + content; a section returning several items spends it for each beyond the first. */
+	readonly itemOverheadChars: number;
 	readonly context: object;
 }
 

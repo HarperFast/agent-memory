@@ -2,11 +2,14 @@
 // node_modules, so memory-consumer's import is a different module instance from the plugin memory-service runs.
 import { suite, test, before, after } from 'node:test';
 import { deepStrictEqual, notStrictEqual, ok, strictEqual } from 'node:assert/strict';
-import { cp, mkdtemp } from 'node:fs/promises';
+import { cp, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { createRequire } from 'node:module';
 import { startHarper, teardownHarper, type ContextWithHarper } from '@harperfast/integration-testing';
+import { resolveConfig } from '../claude-plugin/lib/config.mjs';
+import { handleSessionStart, handleUserPromptSubmit } from '../claude-plugin/lib/hooks.mjs';
+import { loadBootstrapCache, loadSessionState } from '../claude-plugin/lib/cache.mjs';
 
 const require = createRequire(import.meta.url);
 const PASSWORD = 'Memory-test-1!';
@@ -224,6 +227,92 @@ for (const moduleLoader of ['vm-current-context', 'vm']) {
 					listed.body.memories.every((memory: any) => !('consumerNote' in memory)),
 					'a listing is not annotated',
 				);
+			});
+
+			test('the Claude Code plugin hooks render the section without identity and the summaryTree topic with its hit', async () => {
+				const id = memId(`plugin-${moduleLoader}`);
+				const created = await call('alice', 'PUT', `Memory/${id}`, {
+					title: 'x',
+					content: 'dunlin roosting',
+					visibility: 'shared',
+				});
+				strictEqual(created.status, 201, JSON.stringify(created.body));
+				const cacheDir = await mkdtemp(join(tmpdir(), 'agent-memory-plugin-cross-app-'));
+				try {
+					const env = {
+						AGENT_MEMORY_URL: ctx.harper.httpURL,
+						AGENT_MEMORY_TOKEN: 'Basic ' + Buffer.from(`alice:${PASSWORD}`).toString('base64'),
+						AGENT_MEMORY_USER: 'alice',
+						AGENT_MEMORY_CACHE_DIR: cacheDir,
+					};
+					const config = resolveConfig(env);
+					const nonce = '0123456789abcdef';
+					const responses: { url: string; body: any }[] = [];
+					const fetchImpl = async (url: string, init: RequestInit) => {
+						const response = await fetch(url, init);
+						if (url.includes('/Memory/bootstrap')) responses.push({ url, body: await response.clone().json() });
+						return response;
+					};
+					const hookOptions = { config, env, spawnFollower: false, nonce, fetchImpl };
+					const bootAndCheck = async (sessionId: string) => {
+						const boot = await handleSessionStart({ session_id: sessionId, source: 'startup' }, hookOptions);
+						const text: string = boot.hookSpecificOutput?.additionalContext ?? '';
+						ok(text.length <= config.bootstrapBudget, `${text.length} chars`);
+						const { url, body } = responses.at(-1)!;
+						ok(Number(new URL(url).searchParams.get('entryOverhead')) > 0, url);
+						const memories = body.memories.filter((entry: any) => entry.id);
+						deepStrictEqual(
+							loadSessionState(config, sessionId).injectedIds,
+							memories.map((entry: any) => entry.id),
+						);
+						let at = -1;
+						for (const entry of body.memories) {
+							at = text.indexOf(`\n${entry.content}\n[/memory-${nonce}]`, at + 1);
+							ok(at !== -1, `${JSON.stringify(entry)} is injected in order`);
+						}
+						return { text, body };
+					};
+					const { text: bootText } = await bootAndCheck(`plugin-${moduleLoader}`);
+					ok(
+						new RegExp(
+							`\\[memory-${nonce} section="consumerOrientation"\\]\\nTitle: Orientation\\nfor alice within \\d+\\n`,
+						).test(bootText),
+						bootText,
+					);
+					ok(!bootText.includes('unknown'), bootText);
+
+					const recalled = await handleUserPromptSubmit(
+						{ session_id: `plugin-recall-${moduleLoader}`, prompt: 'dunlin roosting' },
+						hookOptions,
+					);
+					const recallText: string = recalled.hookSpecificOutput?.additionalContext ?? '';
+					ok(
+						recallText.includes(
+							`[topic-${nonce} id="topic-shorebirds" title="Shorebirds" memories="2"]\nRoosting and probing notes.\n[/topic-${nonce}]`,
+						),
+						recallText,
+					);
+					ok(recallText.includes(`topic="Shorebirds" topicId="topic-shorebirds"]`), recallText);
+
+					const pinId = memId(`plugin-pin-${moduleLoader}`);
+					const pinContent = 'Tag only after both module loaders pass the integration suite. '
+						.repeat(50)
+						.slice(0, 3000);
+					strictEqual(
+						(await call('alice', 'PUT', `Memory/${pinId}`, { title: 'Release rule', content: pinContent })).status,
+						201,
+					);
+					strictEqual((await call('alice', 'POST', `Memory/${pinId}/pin`, {})).status, 200);
+					try {
+						const { body } = await bootAndCheck(`plugin-pin-${moduleLoader}`);
+						strictEqual(body.memories[0]?.id, pinId);
+						ok(loadBootstrapCache(config).memories.some((entry: any) => entry.id === pinId));
+					} finally {
+						await call('alice', 'POST', `Memory/${pinId}/unpin`, {});
+					}
+				} finally {
+					await rm(cacheDir, { recursive: true, force: true });
+				}
 			});
 
 			test("the consumer's scanMemories reads every memory through the plugin, resumes after a row and fetches by id", async () => {

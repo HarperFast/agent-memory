@@ -38,7 +38,7 @@ Configure your Harper endpoint and user-bound credential:
 
 ### Optional Environment Variables
 
-- `AGENT_MEMORY_BOOTSTRAP_BUDGET`: character budget for `SessionStart` bootstrap injection (default `4000`).
+- `AGENT_MEMORY_BOOTSTRAP_BUDGET`: character budget for `SessionStart` bootstrap injection (default `4000`). The hook sends the server its per-entry framing (`entryOverhead`, `sectionItemOverhead`) so the server packs only what the injection can hold: every packed entry whose metadata is within the hook's sizing (see DESIGN.md › Bootstrap hook) is injected, in order. That needs an agent-memory server with those parameters (newer than 0.1.5). An older server ignores them, and larger metadata (a `lastEditor`, long principal ids, many scopes, escaped characters) can cost more; the injection is then an in-order prefix of the response, always within the budget.
 - `AGENT_MEMORY_BOOTSTRAP_TIMEOUT_MS`: timeout in ms for `SessionStart` bootstrap request (default `3000`).
 - `AGENT_MEMORY_RECALL_BUDGET`: character budget for `UserPromptSubmit` recall injection (default `2000`).
 - `AGENT_MEMORY_RECALL_TIMEOUT_MS`: hard timeout in ms for `UserPromptSubmit` recall request (default `1500`).

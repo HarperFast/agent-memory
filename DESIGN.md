@@ -458,7 +458,7 @@ mounted with `hidden = false` only when the plugin option `mcp` is `true` (defau
 | `GET /Memory/?…&includeWithdrawn=true`                                                  | also list withdrawn memories (`super_user` only; the response carries `includeWithdrawn: true`)                                     |
 | `GET /Memory/<id>/candidates`                                                           | older memories this one may replace (`{ candidates }`; owner or `super_user`)                                                       |
 | `POST /Memory/<id>/supersedes`                                                          | link existing memories as superseded by this one (`{ ids, revisions? }` + `If-Match`; `{ memory }`)                                 |
-| `GET /Memory/bootstrap?q=&budget=&watch=`                                               | session-start context (`watch=true` watches every returned id)                                                                      |
+| `GET /Memory/bootstrap?q=&budget=&entryOverhead=&sectionItemOverhead=&watch=`           | session-start context (`watch=true` watches every returned id)                                                                      |
 | `POST /Memory/<id>/pin` · `/unpin`                                                      | per-reader pin / unpin (empty or `{}` body)                                                                                         |
 | `POST /Memory/<id>/confirm`                                                             | owner's review: clears `needsReview`, records `confirmed` (returns `{ memory }`)                                                    |
 | `POST /Memory/<id>/confirm-scope`                                                       | customer reviewer's ruling: clears the content flag, records `scopeConfirmed` (returns `{ memory }`)                                |
@@ -561,13 +561,16 @@ true` puts `@embed`'s HNSW index on the native plane). Harper 5.3 makes a query 
   skips (and logs) vectors of another size, and rejects a query vector of another size. Search then
   serves the full-text lane alone and logs the rejection once per mismatch episode for that model. Switching dimensions needs a
   re-embedding migration, which v0 does not provide.
-- `GET /Memory/bootstrap?q=&budget=&watch=` — the caller's pinned memories (up to 50 `MemoryPin` rows for
+- `GET /Memory/bootstrap?q=&budget=&entryOverhead=&sectionItemOverhead=&watch=` — the caller's pinned memories (up to 50 `MemoryPin` rows for
   `principal.id`, newest pin first, whose target memory is active, unexpired and readable by the caller), then the caller's own
   memories that need review (section `needsReview`: up to 20 the caller may see, newest flag first,
   through the indexed `needsReviewSince`, from at most the 100 newest flags, so hidden flags cannot make a
   bootstrap scan without bound), then the sections other plugins registered (Extension points), then the caller's recent
   memories, then memories relevant to `q`, deduplicated and packed into a character budget (title +
-  content; default 8000). Expired memories (`validUntil <= now`) are excluded from every section.
+  content; default 8000). `entryOverhead` (`0..10000`, default `0`) is added to each packed memory's size and
+  `sectionItemOverhead` (same range, default `entryOverhead`) to each contributed item's, so a client that frames
+  every entry passes its framing and asks for exactly the room it renders into; `used` includes the charge. They
+  are two numbers because a contributed item carries no provenance attributes and frames smaller. Expired memories (`validUntil <= now`) are excluded from every section.
   A memory or contributed item that does not fit is skipped rather than ending the pack. Passing `watch=true` records a
   `MemoryWatch` (default 1 h TTL) for every memory id returned across all sections. Used at session start.
 - Ranking may add recency decay and retrieval/citation counts later; decay is a ranking function only,
@@ -700,16 +703,17 @@ as REST:
   is when its query runs: rows are not a snapshot of one moment, so a plugin building output from several rows fences
   its publication against sink invalidations and rechecks eligibility.
 - `registerBootstrapSection({ name, render })` returns an unregister function. `render({ principal, q, budgetChars,
-context })` (sync or async) returns `{ text }`, an array of `{ title?, content }` items in priority order, or
-  nothing. Sections render after `pinned` and `needsReview` have packed, so `budgetChars` is the budget they left;
-  sections render concurrently, so each is told the same remainder. Their items pack, in registration order,
-  between `needsReview` and `recent`, each counted like a memory (title + content) and skipped when it does not
-  fit, never truncated; `{ text }` is one item, and agent-memory measures it. A packed item is an element of
+itemOverheadChars, context })` (sync or async) returns `{ text }`, an array of `{ title?, content }` items in
+  priority order, or nothing. Sections render after `pinned` and `needsReview` have packed, so `budgetChars` is the
+  budget they left, net of one item's overhead (`itemOverheadChars`, the request's `sectionItemOverhead`): the
+  title + content room for a single item, so a one-item section that fills it fits exactly, and a section returning
+  several items spends `itemOverheadChars` more for each beyond the first. Sections render concurrently, so each is
+  told the same remainder. Their items pack, in registration order, between `needsReview` and `recent`, each
+  counted as title + content + `itemOverheadChars` and skipped when it does not fit, never truncated; `{ text }` is one item, and agent-memory measures it. A packed item is an element of
   `memories` that agent-memory builds as exactly `{ title, content, section: <name> }`. Clients frame it as stored
   data like any memory. It carries no `id`, so clients never watch, cache or deduplicate it as a memory and
   `watch=true` watches memory ids only; and no `author`, `scopes` or `revision`, so contributed text cannot borrow
-  a principal's attribution. A client that charges framing per entry (the Claude Code plugin does) can omit an
-  item that filled `budgetChars`; several smaller items in priority order lose only their tail. A section that
+  a principal's attribution. A section that
   throws, rejects, or returns anything else is omitted and logged at most once a minute per name; bootstrap still
   answers. `name` matches `^[A-Za-z][A-Za-z0-9_-]{0,63}$`, is not a built-in section, and is unique in the domain;
   otherwise registration throws a `TypeError`. Bootstrap has no MCP tool.
@@ -1002,10 +1006,23 @@ detection into a one-off, reviewed cleanup of history that arrived without its l
     before `SessionStart` hooks run. When `AGENT_MEMORY_URL` is found only in `~/.config/agent-memory/env`,
     `SessionStart` injects a configuration notice reminding the user to export it in their shell or settings.
 - **Bootstrap hook (`SessionStart`: `startup`, `resume`, `compact`)**: calls
-  `GET /Memory/bootstrap?budget=<chars>&watch=true` (default budget `4000` characters via
-  `AGENT_MEMORY_BOOTSTRAP_BUDGET`, timeout `3000` ms via `AGENT_MEMORY_BOOTSTRAP_TIMEOUT_MS`), formats
-  returned memories within the character budget (counting wrapper overhead and skipping oversized records to
-  continue checking smaller ones), records `injectedIds`, `watchedIds`, and per-id `{ revision, status,
+  `GET /Memory/bootstrap?budget=<chars>&watch=true` (injection budget `4000` characters via
+  `AGENT_MEMORY_BOOTSTRAP_BUDGET`, timeout `3000` ms via `AGENT_MEMORY_BOOTSTRAP_TIMEOUT_MS`), and the injection is an in-order prefix of the response within that
+  budget. The hook requests `budget` = its budget less the wrapper and banners, with `entryOverhead` and
+  `sectionItemOverhead` set to its own framing, computed once from `formatMemoryRecord` for an entry at stated
+  sizes: a 64-character id (the server's longest; URL-safe, so never escaped), a 32-character author and no
+  `lastEditor`, 64 characters of scopes, a 6-digit revision, the longest built-in section, a title; and for a section
+  item, a 64-character section name. Every packed entry within those sizes, whose attributes and body need no
+  escaping that lengthens them, fits, so the response is injected whole.
+  The sizes trade fill for coverage: ~310 characters per memory against ~180–220 measured on typical entries, so at
+  the boundary an entry within ~100 characters of the budget is not packed. An entry beyond them (a `lastEditor`,
+  long principal ids, many scopes, attribute values that escaping lengthens, body text that sanitizing lengthens) and a server older than these parameters,
+  which packs `budget` of title + content, both fall back to `formatInjectionBlock({ ordered: true })`: it stops at
+  the first entry that does not fit rather than skipping ahead to a smaller, lower-priority one, and a lone entry too
+  large to fit is truncated. When the budget cannot hold one entry at those sizes the hook sends no overhead. The
+  offline cache path keeps skipping ahead: the cache was packed for an earlier request, not this one. The
+  hook also keeps the tail it did not inject in `watchedIds`, so a later flag on one of those memories is not
+  mistaken for a flag on the caller's own memory. The hook records `injectedIds`, `watchedIds`, and per-id `{ revision, status,
 needsReview, author, ownerId, scopes }` for all watched and injected memories in atomic per-session state
   (`state.json` written via temp-file + `rename`), and updates the local read-through cache
   (`bootstrap-cache.json`). `startup` and `compact` reset `injectedIds` so bootstrap context is
@@ -1025,7 +1042,11 @@ needsReview, author, ownerId, scopes }` for all watched and injected memories in
   `AbortSignal` deadline (default `1500` ms via `AGENT_MEMORY_RECALL_TIMEOUT_MS`, clamped to `<= 2000` ms and
   backed by a `3` s command timeout in `hooks.json`). Only active (`status === 'active'`) memories not yet in
   `state.injectedIds` are injected as recalled records within `AGENT_MEMORY_RECALL_BUDGET` (default `2000`
-  characters). On timeout, network error, or server error, or when `state.json` is corrupt, the hook skips
+  characters). A hit carrying a `summaryTree` annotation (from `@harperfast/summary-tree`) gets
+  `topic="<title>" topicId="<id>"`, and the topic's model-generated summary (at most 400 characters) renders once
+  per injection as an unattributed `[topic-<nonce> ...]` block before its first hit, so the summary is never
+  attributed to a hit's author. The block is placed beside that first hit or not at all in the injection, so it never follows a hit that references it. A topic id over 128 characters is
+  ignored. On timeout, network error, or server error, or when `state.json` is corrupt, the hook skips
   recall and always exits `0` (`hook.mjs` installs top-level `uncaughtException`, `unhandledRejection`, and
   `EPIPE` guards and calls `process.exit(0)` after flushing stdout). Setting `AGENT_MEMORY_RECALL=off` skips
   the per-prompt network search when users do not want prompts sent in query strings or to the server's
@@ -1061,11 +1082,13 @@ needsReview, author, ownerId, scopes }` for all watched and injected memories in
     budget; any overflow notices are persisted in `state.pendingNotices` for subsequent turns.
 - **Untrusted-data injection format (`claude-plugin/lib/format.mjs`)**: every injected memory and change
   notice carries `id`, `author` (`author.principalId`, plus `lastEditor` when different), `scopes`,
-  `revision`, and `needsReview` (`"true"` or `"false"`) inside a per-call random nonced wrapper
+  `revision`, and `needsReview` (`"true"` or `"false"`); a contributed bootstrap section entry (no `id`) carries
+  only `section`, so derived text never borrows an identity or attribution. All of it sits inside a per-call random nonced wrapper
   (`<agent-memory-data-<nonce> role="stored-data" notice="...">...</agent-memory-data-<nonce>>` and
   `[memory-<nonce> ...]...[/memory-<nonce>]`). Attribute values escape quotes, brackets, angle brackets, and
   newlines, and any occurrence of the nonce or tag names in memory bodies is scrubbed so stored content
-  cannot break out of the data block or masquerade as instructions.
+  cannot break out of the data block or masquerade as instructions; `memory` and `topic` delimiters in bodies are
+  escaped whatever their nonce, closed or not.
 - **Read-through offline cache (`bootstrap-cache.json`)**: stores only `pinned` (`section === 'pinned'`) and
   private (`user:*`) memories from the last successful `/Memory/bootstrap` snapshot authoritatively under
   `AGENT_MEMORY_CACHE_DIR` (`0700` dir, `0600` file, bounded by `AGENT_MEMORY_CACHE_MAX_AGE_MS`, default `24`
