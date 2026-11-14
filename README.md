@@ -101,6 +101,8 @@ Requires Harper 5.3.1 or later within 5.x, on RocksDB (the default).
 
    curl -u carol:pass 'localhost:9926/Memory/?q=iowait&limit=5'          # hybrid search
    curl -u carol:pass 'localhost:9926/Memory/bootstrap?q=disk&budget=8000' # session-start context
+   # a client that frames each entry passes its per-entry overhead so budget bounds what it renders:
+   # 'localhost:9926/Memory/bootstrap?budget=3700&entryOverhead=300&sectionItemOverhead=140'
    curl -u carol:pass -i localhost:9926/Memory/<id>                       # read (returns ETag: "<revision>")
 
    # revise, change scopes, or withdraw: pass If-Match with the revision ETag you read
@@ -194,10 +196,14 @@ for await (const memory of scanMemories({ after: savedCursor })) await index(mem
 const members = await getMemories(cluster.memoryIds);
 
 // Packed into GET /Memory/bootstrap after pinned and needsReview, before recent, within the caller's budget.
+// budgetChars is the title + content room for one item; each further item also costs itemOverheadChars.
 registerBootstrapSection({
 	name: 'orientation',
-	render: async ({ principal, q, budgetChars, context }) =>
-		(await topicsFor(principal, budgetChars)).map((topic) => ({ title: topic.title, content: topic.summary })),
+	render: async ({ principal, q, budgetChars, itemOverheadChars, context }) =>
+		(await topicsFor(principal, budgetChars, itemOverheadChars)).map((topic) => ({
+			title: topic.title,
+			content: topic.summary,
+		})),
 });
 
 // Adds hit.summaries to GET /Memory/?q= and MCP recall results; cannot add, drop or reorder hits.

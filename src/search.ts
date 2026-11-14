@@ -33,6 +33,7 @@ export const RECENT_WRITE_SCAN = 100;
 const INDEX_LAGGING = 'DERIVED_INDEX_LAGGING';
 const BOOTSTRAP_DEFAULT_BUDGET = 8000;
 const BOOTSTRAP_MAX_BUDGET = 100_000;
+const BOOTSTRAP_MAX_ENTRY_OVERHEAD = 10_000;
 const BOOTSTRAP_RECENT_LIMIT = 50;
 const BOOTSTRAP_RELEVANT_LIMIT = 20;
 const BOOTSTRAP_REVIEW_LIMIT = 20;
@@ -96,11 +97,11 @@ function parseCursor(value: string | null): CreatedPosition | undefined {
 	return { createdAt, id };
 }
 
-function boundedInteger(value: string | null, field: string, fallback: number, max: number): number {
+function boundedInteger(value: string | null, field: string, fallback: number, max: number, min = 1): number {
 	if (value === null || value === '') return fallback;
 	const parsed = Number(value);
-	if (!Number.isInteger(parsed) || parsed < 1 || parsed > max) {
-		throw badRequest(`${field} must be an integer between 1 and ${max}`, `invalid_${field}`);
+	if (!Number.isInteger(parsed) || parsed < min || parsed > max) {
+		throw badRequest(`${field} must be an integer between ${min} and ${max}`, `invalid_${field}`);
 	}
 	return parsed;
 }
@@ -516,13 +517,32 @@ export async function searchMemories(
 export interface BootstrapParams {
 	q?: string;
 	budget: number;
+	/** Characters a client adds around each memory it renders; every packed memory is charged this much. */
+	entryOverhead?: number;
+	/** The same for a contributed section item, which a client frames without a memory's provenance. */
+	sectionItemOverhead?: number;
 	watch?: boolean;
 }
 
 export function parseBootstrapParams(params: URLSearchParams): BootstrapParams {
+	const entryOverhead = boundedInteger(
+		params.get('entryOverhead'),
+		'entryOverhead',
+		0,
+		BOOTSTRAP_MAX_ENTRY_OVERHEAD,
+		0,
+	);
 	return {
 		q: optionalQuery(params.get('q')),
 		budget: boundedInteger(params.get('budget'), 'budget', BOOTSTRAP_DEFAULT_BUDGET, BOOTSTRAP_MAX_BUDGET),
+		entryOverhead,
+		sectionItemOverhead: boundedInteger(
+			params.get('sectionItemOverhead'),
+			'sectionItemOverhead',
+			entryOverhead,
+			BOOTSTRAP_MAX_ENTRY_OVERHEAD,
+			0,
+		),
 		watch: booleanParam(params, 'watch'),
 	};
 }
@@ -601,15 +621,17 @@ export async function bootstrapMemories(params: BootstrapParams, principal: Prin
 	const seen = new Set<string>();
 	const memories: Record<string, unknown>[] = [];
 	let used = 0;
-	const fits = (title: unknown, content: unknown) => {
-		const size = String(title ?? '').length + String(content ?? '').length;
+	const entryOverhead = params.entryOverhead ?? 0;
+	const itemOverhead = params.sectionItemOverhead ?? entryOverhead;
+	const fits = (title: unknown, content: unknown, overhead: number) => {
+		const size = String(title ?? '').length + String(content ?? '').length + overhead;
 		if (used + size > params.budget) return false;
 		used += size;
 		return true;
 	};
 	const pack = (section: string, records: readonly MemoryView[]) => {
 		for (const memory of records) {
-			if (seen.has(memory.id) || !fits(memory.title, memory.content)) continue;
+			if (seen.has(memory.id) || !fits(memory.title, memory.content, entryOverhead)) continue;
 			seen.add(memory.id);
 			memories.push({ ...memory, section });
 		}
@@ -670,13 +692,14 @@ export async function bootstrapMemories(params: BootstrapParams, principal: Prin
 			const rendered = await renderBootstrapSections(sections, {
 				principal,
 				q: params.q,
-				budgetChars: params.budget - used,
+				budgetChars: Math.max(0, params.budget - used - itemOverhead),
+				itemOverheadChars: itemOverhead,
 				context,
 			});
 			for (const { name, items } of rendered) {
 				// No id: clients must not watch, cache or deduplicate contributed text as a memory.
 				for (const item of items) {
-					if (fits(item.title, item.content))
+					if (fits(item.title, item.content, itemOverhead))
 						memories.push({ title: item.title ?? null, content: item.content, section: name });
 				}
 			}

@@ -9,6 +9,7 @@ import { createRequire } from 'node:module';
 import { startHarper, teardownHarper, type ContextWithHarper } from '@harperfast/integration-testing';
 import { resolveConfig } from '../claude-plugin/lib/config.mjs';
 import { handleSessionStart, handleUserPromptSubmit } from '../claude-plugin/lib/hooks.mjs';
+import { loadBootstrapCache, loadSessionState } from '../claude-plugin/lib/cache.mjs';
 
 const require = createRequire(import.meta.url);
 const PASSWORD = 'Memory-test-1!';
@@ -246,13 +247,33 @@ for (const moduleLoader of ['vm-current-context', 'vm']) {
 					};
 					const config = resolveConfig(env);
 					const nonce = '0123456789abcdef';
-					const hookOptions = { config, env, spawnFollower: false, nonce };
-					const boot = await handleSessionStart(
-						{ session_id: `plugin-${moduleLoader}`, source: 'startup' },
-						hookOptions,
-					);
-					const bootText: string = boot.hookSpecificOutput?.additionalContext ?? '';
-					ok(bootText.length <= config.bootstrapBudget, `${bootText.length} chars`);
+					const responses: { url: string; body: any }[] = [];
+					const fetchImpl = async (url: string, init: RequestInit) => {
+						const response = await fetch(url, init);
+						if (url.includes('/Memory/bootstrap')) responses.push({ url, body: await response.clone().json() });
+						return response;
+					};
+					const hookOptions = { config, env, spawnFollower: false, nonce, fetchImpl };
+					// Every entry the server packed is injected, in order, within the configured budget.
+					const bootAndCheck = async (sessionId: string) => {
+						const boot = await handleSessionStart({ session_id: sessionId, source: 'startup' }, hookOptions);
+						const text: string = boot.hookSpecificOutput?.additionalContext ?? '';
+						ok(text.length <= config.bootstrapBudget, `${text.length} chars`);
+						const { url, body } = responses.at(-1)!;
+						ok(Number(new URL(url).searchParams.get('entryOverhead')) > 0, url);
+						const memories = body.memories.filter((entry: any) => entry.id);
+						deepStrictEqual(
+							loadSessionState(config, sessionId).injectedIds,
+							memories.map((entry: any) => entry.id),
+						);
+						let at = -1;
+						for (const entry of body.memories) {
+							at = text.indexOf(`\n${entry.content}\n[/memory-${nonce}]`, at + 1);
+							ok(at !== -1, `${JSON.stringify(entry)} is injected in order`);
+						}
+						return { text, body };
+					};
+					const { text: bootText } = await bootAndCheck(`plugin-${moduleLoader}`);
 					ok(
 						new RegExp(
 							`\\[memory-${nonce} section="consumerOrientation"\\]\\nTitle: Orientation\\nfor alice within \\d+\\n`,
@@ -273,6 +294,24 @@ for (const moduleLoader of ['vm-current-context', 'vm']) {
 						recallText,
 					);
 					ok(recallText.includes(`topic="Shorebirds" topicId="topic-shorebirds"]`), recallText);
+
+					// A pin longer than the old 60% request (~2,235 chars at the default budget) still fits: #52.
+					const pinId = memId(`plugin-pin-${moduleLoader}`);
+					const pinContent = 'Tag only after both module loaders pass the integration suite. '
+						.repeat(50)
+						.slice(0, 3000);
+					strictEqual(
+						(await call('alice', 'PUT', `Memory/${pinId}`, { title: 'Release rule', content: pinContent })).status,
+						201,
+					);
+					strictEqual((await call('alice', 'POST', `Memory/${pinId}/pin`, {})).status, 200);
+					try {
+						const { body } = await bootAndCheck(`plugin-pin-${moduleLoader}`);
+						strictEqual(body.memories[0]?.id, pinId);
+						ok(loadBootstrapCache(config).memories.some((entry: any) => entry.id === pinId));
+					} finally {
+						await call('alice', 'POST', `Memory/${pinId}/unpin`, {});
+					}
 				} finally {
 					await rm(cacheDir, { recursive: true, force: true });
 				}

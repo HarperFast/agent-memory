@@ -44,12 +44,7 @@ import {
 	runFollowerLoop,
 	tryAcquireFollowerLock,
 } from '../claude-plugin/lib/follower.mjs';
-import {
-	bootstrapRequestBudget,
-	escapeAttr,
-	formatInjectionBlock,
-	sanitizeBody,
-} from '../claude-plugin/lib/format.mjs';
+import { bootstrapRequest, escapeAttr, formatInjectionBlock, sanitizeBody } from '../claude-plugin/lib/format.mjs';
 import {
 	handleHookEvent,
 	handleSessionEnd,
@@ -440,6 +435,41 @@ describe('untrusted-data formatting and delimiter hardening', () => {
 	});
 });
 
+// Packs candidates the way GET /Memory/bootstrap does, honoring entryOverhead unless the server predates it.
+function packingServer(candidates, { honorsEntryOverhead = true } = {}) {
+	const server = { requests: [], packed: [] };
+	server.fetchImpl = async (url) => {
+		const params = new URL(url).searchParams;
+		const budget = Number(params.get('budget'));
+		const overheads = {
+			entryOverhead: Number(params.get('entryOverhead')),
+			sectionItemOverhead: Number(params.get('sectionItemOverhead')),
+		};
+		server.requests.push({ budget, ...overheads });
+		let used = 0;
+		server.packed = candidates.filter((entry) => {
+			const overhead = !honorsEntryOverhead
+				? 0
+				: entry.id === undefined
+					? overheads.sectionItemOverhead
+					: overheads.entryOverhead;
+			const size = String(entry.title ?? '').length + String(entry.content ?? '').length + overhead;
+			if (used + size > budget) return false;
+			used += size;
+			return true;
+		});
+		return new Response(JSON.stringify({ memories: server.packed, budget, used }), {
+			status: 200,
+			headers: { 'Content-Type': 'application/json' },
+		});
+	};
+	return server;
+}
+
+function positionsIn(text, entries) {
+	return entries.map((entry) => text.indexOf(entry.content.slice(0, entry.content.indexOf(' ') + 1)));
+}
+
 describe('SessionStart bootstrap hook and read-through cache', () => {
 	it('bootstraps on startup/resume/compact, falls back to stale cache when offline, and purges cache on 401', async () => {
 		const tmp = makeTempDir();
@@ -483,7 +513,12 @@ describe('SessionStart bootstrap hook and read-through cache', () => {
 					spawnFollower: false,
 					nonce: 'aaaa1111bbbb2222',
 					fetchImpl: async (url) => {
-						assert.ok(url.includes(`/Memory/bootstrap?budget=${bootstrapRequestBudget(4000)}&watch=true`));
+						const { budget, entryOverhead, sectionItemOverhead } = bootstrapRequest(4000);
+						assert.ok(
+							url.includes(
+								`/Memory/bootstrap?budget=${budget}&entryOverhead=${entryOverhead}&sectionItemOverhead=${sectionItemOverhead}&watch=true`,
+							),
+						);
 						return new Response(JSON.stringify({ memories: [pinnedMem, recentMem] }), {
 							status: 200,
 							headers: { 'Content-Type': 'application/json' },
@@ -593,36 +628,19 @@ describe('SessionStart bootstrap hook and read-through cache', () => {
 				section(300),
 				...[250, 500, 180, 220, 400, 150, 600, 120, 300, 260, 340, 90].map((size) => memory('recent', size)),
 			];
-			let requestedBudget;
-			let packed;
+			const server = packingServer(candidates);
 			const res = await handleSessionStart(
 				{ session_id: 'sess-packed', source: 'startup' },
-				{
-					config,
-					env,
-					spawnFollower: false,
-					nonce: '0f0f0f0f0f0f0f0f',
-					fetchImpl: async (url) => {
-						requestedBudget = Number(new URL(url).searchParams.get('budget'));
-						let used = 0;
-						packed = candidates.filter((entry) => {
-							const size = String(entry.title ?? '').length + String(entry.content ?? '').length;
-							if (used + size > requestedBudget) return false;
-							used += size;
-							return true;
-						});
-						return new Response(JSON.stringify({ memories: packed, budget: requestedBudget, used }), {
-							status: 200,
-							headers: { 'Content-Type': 'application/json' },
-						});
-					},
-				},
+				{ config, env, spawnFollower: false, nonce: '0f0f0f0f0f0f0f0f', fetchImpl: server.fetchImpl },
 			);
+			const { packed } = server;
 			const text = res.hookSpecificOutput?.additionalContext ?? '';
-			assert.ok(requestedBudget < 4000);
+			assert.deepEqual(server.requests, [bootstrapRequest(4000)]);
+			assert.ok(server.requests[0].entryOverhead > 0);
 			assert.ok(packed.length >= 6, `fixture packs a realistic response (${packed.length} entries)`);
+			assert.ok(packed.length < candidates.length, 'the fixture overflows the budget');
 			assert.ok(text.length <= 4000, `injection ${text.length} chars exceeds the configured budget`);
-			const positions = packed.map((entry) => text.indexOf(entry.content.slice(0, entry.content.indexOf(' ') + 1)));
+			const positions = positionsIn(text, packed);
 			assert.ok(
 				positions.every((pos) => pos >= 0),
 				'every packed entry is injected',
@@ -656,6 +674,143 @@ describe('SessionStart bootstrap hook and read-through cache', () => {
 				},
 			);
 			assert.ok(offline.hookSpecificOutput.additionalContext.includes('mem_cached_pin_small2'));
+		} finally {
+			rmSync(tmp, { recursive: true, force: true });
+		}
+	});
+
+	it('injects and caches a long pin that fits the configured budget (#52)', async () => {
+		const tmp = makeTempDir();
+		try {
+			const env = {
+				AGENT_MEMORY_URL: 'https://memory.example.com',
+				AGENT_MEMORY_TOKEN: 'tok',
+				AGENT_MEMORY_CACHE_DIR: tmp,
+				AGENT_MEMORY_FOLLOWER: 'off',
+			};
+			const config = resolveConfig(env);
+			const longPin = {
+				id: '11111111-2222-4333-8444-000000000001',
+				title: 'Release checklist for harper',
+				content: `#pin# ${'Run the full integration suite on both module loaders before tagging. '.repeat(50).slice(0, 3300)}`,
+				author: { principalId: 'alice' },
+				scopes: ['user:alice'],
+				revision: 3,
+				section: 'pinned',
+			};
+			const recent = {
+				id: '11111111-2222-4333-8444-000000000002',
+				title: 'Note',
+				content: '#recent# short',
+				author: { principalId: 'alice' },
+				scopes: ['user:alice'],
+				revision: 1,
+				section: 'recent',
+			};
+			const server = packingServer([longPin, recent]);
+			const res = await handleSessionStart(
+				{ session_id: 'sess-long-pin', source: 'startup' },
+				{ config, env, spawnFollower: false, fetchImpl: server.fetchImpl },
+			);
+			const text = res.hookSpecificOutput?.additionalContext ?? '';
+			assert.deepEqual(server.packed, [longPin]);
+			assert.ok(text.includes(longPin.content), 'the whole pin is injected');
+			assert.ok(text.length <= 4000);
+			assert.deepEqual(
+				loadBootstrapCache(config).memories.map((m) => m.id),
+				[longPin.id],
+			);
+		} finally {
+			rmSync(tmp, { recursive: true, force: true });
+		}
+	});
+
+	it('fits every entry the server packs whose framing is within the requested overhead', () => {
+		const { budget, entryOverhead, sectionItemOverhead } = bootstrapRequest(4000);
+		assert.ok(sectionItemOverhead < entryOverhead);
+		let seq = 0;
+		// The largest metadata the overhead covers; content sizes vary so the pack ends at different remainders.
+		const atBound = (size) => ({
+			id: `${'i'.repeat(60)}${String(++seq).padStart(4, '0')}`,
+			author: { principalId: 'a'.repeat(32) },
+			scopes: ['s'.repeat(31), 's'.repeat(32)],
+			revision: 999_999,
+			needsReview: false,
+			section: 'needsReview',
+			title: `#${seq}# title`,
+			content: 'c'.repeat(size),
+		});
+		const sectionAtBound = (size) => ({
+			section: 'n'.repeat(64),
+			title: `#${++seq}# topic`,
+			content: 'c'.repeat(size),
+		});
+		for (const sizes of [[1], [40, 1, 7], [300, 299, 298, 297, 296, 295], [budget - entryOverhead - 10]]) {
+			let used = 0;
+			const candidates = sizes.flatMap((size, i) => (i % 2 ? [sectionAtBound(size), atBound(size)] : [atBound(size)]));
+			const packed = candidates.filter((entry) => {
+				const overhead = entry.id === undefined ? sectionItemOverhead : entryOverhead;
+				const size = entry.title.length + entry.content.length + overhead;
+				if (used + size > budget) return false;
+				used += size;
+				return true;
+			});
+			const formatted = formatInjectionBlock({ memories: packed, budget: 4000, ordered: true });
+			assert.equal(formatted.includedMemories.length, packed.length, `sizes ${sizes}`);
+			assert.ok(formatted.text.length <= 4000);
+		}
+	});
+
+	it('requests no overhead when the budget cannot hold one entry at the bound', () => {
+		const { budget, entryOverhead } = bootstrapRequest(400);
+		assert.equal(entryOverhead, 0);
+		assert.equal(bootstrapRequest(400).sectionItemOverhead, 0);
+		assert.ok(budget > 0 && budget < 400);
+		assert.ok(bootstrapRequest(4000, ['a banner']).budget < bootstrapRequest(4000).budget);
+	});
+
+	it('injects an in-order prefix within budget from a server that ignores entryOverhead', async () => {
+		const tmp = makeTempDir();
+		try {
+			const env = {
+				AGENT_MEMORY_URL: 'https://memory.example.com',
+				AGENT_MEMORY_TOKEN: 'tok',
+				AGENT_MEMORY_CACHE_DIR: tmp,
+				AGENT_MEMORY_FOLLOWER: 'off',
+			};
+			const config = resolveConfig(env);
+			const candidates = Array.from({ length: 20 }, (_, i) => ({
+				id: `11111111-2222-4333-8444-${String(i + 1).padStart(12, '0')}`,
+				title: `Decision ${i + 1}`,
+				content: `#${i + 1}# ${'x'.repeat(i % 3 === 0 ? 400 : 60)}`,
+				author: { principalId: 'alice' },
+				scopes: ['user:alice'],
+				revision: 1,
+				section: 'recent',
+			}));
+			const server = packingServer(candidates, { honorsEntryOverhead: false });
+			const res = await handleSessionStart(
+				{ session_id: 'sess-old-server', source: 'startup' },
+				{ config, env, spawnFollower: false, fetchImpl: server.fetchImpl },
+			);
+			const text = res.hookSpecificOutput?.additionalContext ?? '';
+			assert.ok(text.length <= 4000);
+			const positions = positionsIn(text, server.packed);
+			const injected = positions.findIndex((pos) => pos < 0);
+			assert.ok(injected > 0 && injected < server.packed.length, 'part of the response is injected');
+			assert.ok(
+				positions.slice(injected).every((pos) => pos < 0),
+				'a prefix, never skipping ahead',
+			);
+			const state = loadSessionState(config, 'sess-old-server');
+			assert.deepEqual(
+				state.injectedIds,
+				server.packed.slice(0, injected).map((entry) => entry.id),
+			);
+			assert.deepEqual(
+				state.watchedIds,
+				server.packed.map((entry) => entry.id),
+			);
 		} finally {
 			rmSync(tmp, { recursive: true, force: true });
 		}

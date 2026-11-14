@@ -458,7 +458,7 @@ mounted with `hidden = false` only when the plugin option `mcp` is `true` (defau
 | `GET /Memory/?…&includeWithdrawn=true`                                                  | also list withdrawn memories (`super_user` only; the response carries `includeWithdrawn: true`)                                     |
 | `GET /Memory/<id>/candidates`                                                           | older memories this one may replace (`{ candidates }`; owner or `super_user`)                                                       |
 | `POST /Memory/<id>/supersedes`                                                          | link existing memories as superseded by this one (`{ ids, revisions? }` + `If-Match`; `{ memory }`)                                 |
-| `GET /Memory/bootstrap?q=&budget=&watch=`                                               | session-start context (`watch=true` watches every returned id)                                                                      |
+| `GET /Memory/bootstrap?q=&budget=&entryOverhead=&sectionItemOverhead=&watch=`           | session-start context (`watch=true` watches every returned id)                                                                      |
 | `POST /Memory/<id>/pin` · `/unpin`                                                      | per-reader pin / unpin (empty or `{}` body)                                                                                         |
 | `POST /Memory/<id>/confirm`                                                             | owner's review: clears `needsReview`, records `confirmed` (returns `{ memory }`)                                                    |
 | `POST /Memory/<id>/confirm-scope`                                                       | customer reviewer's ruling: clears the content flag, records `scopeConfirmed` (returns `{ memory }`)                                |
@@ -561,13 +561,16 @@ true` puts `@embed`'s HNSW index on the native plane). Harper 5.3 makes a query 
   skips (and logs) vectors of another size, and rejects a query vector of another size. Search then
   serves the full-text lane alone and logs the rejection once per mismatch episode for that model. Switching dimensions needs a
   re-embedding migration, which v0 does not provide.
-- `GET /Memory/bootstrap?q=&budget=&watch=` — the caller's pinned memories (up to 50 `MemoryPin` rows for
+- `GET /Memory/bootstrap?q=&budget=&entryOverhead=&sectionItemOverhead=&watch=` — the caller's pinned memories (up to 50 `MemoryPin` rows for
   `principal.id`, newest pin first, whose target memory is active, unexpired and readable by the caller), then the caller's own
   memories that need review (section `needsReview`: up to 20 the caller may see, newest flag first,
   through the indexed `needsReviewSince`, from at most the 100 newest flags, so hidden flags cannot make a
   bootstrap scan without bound), then the sections other plugins registered (Extension points), then the caller's recent
   memories, then memories relevant to `q`, deduplicated and packed into a character budget (title +
-  content; default 8000). Expired memories (`validUntil <= now`) are excluded from every section.
+  content; default 8000). `entryOverhead` (`0..10000`, default `0`) is added to each packed memory's size and
+  `sectionItemOverhead` (same range, default `entryOverhead`) to each contributed item's, so a client that frames
+  every entry passes its framing and asks for exactly the room it renders into; `used` includes the charge. They
+  are two numbers because a contributed item carries no provenance attributes and frames smaller. Expired memories (`validUntil <= now`) are excluded from every section.
   A memory or contributed item that does not fit is skipped rather than ending the pack. Passing `watch=true` records a
   `MemoryWatch` (default 1 h TTL) for every memory id returned across all sections. Used at session start.
 - Ranking may add recency decay and retrieval/citation counts later; decay is a ranking function only,
@@ -700,16 +703,17 @@ as REST:
   is when its query runs: rows are not a snapshot of one moment, so a plugin building output from several rows fences
   its publication against sink invalidations and rechecks eligibility.
 - `registerBootstrapSection({ name, render })` returns an unregister function. `render({ principal, q, budgetChars,
-context })` (sync or async) returns `{ text }`, an array of `{ title?, content }` items in priority order, or
-  nothing. Sections render after `pinned` and `needsReview` have packed, so `budgetChars` is the budget they left;
-  sections render concurrently, so each is told the same remainder. Their items pack, in registration order,
-  between `needsReview` and `recent`, each counted like a memory (title + content) and skipped when it does not
-  fit, never truncated; `{ text }` is one item, and agent-memory measures it. A packed item is an element of
+itemOverheadChars, context })` (sync or async) returns `{ text }`, an array of `{ title?, content }` items in
+  priority order, or nothing. Sections render after `pinned` and `needsReview` have packed, so `budgetChars` is the
+  budget they left, net of one item's overhead (`itemOverheadChars`, the request's `sectionItemOverhead`): the
+  title + content room for a single item, so a one-item section that fills it fits exactly, and a section returning
+  several items spends `itemOverheadChars` more for each beyond the first. Sections render concurrently, so each is
+  told the same remainder. Their items pack, in registration order, between `needsReview` and `recent`, each
+  counted as title + content + `itemOverheadChars` and skipped when it does not fit, never truncated; `{ text }` is one item, and agent-memory measures it. A packed item is an element of
   `memories` that agent-memory builds as exactly `{ title, content, section: <name> }`. Clients frame it as stored
   data like any memory. It carries no `id`, so clients never watch, cache or deduplicate it as a memory and
   `watch=true` watches memory ids only; and no `author`, `scopes` or `revision`, so contributed text cannot borrow
-  a principal's attribution. A client that charges framing per entry (the Claude Code plugin does) asks for a
-  budget net of its framing; an entry it still cannot fit takes only the entries after it. A section that
+  a principal's attribution. A section that
   throws, rejects, or returns anything else is omitted and logged at most once a minute per name; bootstrap still
   answers. `name` matches `^[A-Za-z][A-Za-z0-9_-]{0,63}$`, is not a built-in section, and is unique in the domain;
   otherwise registration throws a `TypeError`. Bootstrap has no MCP tool.
@@ -1004,13 +1008,18 @@ detection into a one-off, reviewed cleanup of history that arrived without its l
 - **Bootstrap hook (`SessionStart`: `startup`, `resume`, `compact`)**: calls
   `GET /Memory/bootstrap?budget=<chars>&watch=true` (injection budget `4000` characters via
   `AGENT_MEMORY_BOOTSTRAP_BUDGET`, timeout `3000` ms via `AGENT_MEMORY_BOOTSTRAP_TIMEOUT_MS`), and the injection is an in-order prefix of the response within that
-  budget. The server's `budget` counts title + content only, so the hook requests `bootstrapRequestBudget`: 60% of
-  the budget left after its wrapper and banners, since title + content measured ~64% of a rendered memory entry.
-  Typical responses then fit whole; `formatInjectionBlock({ ordered: true })` stops at the first entry that does
-  not fit rather than skipping ahead to a smaller, lower-priority one. The offline cache path keeps skipping
-  ahead: the cache was packed for an earlier request budget, not this one. The share is a client-side estimate: an entry
-  longer than the request budget is not returned even when it alone would fit the injection, and many very short
-  entries can still overflow; only the server counting framing per entry would make the injection exact. The
+  budget. The hook requests `budget` = its budget less the wrapper and banners, with `entryOverhead` and
+  `sectionItemOverhead` set to its own framing, computed once from `formatMemoryRecord` for an entry at stated
+  sizes: a 64-character id (the server's longest; URL-safe, so never escaped), a 32-character author and no
+  `lastEditor`, 64 characters of scopes, a 6-digit revision, the longest built-in section, a title; and for a section
+  item, a 64-character section name. Every packed entry within those sizes fits, so the response is injected whole.
+  The sizes trade fill for coverage: ~310 characters per memory against ~180–220 measured on typical entries, so at
+  the boundary an entry within ~100 characters of the budget is not packed. An entry beyond them (a `lastEditor`,
+  long principal ids, many scopes, body text that sanitizing lengthens) and a server older than these parameters,
+  which packs `budget` of title + content, both fall back to `formatInjectionBlock({ ordered: true })`: it stops at
+  the first entry that does not fit rather than skipping ahead to a smaller, lower-priority one, and a lone entry too
+  large to fit is truncated. When the budget cannot hold one entry at those sizes the hook sends no overhead. The
+  offline cache path keeps skipping ahead: the cache was packed for an earlier request, not this one. The
   hook also keeps the tail it did not inject in `watchedIds`, so a later flag on one of those memories is not
   mistaken for a flag on the caller's own memory. The hook records `injectedIds`, `watchedIds`, and per-id `{ revision, status,
 needsReview, author, ownerId, scopes }` for all watched and injected memories in atomic per-session state

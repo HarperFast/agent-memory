@@ -8,16 +8,22 @@ All notable changes to `@harperfast/agent-memory` are documented here. The forma
 
 ### Fixed
 
-- Claude Code plugin: session start asks the server for 60% of `AGENT_MEMORY_BOOTSTRAP_BUDGET` (after its wrapper)
-  as title + content, leaving room for its framing, and injects entries in the server's order. A typical response
-  is now injected whole; on `main` about 40% of the entries were dropped at the default budget, because the server
-  counts only title + content. An entry longer than the request budget (about 2200 characters at the default) is
-  no longer returned, and a response of many very short entries can still lose its tail.
+- Claude Code plugin: session start injects every entry the server packed, in the server's order, within
+  `AGENT_MEMORY_BOOTSTRAP_BUDGET`. It sends its per-entry framing as `entryOverhead` and `sectionItemOverhead`, so
+  the server packs exactly what fits; before, about 40% of the entries were dropped at the default budget, because
+  the server counted only title + content. A long pin that fits the budget is injected and kept in the offline cache
+  ([#52](https://github.com/HarperFast/agent-memory/issues/52)). Against a server without these parameters the
+  plugin injects an in-order prefix of the response within the budget.
 - Claude Code plugin: bootstrap section entries (such as summary-tree's `orientation`) render with only their
   `section`, instead of as a memory with `id="unknown"` and `author="unknown"`.
 
 ### Added
 
+- `GET /Memory/bootstrap?entryOverhead=&sectionItemOverhead=`: characters a client adds around each memory and each
+  contributed section item it renders (`0..10000`, default `0`; `sectionItemOverhead` defaults to `entryOverhead`).
+  Each packed entry is charged title + content + its overhead, so a client that frames entries can ask for its exact
+  injection budget. `used` includes the charge. Bootstrap sections receive `itemOverheadChars`, and `budgetChars` is
+  now the room for one item, net of that overhead (unchanged when it is `0`).
 - Claude Code plugin: recall hits carrying a `summaryTree` annotation show their topic (`topic`, `topicId`) and the
   topic's summary once per injection, sanitized like memory bodies.
 

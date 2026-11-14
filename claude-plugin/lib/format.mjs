@@ -118,15 +118,38 @@ function formatBanner(banner, nonce) {
 	return `[notice-${nonce}] ${sanitizeBody(banner, nonce).replace(/[\r\n]+/g, ' ')} [/notice-${nonce}]`;
 }
 
-// The server's bootstrap budget counts only title + content, measured at ~64% of a rendered memory entry (UUID id,
-// one or two scopes), so ask for 60% of what the wrapper and banners leave.
-const BOOTSTRAP_CONTENT_SHARE = 0.6;
+const SAMPLE_NONCE = '0'.repeat(16);
 
-export function bootstrapRequestBudget(budget, banners = []) {
-	const { openTag, closeTag } = wrapperTags('0'.repeat(16));
+// Per-entry framing for an entry within these sizes: the server's longest memory id (URL-safe, so never escaped), a
+// 32-character author, 64 characters of scopes, the longest built-in section. Larger entries fall back to the
+// ordered prefix.
+const FRAMING_SAMPLE = {
+	id: 'i'.repeat(64),
+	author: { principalId: 'a'.repeat(32) },
+	scopes: ['s'.repeat(31), 's'.repeat(32)],
+	revision: 999_999,
+	needsReview: false,
+	section: 'needsReview',
+	title: 'T',
+	content: 'C',
+};
+// A contributed section item carries only its section name, at most 64 characters.
+const SECTION_FRAMING_SAMPLE = { section: 'n'.repeat(64), title: 'T', content: 'C' };
+let overheads;
+
+function framingOf(sample) {
+	return formatMemoryRecord(sample, SAMPLE_NONCE).length + 1 - sample.title.length - sample.content.length;
+}
+
+/** The bootstrap query that makes every entry the server packs fit the injection. */
+export function bootstrapRequest(budget, banners = []) {
+	const { openTag, closeTag } = wrapperTags(SAMPLE_NONCE);
 	let framing = openTag.length + closeTag.length + 2;
-	for (const banner of banners) framing += formatBanner(banner, '0'.repeat(16)).length + 1;
-	return Math.max(1, Math.floor((budget - framing) * BOOTSTRAP_CONTENT_SHARE));
+	for (const banner of banners) framing += formatBanner(banner, SAMPLE_NONCE).length + 1;
+	const contentBudget = Math.max(1, budget - framing);
+	overheads ??= { entry: framingOf(FRAMING_SAMPLE), sectionItem: framingOf(SECTION_FRAMING_SAMPLE) };
+	if (contentBudget <= overheads.entry) return { budget: contentBudget, entryOverhead: 0, sectionItemOverhead: 0 };
+	return { budget: contentBudget, entryOverhead: overheads.entry, sectionItemOverhead: overheads.sectionItem };
 }
 
 export function formatInjectionBlock({
