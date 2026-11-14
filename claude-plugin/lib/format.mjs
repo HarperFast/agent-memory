@@ -42,7 +42,8 @@ export function isNeedsReview(memory) {
 
 function truncateText(text, maxChars) {
 	if (typeof maxChars !== 'number' || text.length <= maxChars) return text;
-	const suffix = '… [truncated]';
+	// No `]`: it could close a `[memory` or `[topic` that sanitizing left alone because it was unclosed.
+	const suffix = '… (truncated)';
 	return text.slice(0, Math.max(0, maxChars - suffix.length)).replace(/[\uD800-\uDBFF]$/, '') + suffix;
 }
 
@@ -120,8 +121,7 @@ function formatBanner(banner, nonce) {
 
 const SAMPLE_NONCE = '0'.repeat(16);
 
-// Per-entry framing for an entry within these sizes: the server's longest memory id (URL-safe, so never escaped), a
-// 32-character author, 64 characters of scopes, the longest built-in section. Larger entries fall back to the
+// The metadata sizes the overhead covers; memory ids are URL-safe, so never escaped. Larger entries fall back to the
 // ordered prefix.
 const FRAMING_SAMPLE = {
 	id: 'i'.repeat(64),
@@ -133,7 +133,6 @@ const FRAMING_SAMPLE = {
 	title: 'T',
 	content: 'C',
 };
-// A contributed section item carries only its section name, at most 64 characters.
 const SECTION_FRAMING_SAMPLE = { section: 'n'.repeat(64), title: 'T', content: 'C' };
 let overheads;
 
@@ -141,7 +140,6 @@ function framingOf(sample) {
 	return formatMemoryRecord(sample, SAMPLE_NONCE).length + 1 - sample.title.length - sample.content.length;
 }
 
-/** The bootstrap query that makes every entry the server packs fit the injection. */
 export function bootstrapRequest(budget, banners = []) {
 	const { openTag, closeTag } = wrapperTags(SAMPLE_NONCE);
 	let framing = openTag.length + closeTag.length + 2;

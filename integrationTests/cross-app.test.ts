@@ -254,7 +254,6 @@ for (const moduleLoader of ['vm-current-context', 'vm']) {
 						return response;
 					};
 					const hookOptions = { config, env, spawnFollower: false, nonce, fetchImpl };
-					// Every entry the server packed is injected, in order, within the configured budget.
 					const bootAndCheck = async (sessionId: string) => {
 						const boot = await handleSessionStart({ session_id: sessionId, source: 'startup' }, hookOptions);
 						const text: string = boot.hookSpecificOutput?.additionalContext ?? '';
@@ -295,7 +294,6 @@ for (const moduleLoader of ['vm-current-context', 'vm']) {
 					);
 					ok(recallText.includes(`topic="Shorebirds" topicId="topic-shorebirds"]`), recallText);
 
-					// A pin longer than the old 60% request (~2,235 chars at the default budget) still fits: #52.
 					const pinId = memId(`plugin-pin-${moduleLoader}`);
 					const pinContent = 'Tag only after both module loaders pass the integration suite. '
 						.repeat(50)

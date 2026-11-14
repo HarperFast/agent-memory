@@ -99,7 +99,7 @@ function parseCursor(value: string | null): CreatedPosition | undefined {
 
 function boundedInteger(value: string | null, field: string, fallback: number, max: number, min = 1): number {
 	if (value === null || value === '') return fallback;
-	const parsed = Number(value);
+	const parsed = value.trim() === '' ? NaN : Number(value);
 	if (!Number.isInteger(parsed) || parsed < min || parsed > max) {
 		throw badRequest(`${field} must be an integer between ${min} and ${max}`, `invalid_${field}`);
 	}
@@ -517,9 +517,8 @@ export async function searchMemories(
 export interface BootstrapParams {
 	q?: string;
 	budget: number;
-	/** Characters a client adds around each memory it renders; every packed memory is charged this much. */
 	entryOverhead?: number;
-	/** The same for a contributed section item, which a client frames without a memory's provenance. */
+	/** Separate because a client frames a contributed item without a memory's provenance attributes. */
 	sectionItemOverhead?: number;
 	watch?: boolean;
 }

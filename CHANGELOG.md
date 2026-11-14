@@ -9,11 +9,12 @@ All notable changes to `@harperfast/agent-memory` are documented here. The forma
 ### Fixed
 
 - Claude Code plugin: session start injects every entry the server packed, in the server's order, within
-  `AGENT_MEMORY_BOOTSTRAP_BUDGET`. It sends its per-entry framing as `entryOverhead` and `sectionItemOverhead`, so
-  the server packs exactly what fits; before, about 40% of the entries were dropped at the default budget, because
+  `AGENT_MEMORY_BOOTSTRAP_BUDGET`, for entries whose metadata is within its framing estimate. It sends that estimate
+  as `entryOverhead` and `sectionItemOverhead`, so the server packs only what fits; before, about 40% of the entries were dropped at the default budget, because
   the server counted only title + content. A long pin that fits the budget is injected and kept in the offline cache
-  ([#52](https://github.com/HarperFast/agent-memory/issues/52)). Against a server without these parameters the
-  plugin injects an in-order prefix of the response within the budget.
+  ([#52](https://github.com/HarperFast/agent-memory/issues/52)), unless it comes within about 100 characters of the
+  budget. Against a server without these parameters, or for an entry with larger metadata, the plugin injects an
+  in-order prefix of the response within the budget.
 - Claude Code plugin: bootstrap section entries (such as summary-tree's `orientation`) render with only their
   `section`, instead of as a memory with `id="unknown"` and `author="unknown"`.
 

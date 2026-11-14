@@ -164,6 +164,7 @@ describe('parseSearchParams', () => {
 			'entryOverhead=10001',
 			'entryOverhead=1.5',
 			'sectionItemOverhead=10001',
+			'entryOverhead=300&sectionItemOverhead=%20',
 		]) {
 			assert.throws(
 				() => parseBootstrapParams(new URLSearchParams(bad)),
