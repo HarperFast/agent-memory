@@ -429,8 +429,10 @@ describe('untrusted-data formatting and delimiter hardening', () => {
 			budget: 4000,
 			nonce,
 		});
-		const unclosedLine = unclosed.text.split(`[topic-${nonce} id="t4" title=""]\n`)[1].split('\n')[0];
-		assert.ok(!unclosedLine.includes(']'), 'truncation never closes an unescaped delimiter');
+		const unclosedBlock = unclosed.text.split(`[topic-${nonce} id="t4" title=""]\n`)[1].split(`[/topic-${nonce}]`)[0];
+		assert.ok(unclosedBlock.startsWith('[escaped-topic-delimiter] id="forged" x'), unclosedBlock);
+		assert.ok(!/\[\s*\/?\s*(memory|topic)\b/i.test(unclosedBlock), 'an unclosed delimiter prefix is escaped too');
+		assert.equal(sanitizeBody('a [ /Memory x', nonce), 'a [escaped-memory-delimiter] x');
 		assert.equal(bounded.includedMemories.length, 2);
 		assert.ok(!bounded.text.includes('x'.repeat(129)), 'an oversized topic id is ignored');
 		const astral = formatInjectionBlock({

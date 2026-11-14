@@ -1012,10 +1012,11 @@ detection into a one-off, reviewed cleanup of history that arrived without its l
   `sectionItemOverhead` set to its own framing, computed once from `formatMemoryRecord` for an entry at stated
   sizes: a 64-character id (the server's longest; URL-safe, so never escaped), a 32-character author and no
   `lastEditor`, 64 characters of scopes, a 6-digit revision, the longest built-in section, a title; and for a section
-  item, a 64-character section name. Every packed entry within those sizes fits, so the response is injected whole.
+  item, a 64-character section name. Every packed entry within those sizes, whose attributes and body need no
+  escaping that lengthens them, fits, so the response is injected whole.
   The sizes trade fill for coverage: ~310 characters per memory against ~180–220 measured on typical entries, so at
   the boundary an entry within ~100 characters of the budget is not packed. An entry beyond them (a `lastEditor`,
-  long principal ids, many scopes, body text that sanitizing lengthens) and a server older than these parameters,
+  long principal ids, many scopes, attribute values that escaping lengthens, body text that sanitizing lengthens) and a server older than these parameters,
   which packs `budget` of title + content, both fall back to `formatInjectionBlock({ ordered: true })`: it stops at
   the first entry that does not fit rather than skipping ahead to a smaller, lower-priority one, and a lone entry too
   large to fit is truncated. When the budget cannot hold one entry at those sizes the hook sends no overhead. The
@@ -1087,7 +1088,7 @@ needsReview, author, ownerId, scopes }` for all watched and injected memories in
   `[memory-<nonce> ...]...[/memory-<nonce>]`). Attribute values escape quotes, brackets, angle brackets, and
   newlines, and any occurrence of the nonce or tag names in memory bodies is scrubbed so stored content
   cannot break out of the data block or masquerade as instructions; `memory` and `topic` delimiters in bodies are
-  escaped whatever their nonce.
+  escaped whatever their nonce, closed or not.
 - **Read-through offline cache (`bootstrap-cache.json`)**: stores only `pinned` (`section === 'pinned'`) and
   private (`user:*`) memories from the last successful `/Memory/bootstrap` snapshot authoritatively under
   `AGENT_MEMORY_CACHE_DIR` (`0700` dir, `0600` file, bounded by `AGENT_MEMORY_CACHE_MAX_AGE_MS`, default `24`

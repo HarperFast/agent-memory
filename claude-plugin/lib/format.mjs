@@ -18,7 +18,8 @@ export function sanitizeBody(value, nonce) {
 		.replaceAll(nonce, '[redacted-nonce]')
 		.replace(/<\/?\s*agent-memory-data[^>]*>/gi, '[escaped-agent-memory-tag]')
 		.replace(/\[\/?\s*memory\b[^\]]*\]/gi, '[escaped-memory-delimiter]')
-		.replace(/\[\/?\s*topic\b[^\]]*\]/gi, '[escaped-topic-delimiter]');
+		.replace(/\[\/?\s*topic\b[^\]]*\]/gi, '[escaped-topic-delimiter]')
+		.replace(/\[\s*\/?\s*(memory|topic)\b/gi, (_, name) => `[escaped-${name.toLowerCase()}-delimiter]`);
 }
 
 export function resolveAuthorPrincipal(memory) {
@@ -72,7 +73,7 @@ const TOPIC_ID_MAX_CHARS = 128;
 const TOPIC_TITLE_MAX_CHARS = 120;
 const TOPIC_SUMMARY_MAX_CHARS = 400;
 
-// summaryTree is model-generated: only well-typed fields are used, the rest of the annotation is ignored.
+// summaryTree is model-generated: only well-typed fields are used.
 function resolveTopic(memory, nonce) {
 	const tree = memory?.summaryTree;
 	if (typeof tree?.id !== 'string' || !tree.id || tree.id.length > TOPIC_ID_MAX_CHARS) return undefined;
