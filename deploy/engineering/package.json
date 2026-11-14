@@ -4,6 +4,7 @@
 	"type": "module",
 	"description": "Harper engineering's shared agent-memory deployment. deploy/deploy.sh vendors the packed plugin.",
 	"dependencies": {
-		"@harperfast/agent-memory": "file:./vendor/harperfast-agent-memory.tgz"
+		"@harperfast/agent-memory": "file:./vendor/harperfast-agent-memory.tgz",
+		"@harperfast/summary-tree": "0.2.0"
 	}
 }
