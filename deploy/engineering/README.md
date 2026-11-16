@@ -35,6 +35,10 @@ Roles and their `ScopeGrant` rows:
 | `eng-agents`      | interactive agents             | `global`, `customer:*` | `global`, `customer:*` |
 | `dispatch-worker` | fleet workers (separate users) | `global`               | `global`               |
 
+An engineer's agent users act for the engineer's own user through a `Delegation` row per agent user (`upsert` into
+`memory.Delegation`: `{ "id": "<agent user>", "actsFor": "<engineer user>" }`), so they can correct the engineer's
+memories and share `user:<engineer>`. `provision-user.sh` creates users only; add or delete the row by hand.
+
 ## Embedding truncation
 
 `config.yaml` sets `embeddingTruncate: true` and `limits.embeddingInputChars: 12000`: vLLM cuts each input at

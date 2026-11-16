@@ -91,6 +91,12 @@ Requires Harper 5.3.1 or later within 5.x, on RocksDB (the default).
    }
    ```
 
+   To let a person's agents act for the person, add one `Delegation` row per agent user, keyed by the agent:
+   `{ "id": "kris-laptop-agent", "actsFor": "kris" }` (table `Delegation`, same `upsert`). The agent may then
+   revise, withdraw and confirm kris's memories, and reads and writes `user:kris` (its private writes land there,
+   owned by kris). It keeps its own grants for every other label, and delegation is never transitive; delete the
+   row to revoke it on the next request.
+
 3. Use it as any Harper user:
 
    ```sh
@@ -218,8 +224,8 @@ and agent-memory shows what they return as is, so they must show a caller only w
 the memories a summary draws on, judged by their current scopes and content flags. A section or annotator that
 throws is left out and logged; the request still succeeds. Contract: [DESIGN.md](DESIGN.md#extension-points).
 
-`read` and `write` list the effective grant patterns: `user:<id>`, exact labels and namespace wildcards, with
-role and user grants merged and patterns that grant nothing dropped. A super_user's lists do not enumerate its
+`read` and `write` list the effective grant patterns: `user:<id>` (and `user:<actsFor>` for a principal acting for
+another, named by `actsFor`), exact labels and namespace wildcards, with role and user grants merged and patterns that grant nothing dropped. A super_user's lists do not enumerate its
 access; check `superUser`, or let `canReadLabels` do it. `canReadLabels` is the label rule only (any label
 matches), and accepts only a principal `resolvePrincipal` returned. Contract: [DESIGN.md](DESIGN.md#extension-points).
 
@@ -461,7 +467,7 @@ node scripts/copy-memories.mjs --from https://test.example.com --to https://app.
   and refuses if the target has a memory of its own or one that differs. Exit status is 0 only when the final
   comparison matches.
 - **Same people, same grants.** Labels are copied as they are, so `user:alice` and every `ScopeGrant` must mean the
-  same on the target. Grants, pins and watches are not copied; recreate the `ScopeGrant` rows by hand.
+  same on the target. Grants, delegations, pins and watches are not copied; recreate the `ScopeGrant` and `Delegation` rows by hand.
 - **Not carried:** revision numbers, author and last editor (the target records `source: import`), `confirmed`,
   `scopeConfirmed` (the target's own check may flag a memory again for review), and which links the judge added. The
   dry run counts the rows that lose one.
