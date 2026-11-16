@@ -137,7 +137,7 @@ vocabulary with Reflex visibility scopes (Reflex #573):
 | Label           | Meaning                                               |
 | --------------- | ----------------------------------------------------- |
 | `global`        | everyone with global read                             |
-| `user:<id>`     | the owner only (private)                              |
+| `user:<id>`     | the owner and its delegates only (private)            |
 | `customer:<id>` | people and agents cleared for that customer's content |
 | `team:<id>`     | a team                                                |
 
@@ -639,7 +639,7 @@ Three levels, built in order:
      read check, or
    - one of the caller's own memories (`ownerId === principal.id`, or for a delegate one in `user:<actsFor>`:
      `inOwnView`; a delegation added while the stream is open reaches this at reconnect, a revoked one stops
-     delivery at once) is flagged `needsReview`
+     delivery from the next event) is flagged `needsReview`
      (`kind: 'flagged'`, or `restored` / `created` with a newly folded `needsReview` flag visible to the
      caller), or a create or revise newly content-flags it (any flag on a created row; on a revise, the flag's `since`
      equals that write's `lastEditor.revisedAt`, so editing an already flagged memory is not news; two writes in
