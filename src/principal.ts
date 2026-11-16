@@ -8,7 +8,7 @@ export interface PrincipalResolution {
 	grants?: GrantPatterns;
 	superUser?: boolean;
 	source?: string;
-	actsFor?: string;
+	actsFor?: string | null;
 }
 
 /**

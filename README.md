@@ -96,7 +96,8 @@ Requires Harper 5.3.1 or later within 5.x, on RocksDB (the default).
    has; an agent whose grants come from its role gets a row carrying only `actsFor`). The agent may then revise,
    withdraw and confirm kris's memories, and reads and writes `user:kris` (its private writes land there, owned by
    kris). It keeps its own grants for every other label, and delegation is never transitive; set `actsFor` to
-   `null` to revoke it on the next request. `actsFor` on a `role:` row grants nothing.
+   `null` to revoke it on the next request. `actsFor` on a `role:` row grants nothing. Change a user's grants with
+   `upsert` too: a whole-row `put` that leaves out `actsFor` clears it.
 
 3. Use it as any Harper user:
 

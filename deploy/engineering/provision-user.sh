@@ -43,7 +43,6 @@ const e=process.env;
 process.stdout.write(JSON.stringify({operation:e.OP, username:e.USERNAME, password:e.PASS, role:e.ROLE, active:true}));')"
 
 QMATCH="$(printf %q "$MATCH")"
-# Sends one operation (JSON on stdin) through the operations socket of the one matching container.
 operation() {
   local result
   result="$(ssh -o ProxyJump=none "root@$HOST" \

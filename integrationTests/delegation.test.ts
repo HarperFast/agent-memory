@@ -88,7 +88,6 @@ suite('@harperfast/agent-memory delegation over HTTP', (ctx: ContextWithHarper) 
 	}
 
 	const memId = (tag: string) => `mem-dlg-${tag}`.padEnd(16, '_');
-	// actsFor rides the delegate's user ScopeGrant row; agent-a's grants come from its role, so the row carries only it.
 	const setActsFor = (id: string, actsFor: string | null) =>
 		operation({
 			operation: 'upsert',
