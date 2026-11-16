@@ -19,8 +19,9 @@ deploy/deploy.sh deploy/engineering
 - [`../deploy.sh`](../deploy.sh): packs the plugin from this checkout, vendors it into this app, and runs a
   replicated `deploy_component` for the project named in this `package.json` through the operations socket inside
   one node's container.
-- `provision-user.sh <username> <role> <local|ssh:user@host|none> [--rotate]`: creates a Harper user and writes
-  its credentials to that machine's `~/.config/agent-memory/env` (mode 0600). The password is never printed. It
+- `provision-user.sh <username> <role> <local|ssh:user@host|none> [--rotate] [--acts-for <user>]`: creates a Harper
+  user and writes its credentials to that machine's `~/.config/agent-memory/env` (mode 0600); `--acts-for` then sets
+  the user's `actsFor`. The password is never printed. It
   reads the same two variables, plus `AGENT_MEMORY_URL` (the cluster's base URL) unless the target is `none`.
 
 Root config set once per node (not part of the app): `mcp.application.mountPath: /mcp`, and
@@ -34,6 +35,12 @@ Roles and their `ScopeGrant` rows:
 | `eng`             | engineers                      | `global`, `customer:*` | `global`, `customer:*` |
 | `eng-agents`      | interactive agents             | `global`, `customer:*` | `global`, `customer:*` |
 | `dispatch-worker` | fleet workers (separate users) | `global`               | `global`               |
+
+An engineer's agent users act for the engineer's own user through `actsFor` on the agent user's own `ScopeGrant`
+row (`{ "id": "user:<agent user>", "actsFor": "<engineer user>" }`), so they can correct the engineer's memories and
+share `user:<engineer>`. The `eng-agents` role grants their labels, so that row carries only `actsFor`.
+`provision-user.sh <agent user> eng-agents <target> --acts-for <engineer user>` upserts it after creating the
+user; to revoke, upsert `actsFor: null`. Never put `actsFor` on a `role:` row: it grants nothing there.
 
 ## Embedding truncation
 

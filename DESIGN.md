@@ -39,6 +39,7 @@ allowlists, idempotent `PUT` create/revise with `If-Match` revision precondition
 | Supersession backfill: candidates for an existing memory, links between existing memories, created-order cursor  | implemented (`src/lifecycle.ts`)    |
 | Package exports reaching the plugin from another app (Extension points, Across apps)                             | implemented (`src/runtime.ts`)      |
 | `scanMemories`, `getMemories`, bootstrap sections and search annotators for derived plugins (Extension points)   | implemented (`src/extensions.ts`)   |
+| Delegation: one principal acting for another (Identity, Scopes and grants)                                       | implemented (`src/scopes.ts`)       |
 
 ## Data model
 
@@ -63,7 +64,8 @@ database).
   every embed into another vector space, with no refusal to see. One write, import or search takes its model,
   caps and flag from one settings snapshot (`EmbeddingSettings`); the table embedder truncates only a row
   recorded under the configured `embeddingModel`.
-- `ScopeGrant` — read/write scope patterns held by a Harper role or user.
+- `ScopeGrant` — read/write scope patterns held by a Harper role or user; a user's row may also name the
+  principal it acts for (`actsFor`, Identity).
 - `MemoryPin` — a principal's pinned memories (`<principalId>:<memoryId>`), loaded first at session bootstrap.
 - `MemoryWatch` — a principal's time-bounded interest in specific memories (live updates).
 
@@ -73,7 +75,7 @@ See `schema/memory.graphql`. The table is not `@export`ed: every read and write 
 
 Server-owned fields: `ownerId`, `status`, `revision`, `author`, `lastEditor`, `supersededBy`,
 `autoSupersedes`, `evidenceMemoryIds`, `needsReview`, `needsReviewSince`, `confirmed`, `contentFlag`,
-`contentFlagged`, `scopeConfirmed`, `createdAt`, `embeddingModel`, `lastEventKind`. `createdAt` is set by the lifecycle rather than `@createdTime`, because Harper's
+`contentFlagged`, `scopeConfirmed`, `withdrawnBy`, `createdAt`, `embeddingModel`, `lastEventKind`. `createdAt` is set by the lifecycle rather than `@createdTime`, because Harper's
 `@createdTime` overwrites a supplied value on insert and import must preserve it. `updatedAt` stays
 `@updatedTime`. `needsReviewSince` mirrors `needsReview.since` because Harper does not index object
 values; `lastEventKind` records the lifecycle event kind (`created`, `revised`, `superseded`, `withdrawn`,
@@ -110,6 +112,20 @@ source? }`, or `undefined` for unauthenticated. `next()` is the default Harper-u
 Principal ids must not contain whitespace, `:` or `*`, and are capped at 122 characters, so that
 `user:<id>` fits a 128-character scope label.
 
+**Delegation.** A person often reaches the plugin through several principals: their own user (owning history
+imported for them) and one agent user per machine. `actsFor` on the delegate's user grant row
+(`ScopeGrant` `{ id: "user:<delegate>", actsFor: <principal> }`) lets the delegate act for the principal: edit the
+principal's memories and share its private scope (Scopes and grants). It sits on the user row because that row is
+already keyed by the delegate and read on every request; a delegate whose grants all come from its role gets a
+user row carrying only `actsFor`. One field per delegate, so a principal acts for at most one other and its private
+writes have one destination; only the caller's own row is read, so it is not transitive. The default resolution
+reads it on every request, so clearing it (or deleting the row) takes effect on the next request; a custom
+resolver returns `actsFor` itself. An `actsFor` naming the principal itself, or not a valid principal id, grants
+nothing and is logged. So does one on a `role:` row: a role is shared by many people's agents, so it can never
+name the one principal they act for.
+Delegation never merges the two principals: `author`, `lastEditor`, `confirmed.by` and `withdrawnBy` name the
+delegate, and the delegate keeps its own grants and `user:<self>`.
+
 Memory ids are client-chosen (`^[A-Za-z0-9_-]{16,64}$`; clients normally generate a UUID) and share one
 table-wide namespace across all owners rather than per-owner id namespaces. Because `PUT /Memory/<id>`
 creates when the id is absent, a `PUT` to an existing id that the caller cannot read answers `409
@@ -125,7 +141,7 @@ vocabulary with Reflex visibility scopes (Reflex #573):
 | Label           | Meaning                                               |
 | --------------- | ----------------------------------------------------- |
 | `global`        | everyone with global read                             |
-| `user:<id>`     | the owner only (private)                              |
+| `user:<id>`     | the owner and its delegates only (private)            |
 | `customer:<id>` | people and agents cleared for that customer's content |
 | `team:<id>`     | a team                                                |
 
@@ -133,13 +149,14 @@ Each memory carries `scopes: [String]`. A caller sees a memory when **any** of i
 caller's readable set. To restrict content, use one specific label (`customer:acme`), not a list.
 
 Grants are `ScopeGrant` rows keyed `role:<roleName>` or `user:<username>`, with `read` and `write`
-pattern lists. A pattern is an exact label or a namespace wildcard (`customer:*`); a wildcard never
-covers the bare `global`. Every principal implicitly reads and writes `user:<self>`, and no grant
-reaches into the `user` namespace: `user:<id>` means the owner only, so a pattern such as `user:*` or
-`user:bob` is ignored rather than quietly opening private memories (reading everything is what
-`super_user` is for). `super_user` reads and writes everything. Grant rows are read on every request,
-so revoking one takes effect on the next request. An invalid pattern grants nothing and is logged; at
-most 256 patterns per principal count, which bounds the condition every search carries.
+pattern lists (a user row may also carry `actsFor`, Identity). A pattern is an exact label or a namespace wildcard (`customer:*`); a wildcard never
+covers the bare `global`. Every principal implicitly reads and writes `user:<self>`, a delegate also
+`user:<actsFor>`, and no grant reaches into the `user` namespace: `user:<id>` means the owner and its
+delegates only, so a pattern such as `user:*` or `user:bob` is ignored rather than quietly opening private
+memories (reading everything is what `super_user` is for). `super_user` reads and writes everything. Grant rows
+are read on every request, so revoking one takes effect on the next request. An invalid pattern grants nothing
+and is logged; at most 256 patterns per principal count (the implicit `user:` labels do not), which bounds the
+condition every search carries.
 
 Rules:
 
@@ -154,10 +171,18 @@ Rules:
 2. **Write scopes**: creating or revising with scopes `S` requires every label of `S` to be writable by
    the caller — the resulting scopes, so revising a memory that stays `global` needs `global` write.
    `visibility: "private" | "shared"` is shorthand for `[user:<owner>]` / `[global]`; explicit
-   `scopes` wins when both are given. Withdrawal is exempt.
-3. **Edit**: only the owner (or `super_user`) revises or withdraws, apart from the customer-content review
-   (rule 4). Read access never grants edit; a
-   reader that is not the owner gets 403 (`not_memory_owner`), and a non-reader gets 404 on `DELETE`
+   `scopes` wins when both are given. Withdrawal is exempt. A delegate's private create goes to
+   `[user:<actsFor>]`, and a create whose scopes are exactly that is owned by the principal, so the principal and
+   its other delegates can edit it; any other create is owned by its writer (`createScopesAndOwner`), which keeps an
+   uncleared writer able to read, and so fix, its own content-flagged write.
+3. **Edit**: only the owner, a principal acting for the owner, or `super_user` revises, withdraws, confirms,
+   links or lists candidates, apart from the customer-content review (rule 4). A delegate must still read the
+   memory through its labels (`actsAsOwner`): delegation never adds the owner's other labels or the owner's
+   ownership-based reads (withdrawn, content-flagged), so a delegate that cannot read gets what a stranger gets.
+   The owner keeps its own read of whatever labels a delegate gives its memory, as it does after a customer
+   reviewer's rescope; a delegate can publish to the principal through `user:<actsFor>` anyway.
+   Read access never grants edit; a reader that is not the owner gets 403 (`not_memory_owner`; on a revise it
+   names the route left, a merged replacement with `supersedes: [id]`), and a non-reader gets 404 on `DELETE`
    or 409 `id_unavailable` on `PUT`.
 4. **Supersede, review flags and customer-content review**: see below. They are the only writes that touch
    another principal's memory: a supersede changes only status fields (`status`, `supersededBy`, `revision`),
@@ -166,8 +191,8 @@ Rules:
    confirm-scope changes only the content flag, `scopeConfirmed` and `revision`.
 5. **Search pushes the readable set into the query**, applied before the limit in every lane, never
    as a post-filter on a top-k. The set compiles to conditions (`src/scopes.ts` `readableConditions`):
-   an `or` of `ownerId = self`, `scopes = <label>` per exact grant, and `scopes gelt [ns:, ns;)` per
-   wildcard — the exact prefix range, which Harper plans from the index where `starts_with` would scan.
+   an `or` of `ownerId = self`, `scopes = <label>` per exact grant (`user:<actsFor>` among them, never
+   `ownerId = <actsFor>`), and `scopes gelt [ns:, ns;)` per wildcard — the exact prefix range, which Harper plans from the index where `starts_with` would scan.
    Harper matches an array attribute when any element matches. For a caller not cleared for customer
    content, a second group `or(ownerId = self, contentFlagged not_equal true)` adds the quarantine: kept
    apart from the label group so that group's estimate stays finite and its index can still drive a narrow
@@ -184,9 +209,9 @@ Rules:
 | confirm-scope       | `POST /Memory/<id>/confirm-scope` (a reviewer holding `customer:*` read and write, or `super_user`; 403 `customer_clearance_required` otherwise, the missing-id 404 for a non-reader) clears the content flag and records `scopeConfirmed: { by, at }`; `If-Match` honoured when sent; 409 `not_flagged`, 409 on a withdrawn memory     |
 | supersede           | create a memory via `PUT /Memory/<id>` with `supersedes: [ids]` (`supersedes` on a revise is 400 `supersedes_not_allowed`)                                                                                                                                                                                                              |
 | link                | `POST /Memory/<id>/supersedes { ids, revisions? }` with `If-Match: "<revision>"` (missing → 428, stale → 412) links an existing memory as the replacement of existing older ones, under the supersede rules (see Supersession); returns `{ memory }`                                                                                    |
-| withdraw (`DELETE`) | `DELETE /Memory/<id>?reason=` requires `If-Match: "<revision>"` (or `*`; missing → 428, stale → 412); sets `status = withdrawn`, keeps the row as a tombstone, never deletes it                                                                                                                                                         |
+| withdraw (`DELETE`) | `DELETE /Memory/<id>?reason=` requires `If-Match: "<revision>"` (or `*`; missing → 428, stale → 412); sets `status = withdrawn` and `withdrawnBy` (the caller), keeps the row as a tombstone, never deletes it                                                                                                                          |
 | pin / unpin         | records or deletes the caller's `MemoryPin` row (`<principalId>:<memoryId>`, up to 50 pins per principal; withdrawn pins are pruned on pin, 409 `pin_limit_exceeded` past 50); `pin` requires read access (same 404 when missing or unreadable), while `unpin` always deletes the caller's pin and includes `memory` only when readable |
-| confirm             | `POST /Memory/<id>/confirm` (owner or `super_user`; 403 for another reader, the missing-id 404 for a non-reader) clears `needsReview`, records `confirmed: { by, at }` and bumps `revision`; `If-Match` is honoured when sent (412) but not required; 409 on a superseded or withdrawn memory                                           |
+| confirm             | `POST /Memory/<id>/confirm` (owner, its delegate or `super_user`; 403 for another reader, the missing-id 404 for a non-reader) clears `needsReview`, records `confirmed: { by, at }` and bumps `revision`; `If-Match` is honoured when sent (412) but not required; 409 on a superseded or withdrawn memory                             |
 
 `status` is `active | superseded | withdrawn`. Search returns `active` by default. Owners share one id
 namespace: `PUT /Memory/<id>` to an existing id owned by another principal returns `403
@@ -274,7 +299,7 @@ first-class operation, and the write path proposes it.
   that already exist, typically imported history whose source never recorded the link. It runs the
   create-time code (`planSupersede` / `applySupersede`, shared with `PUT`): the same refusals per target
   (404 missing or unreadable, 409 withdrawn, 403 narrowing), the same pointer rule, and the same flags.
-  The caller owns the replacement or is `super_user` (a reader that is not the owner gets 403, a
+  The caller owns the replacement, acts for its owner, or is `super_user` (a reader that is not the owner gets 403, a
   non-reader the missing-id 404) and, as on a create, can still write every label of the replacement
   (403 `scope_not_writable`). `If-Match` names the replacement's revision; `revisions`, when sent,
   maps every id to the target revision the caller judged, checked under the target's lock (412). The
@@ -299,7 +324,7 @@ first-class operation, and the write path proposes it.
   lists is still stored `active` (only import derives the new row's own status from the graph).
 - **Candidates for an existing memory** (`GET /Memory/<id>/candidates`, `memoryCandidates`): the write-time
   candidates (below) of a stored memory, from its stored vector, restricted to memories created before it
-  (`createdAt`, then id), as `{ candidates: [{ id, title, similarity }] }`. Owner or `super_user`, with the
+  (`createdAt`, then id), as `{ candidates: [{ id, title, similarity }] }`. Owner, its delegate or `super_user`, with the
   same 403 / missing-id 404 split as a link, and 409 for a withdrawn memory. It neither judges nor applies,
   ignores `supersession.mode` (which governs writes), and, unlike a write's advisory search, waits for index
   coverage (as a search does: about one index flush, 503 past 5 s) and fails with the search (503 / 500)
@@ -456,7 +481,7 @@ mounted with `hidden = false` only when the plugin option `mcp` is `true` (defau
 | `GET /Memory/?q=&tag=&scope=&limit=&includeSuperseded=&includeExpired=&flagged=&watch=` | search (no `q`: newest first; `flagged=true`: content-flagged memories the caller can read; `watch=true` watches every returned id) |
 | `GET /Memory/?order=created&after=<createdAt>,<id>&limit=`                              | list oldest first by `createdAt`, then id, one page after the cursor (no `q`)                                                       |
 | `GET /Memory/?…&includeWithdrawn=true`                                                  | also list withdrawn memories (`super_user` only; the response carries `includeWithdrawn: true`)                                     |
-| `GET /Memory/<id>/candidates`                                                           | older memories this one may replace (`{ candidates }`; owner or `super_user`)                                                       |
+| `GET /Memory/<id>/candidates`                                                           | older memories this one may replace (`{ candidates }`; owner, its delegate or `super_user`)                                         |
 | `POST /Memory/<id>/supersedes`                                                          | link existing memories as superseded by this one (`{ ids, revisions? }` + `If-Match`; `{ memory }`)                                 |
 | `GET /Memory/bootstrap?q=&budget=&entryOverhead=&sectionItemOverhead=&watch=`           | session-start context (`watch=true` watches every returned id)                                                                      |
 | `POST /Memory/<id>/pin` · `/unpin`                                                      | per-reader pin / unpin (empty or `{}` body)                                                                                         |
@@ -563,7 +588,8 @@ true` puts `@embed`'s HNSW index on the native plane). Harper 5.3 makes a query 
   re-embedding migration, which v0 does not provide.
 - `GET /Memory/bootstrap?q=&budget=&entryOverhead=&sectionItemOverhead=&watch=` — the caller's pinned memories (up to 50 `MemoryPin` rows for
   `principal.id`, newest pin first, whose target memory is active, unexpired and readable by the caller), then the caller's own
-  memories that need review (section `needsReview`: up to 20 the caller may see, newest flag first,
+  memories (for a delegate, also those in `user:<actsFor>` it may read, not the principal's whole corpus:
+  `ownViewCondition`) that need review (section `needsReview`: up to 20 the caller may see, newest flag first,
   through the indexed `needsReviewSince`, from at most the 100 newest flags, so hidden flags cannot make a
   bootstrap scan without bound), then the sections other plugins registered (Extension points), then the caller's recent
   memories, then memories relevant to `q`, deduplicated and packed into a character budget (title +
@@ -583,7 +609,8 @@ Three levels, built in order:
 1. **Record changes**: `Memory` (`/Memory` and `/Memory/<id>`) supports Harper real-time subscriptions
    over WebSocket and SSE (`Accept: text/event-stream`). Every event is checked against the subscriber's
    read rule (`canRead`) at delivery time: `ScopeGrant` rows and custom principal resolver results are
-   cached for up to 5 s and invalidated via the worker hub's `ScopeGrant` subscription, so a scope
+   cached for up to 5 s and invalidated via the worker hub's `ScopeGrant` subscription, which carries
+   `actsFor` too (a resolution that began before an invalidation is not cached), so a scope
    narrowing or grant revocation revokes visibility mid-subscription; Harper user role assignments on
    `context.user` are captured when the connection opens and take effect on reconnect. For `withdrawn`,
    read access checks the memory's scope labels ignoring `status = withdrawn` (matching Provenance), so
@@ -614,7 +641,9 @@ Three levels, built in order:
    SSE or WebSocket whenever:
    - a memory with an unexpired `MemoryWatch` for the caller changes and passes the caller's delivery-time
      read check, or
-   - one of the caller's own memories (`ownerId === principal.id`) is flagged `needsReview`
+   - one of the caller's own memories (`ownerId === principal.id`, or for a delegate one in `user:<actsFor>`:
+     `inOwnView`; a delegation added while the stream is open reaches this at reconnect, a revoked one stops
+     delivery from the next event) is flagged `needsReview`
      (`kind: 'flagged'`, or `restored` / `created` with a newly folded `needsReview` flag visible to the
      caller), or a create or revise newly content-flags it (any flag on a created row; on a revise, the flag's `since`
      equals that write's `lastEditor.revisedAt`, so editing an already flagged memory is not news; two writes in
@@ -740,9 +769,10 @@ context })` (sync or async) returns a `Map` from memory id to a JSON value, or n
   return or the objects they are handed. They are awaited with no time bound, so a slow one delays the response.
 - `setPrincipalResolver(fn)` — see Identity.
 - `resolvePrincipal(context)` — the caller behind a request context, resolved exactly as the plugin's own routes
-  resolve it (custom resolver, else the Harper user and its `ScopeGrant` rows, read on every call). It resolves
-  to a frozen `{ id, superUser, source, read, write }`. `read` and `write` are frozen lists of the effective
-  grant patterns: `user:<id>` first, then exact labels, then namespace wildcards (`customer:*`), role and user
+  resolve it (custom resolver, else the Harper user and its `ScopeGrant` rows, `actsFor` included, read on every
+  call). It resolves to a frozen `{ id, superUser, source, actsFor, read, write }` (`actsFor` null unless
+  delegating). `read` and `write` are frozen lists of the effective grant patterns: `user:<id>` (and
+  `user:<actsFor>`) first, then exact labels, then namespace wildcards (`customer:*`), role and user
   rows merged. A pattern that grants nothing is not listed: invalid, in the `user` namespace, past the 256 cap,
   or inside a granted wildcard (`customer:acme` under `customer:*`). `superUser: true` reads and writes every
   label, and its lists do not say so: check the flag. It rejects with a `MemoryError` (`statusCode` 401, `code`
@@ -936,7 +966,8 @@ broader reads (labels are copied verbatim; that precondition is documented, not 
 - **Row**: the view's import fields (`contentFlag` and `needsReview` included), never the embedding: the target
   re-embeds with its own model. Not carried, because import cannot set them: `revision`, `author` / `lastEditor`,
   `confirmed`, `scopeConfirmed` (the target's own pattern check may flag the row again, which fails closed),
-  `autoSupersedes` (the links themselves are in `supersedes`), pins, watches and `ScopeGrant` rows.
+  `autoSupersedes` (the links themselves are in `supersedes`), `withdrawnBy`, pins, watches, and `ScopeGrant`
+  rows (`actsFor` included).
 - **Order**: successors first (Kahn's order over live rows' `supersedes`; withdrawn rows supersede nothing), so
   no batch ever supersedes a row already stored. Import would turn such a row superseded and flag its active
   citers, raising reviews the source's owners had already answered. Rows left on a cycle refuse the copy.

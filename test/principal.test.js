@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { __test, databases } from 'harper';
+import { __test, databases, logger } from 'harper';
 import { canReadLabels, resolvePrincipal, setPrincipalResolver } from '../dist/index.js';
 import { canRead, MAX_GRANT_PATTERNS } from '../dist/scopes.js';
 
@@ -27,6 +27,7 @@ describe('resolvePrincipal', () => {
 			id: 'alice',
 			superUser: false,
 			source: 'harper',
+			actsFor: null,
 			read: ['user:alice', 'team:a', 'global', 'customer:*'],
 			write: ['user:alice', 'team:a', 'global'],
 		});
@@ -80,6 +81,7 @@ describe('resolvePrincipal', () => {
 			id: 'reflex-svc',
 			superUser: false,
 			source: 'api-key',
+			actsFor: null,
 			read: ['user:reflex-svc', 'global', 'team:*'],
 			write: ['user:reflex-svc'],
 		});
@@ -140,6 +142,92 @@ describe('resolvePrincipal', () => {
 		assert.ok(canReadLabels(await resolvePrincipal(member('alice')), ['team:a']));
 		await databases.memory.ScopeGrant.delete('user:alice');
 		assert.ok(!canReadLabels(await resolvePrincipal(member('alice')), ['team:a']));
+	});
+});
+
+describe('delegation', () => {
+	const delegate = (id, actsFor, read = [], write = []) =>
+		databases.memory.ScopeGrant.put({ id: `user:${id}`, read, write, actsFor });
+
+	it("reads actsFor from the user's ScopeGrant row on every call, so a revoked delegation is gone from the next principal", async () => {
+		await delegate('agent-a', 'kris', ['global'], ['global']);
+		const acting = await resolvePrincipal(member('agent-a'));
+		assert.equal(acting.actsFor, 'kris');
+		assert.deepEqual(acting.read, ['user:agent-a', 'user:kris', 'global']);
+		assert.deepEqual(acting.write, ['user:agent-a', 'user:kris', 'global']);
+		await delegate('agent-a', null, ['global'], ['global']);
+		const revoked = await resolvePrincipal(member('agent-a'));
+		assert.equal(revoked.actsFor, null);
+		assert.deepEqual(revoked.read, ['user:agent-a', 'global']);
+	});
+
+	it('takes actsFor from a user row that carries no grants of its own, beside its role grants', async () => {
+		await grant('role:agents', ['global'], ['global']);
+		await databases.memory.ScopeGrant.put({ id: 'user:agent-a', actsFor: 'kris' });
+		const acting = await resolvePrincipal(member('agent-a'));
+		assert.equal(acting.actsFor, 'kris');
+		assert.deepEqual(acting.read, ['user:agent-a', 'user:kris', 'global']);
+	});
+
+	it('grants nothing from actsFor on a role row, and warns once', async () => {
+		const warnings = [];
+		const originalWarn = logger.warn;
+		logger.warn = (message) => warnings.push(message);
+		try {
+			await databases.memory.ScopeGrant.put({
+				id: 'role:agents',
+				read: ['global'],
+				write: ['global'],
+				actsFor: 'kris',
+			});
+			for (let i = 0; i < 2; i++) {
+				const principal = await resolvePrincipal(member('agent-a'));
+				assert.equal(principal.actsFor, null);
+				assert.deepEqual(principal.read, ['user:agent-a', 'global']);
+			}
+			assert.equal(warnings.filter((message) => message.includes('role ScopeGrant row')).length, 1);
+		} finally {
+			logger.warn = originalWarn;
+		}
+	});
+
+	it('ignores a malformed actsFor and a row for super_user', async () => {
+		await delegate('agent-a', 'not:valid');
+		assert.equal((await resolvePrincipal(member('agent-a'))).actsFor, null);
+		await delegate('agent-a', 7);
+		assert.equal((await resolvePrincipal(member('agent-a'))).actsFor, null);
+		await delegate('root', 'kris');
+		assert.equal((await resolvePrincipal(superUser)).actsFor, null);
+	});
+
+	it("takes a custom resolver's actsFor, and the row's through next()", async () => {
+		await delegate('agent-a', 'kris');
+		setPrincipalResolver((context, next) =>
+			context.headers?.['x-api-key'] ? { id: 'svc-agent', actsFor: 'kris', source: 'api-key' } : next(),
+		);
+		assert.equal((await resolvePrincipal({ headers: { 'x-api-key': 'k' } })).actsFor, 'kris');
+		assert.equal((await resolvePrincipal(member('agent-a'))).actsFor, 'kris');
+	});
+
+	it('issues exactly the two grant reads per request, each in a context of its own', async () => {
+		await grant('role:agents', ['global'], ['global']);
+		await delegate('agent-a', 'kris');
+		const ScopeGrant = databases.memory.ScopeGrant;
+		const originalGet = ScopeGrant.get;
+		const reads = [];
+		ScopeGrant.get = function (id, context) {
+			reads.push({ id, context });
+			return originalGet.call(this, id, context);
+		};
+		const caller = { ...member('agent-a'), authorize: true };
+		try {
+			assert.equal((await resolvePrincipal(caller)).actsFor, 'kris');
+			assert.deepEqual(reads.map((read) => read.id).sort(), ['role:agents', 'user:agent-a']);
+			assert.ok(reads.every((read) => read.context.authorize === false));
+			assert.equal(caller.authorize, true);
+		} finally {
+			ScopeGrant.get = originalGet;
+		}
 	});
 });
 

@@ -551,6 +551,7 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 			id: 'carol',
 			superUser: false,
 			source: 'harper',
+			actsFor: null,
 			read: ['user:carol', 'global', 'customer:x'],
 			write: ['user:carol', 'global', 'customer:x'],
 		};
@@ -560,6 +561,7 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 			id: 'dave',
 			superUser: false,
 			source: 'harper',
+			actsFor: null,
 			read: ['user:dave', 'global', 'customer:*'],
 			write: ['user:dave', 'global'],
 		};
@@ -569,6 +571,7 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 			id: 'agent-erin',
 			superUser: false,
 			source: 'fixture-resolver',
+			actsFor: null,
 			read: ['user:agent-erin', 'global'],
 			write: ['user:agent-erin', 'global'],
 		};
@@ -578,7 +581,13 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 		strictEqual(admin.canRead, true);
 		strictEqual((await probe(undefined, ['global'])).status, 401);
 
-		const withTeam = { id: 'bob', superUser: false, source: 'harper', read: ['user:bob', 'global', 'team:probe'] };
+		const withTeam = {
+			id: 'bob',
+			superUser: false,
+			source: 'harper',
+			actsFor: null,
+			read: ['user:bob', 'global', 'team:probe'],
+		};
 		await operation({
 			operation: 'upsert',
 			database: 'memory',

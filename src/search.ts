@@ -15,7 +15,16 @@ import {
 	type MemoryView,
 } from './lifecycle.ts';
 import { forReader } from './provenance.ts';
-import { anyOf, canRead, isScopeLabel, readableConditions, type Condition, type Principal } from './scopes.ts';
+import {
+	anyOf,
+	canRead,
+	isScopeLabel,
+	ownViewCondition,
+	quarantineConditions,
+	readableConditions,
+	type Condition,
+	type Principal,
+} from './scopes.ts';
 import { getSettings } from './settings.ts';
 
 const RRF_K = 60;
@@ -63,6 +72,7 @@ export const VIEW_FIELDS = [
 	'validUntil',
 	'withdrawnAt',
 	'withdrawnReason',
+	'withdrawnBy',
 	'createdAt',
 	'updatedAt',
 ];
@@ -551,6 +561,10 @@ export async function bootstrapMemories(params: BootstrapParams, principal: Prin
 	const active = { attribute: 'status', comparator: 'equals', value: STATUS_ACTIVE };
 	const unexpired = unexpiredCondition(new Date());
 	const readable = readableConditions(principal);
+	const own =
+		principal.actsFor === null
+			? [ownViewCondition(principal)]
+			: [ownViewCondition(principal), ...quarantineConditions(principal)];
 	const recentFirst = { attribute: 'updatedAt', descending: true };
 	// One lookup per flag source across every section.
 	const access = new Map<string, Promise<any>>();
@@ -599,7 +613,7 @@ export async function bootstrapMemories(params: BootstrapParams, principal: Prin
 				conditions: [
 					active,
 					unexpired,
-					{ attribute: 'ownerId', comparator: 'equals', value: principal.id },
+					...own,
 					{ attribute: 'needsReviewSince', comparator: 'greater_than', value: new Date(0) },
 				],
 				sort: { attribute: 'needsReviewSince', descending: true },
@@ -608,7 +622,7 @@ export async function bootstrapMemories(params: BootstrapParams, principal: Prin
 			},
 			context,
 		)) {
-			chunk.push(record);
+			if (assertReadable([record], principal).length > 0) chunk.push(record);
 			if (chunk.length < BOOTSTRAP_REVIEW_LIMIT) continue;
 			await admit();
 			if (visible.length === BOOTSTRAP_REVIEW_LIMIT) break;
@@ -638,14 +652,14 @@ export async function bootstrapMemories(params: BootstrapParams, principal: Prin
 		collect(
 			Memory.search(
 				{
-					conditions: [active, unexpired, { attribute: 'ownerId', comparator: 'equals', value: principal.id }],
+					conditions: [active, unexpired, ...own],
 					sort: recentFirst,
 					select: VIEW_FIELDS,
 					limit: BOOTSTRAP_RECENT_LIMIT,
 				},
 				context,
 			),
-		).then((records) => forReader(records.map(toMemoryView), principal, context, access));
+		).then((records) => forReader(assertReadable(records, principal).map(toMemoryView), principal, context, access));
 	const loadRelevant = () =>
 		params.q
 			? searchMemories(

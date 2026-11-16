@@ -10,7 +10,7 @@ import {
 } from './lifecycle.ts';
 import { hasCustomPrincipalResolver, resolvePrincipal } from './principal.ts';
 import { forReader } from './provenance.ts';
-import { canRead, type Principal } from './scopes.ts';
+import { canRead, inOwnView, type Principal } from './scopes.ts';
 
 const EVENT_KINDS = ['created', 'revised', 'superseded', 'withdrawn', 'restored', 'flagged'] as const;
 type MemoryEventKind = (typeof EVENT_KINDS)[number];
@@ -232,6 +232,8 @@ interface CachedPrincipal {
 
 const principalCache = new Map<string, CachedPrincipal>();
 const inflightPrincipals = new Map<string, Promise<Principal>>();
+// A resolution that spans an invalidation is retried and never cached: it may predate a revocation.
+let principalCacheGeneration = 0;
 let nextListenerCacheId = 0;
 
 function scopeGrantTable(): any {
@@ -239,6 +241,7 @@ function scopeGrantTable(): any {
 }
 
 function clearPrincipalCache(): void {
+	principalCacheGeneration++;
 	principalCache.clear();
 	inflightPrincipals.clear();
 }
@@ -252,13 +255,23 @@ function harperUserCacheKey(context: Record<string, unknown>): string | undefine
 	return `${user.username}\0${roleName}\0${isSuper}`;
 }
 
+async function resolveCurrentPrincipal(
+	authContext: Record<string, unknown>,
+): Promise<{ principal: Principal; generation: number }> {
+	for (;;) {
+		const generation = principalCacheGeneration;
+		const principal = await resolvePrincipal(authContext);
+		if (generation === principalCacheGeneration) return { principal, generation };
+	}
+}
+
 async function resolveSubscriberPrincipal(
 	authContext: Record<string, unknown>,
 	fallbackKey?: string,
 ): Promise<Principal> {
 	const key = harperUserCacheKey(authContext) ?? fallbackKey;
 	if (!key) {
-		return resolvePrincipal(authContext);
+		return (await resolveCurrentPrincipal(authContext)).principal;
 	}
 	const now = Date.now();
 	const cached = principalCache.get(key);
@@ -267,14 +280,16 @@ async function resolveSubscriberPrincipal(
 	}
 	const existing = inflightPrincipals.get(key);
 	if (existing) return existing;
-	const promise = resolvePrincipal(authContext).then(
-		(resolved) => {
-			inflightPrincipals.delete(key);
-			principalCache.set(key, { principal: resolved, expiresAtMs: Date.now() + PRINCIPAL_CACHE_TTL_MS });
-			return resolved;
+	const promise: Promise<Principal> = resolveCurrentPrincipal(authContext).then(
+		({ principal, generation }) => {
+			if (inflightPrincipals.get(key) === promise) inflightPrincipals.delete(key);
+			if (generation === principalCacheGeneration) {
+				principalCache.set(key, { principal, expiresAtMs: Date.now() + PRINCIPAL_CACHE_TTL_MS });
+			}
+			return principal;
 		},
 		(error) => {
-			inflightPrincipals.delete(key);
+			if (inflightPrincipals.get(key) === promise) inflightPrincipals.delete(key);
 			throw error;
 		},
 	);
@@ -759,7 +774,10 @@ export async function subscribeMemoryEvents(
 		const kind = eventRecord?.lastEventKind;
 		if (!id || !isEventKind(kind)) return undefined;
 		const maybeOwnFlagged =
-			isFlagEvent(kind, eventRecord) && (!eventRecord?.ownerId || eventRecord.ownerId === principal.id);
+			isFlagEvent(kind, eventRecord) &&
+			(!eventRecord?.ownerId ||
+				inOwnView(eventRecord, principal) ||
+				(principal.actsFor !== null && !Array.isArray(eventRecord.scopes)));
 		if (maybeOwnFlagged) return { maybeOwnFlagged: true, watchConfirmed: false };
 		if (!hasActiveWatch(principal.id, id)) return undefined;
 		return { maybeOwnFlagged: false, watchConfirmed: true };
@@ -779,7 +797,7 @@ export async function subscribeMemoryEvents(
 			if (!deliverable) return undefined;
 			const { event, record, currentPrincipal, dedupToken } = deliverable;
 
-			if (isFlagEvent(event.kind, record) && record.ownerId === currentPrincipal.id) {
+			if (isFlagEvent(event.kind, record) && inOwnView(record, currentPrincipal)) {
 				if (
 					event.kind === 'flagged' ||
 					isNewContentFlag(event.kind, record) ||

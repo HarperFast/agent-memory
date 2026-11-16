@@ -8,6 +8,9 @@ All notable changes to `@harperfast/agent-memory` are documented here. The forma
 
 ### Fixed
 
+- Live updates: a principal resolution that started before a `ScopeGrant` change is no longer cached after it, so a
+  revoked grant stops event delivery on the next event instead of up to 5 s later.
+
 - Claude Code plugin: session start injects every entry the server packed, in the server's order, within
   `AGENT_MEMORY_BOOTSTRAP_BUDGET`, for entries whose metadata is within its framing estimate. It sends that estimate
   as `entryOverhead` and `sectionItemOverhead`, so the server packs only what fits; before, about 40% of the entries were dropped at the default budget, because
@@ -20,6 +23,20 @@ All notable changes to `@harperfast/agent-memory` are documented here. The forma
 
 ### Added
 
+- Delegation ([#55](https://github.com/HarperFast/agent-memory/issues/55)): `actsFor` on an agent user's
+  `ScopeGrant` row (`{ id: "user:<delegate>", actsFor: <principal> }`) lets a person's agent users act for the person. A delegate may revise,
+  withdraw, confirm, link and list candidates for the principal's memories (`ownerId` stays the principal; `lastEditor`,
+  `confirmed.by` and the new `withdrawnBy` name the delegate) and reads and writes `user:<principal>`: its private
+  writes land there, owned by the principal, so the principal and every other delegate can edit them. A delegate
+  still reads only through labels, so it never reaches a memory its own grants do not. The row is read on every
+  request, and clearing `actsFor` revokes the delegation on the next one; `actsFor` on a `role:` row grants nothing.
+  `provision-user.sh --acts-for <user>` sets it. `resolvePrincipal` returns `actsFor`, and a custom
+  principal resolver may return it.
+- A delegate's bootstrap `recent` and `needsReview` sections, and its `/MemoryEvents` flag notices, include memories in
+  its principal's private scope.
+- The `403 not_memory_owner` from a revise (HTTP and the MCP `revise` tool) names the route left: a merged replacement
+  with `supersedes: [id]`.
+- `withdrawnBy`: the principal that withdrew a memory.
 - `GET /Memory/bootstrap?entryOverhead=&sectionItemOverhead=`: characters a client adds around each memory and each
   contributed section item it renders (`0..10000`, default `0`; `sectionItemOverhead` defaults to `entryOverhead`).
   Each packed entry is charged title + content + its overhead, so a client that frames entries can ask for its exact

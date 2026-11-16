@@ -122,7 +122,8 @@ export const MEMORY_MCP_TOOLS = [
 	{
 		name: 'revise',
 		method: 'mcpRevise',
-		description: 'Revise an existing owned memory at a specific revision.',
+		description:
+			"Revise an existing memory you own, or one owned by the principal you act for, at a specific revision. To correct anyone else's memory, call remember with a merged replacement and supersedes: [id], with scopes that include all of its scopes.",
 		inputSchema: {
 			type: 'object',
 			additionalProperties: false,

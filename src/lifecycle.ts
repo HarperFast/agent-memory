@@ -4,9 +4,11 @@ import { checkedText, matchCustomerContent } from './patterns.ts';
 import { activeDependentIds, CLEARED_REVIEW, flagDependents, forReader, reviewFlagFor } from './provenance.ts';
 import { CLEARED_CONTENT_FLAG, contentFlagFields, decideContentFlag, scheduleModelCheck } from './quarantine.ts';
 import {
+	actsAsOwner,
 	assertWritable,
 	canRead,
 	canWrite,
+	createScopesAndOwner,
 	GLOBAL_SCOPE,
 	isCustomerScope,
 	isSuperset,
@@ -314,6 +316,7 @@ export function toMemoryView(record: any): MemoryView {
 		validUntil: iso(record.validUntil),
 		withdrawnAt: iso(record.withdrawnAt),
 		withdrawnReason: record.withdrawnReason ?? null,
+		withdrawnBy: record.withdrawnBy ?? null,
 		createdAt: iso(record.createdAt),
 		updatedAt: iso(record.updatedAt),
 	};
@@ -592,17 +595,13 @@ function mayReviewWithdraw(existing: any, principal: Principal): boolean {
 	return Boolean(existing.contentFlag) && reviewsCustomerContent(principal) && canRead(existing, principal);
 }
 
-function plannedScopes(
-	payload: Record<string, any>,
-	principal: Principal,
-	ownerId: string,
-	current?: string[],
-): string[] | undefined {
+function plannedScopes(payload: Record<string, any>, principal: Principal, existing?: any): string[] | undefined {
 	try {
-		const scopes =
-			current && payload.scopes == null && payload.visibility == null
-				? current
-				: normalizeScopes(payload.scopes, payload.visibility, ownerId);
+		const scopes = !existing
+			? createScopesAndOwner(payload.scopes, payload.visibility, principal).scopes
+			: existing.scopes && payload.scopes == null && payload.visibility == null
+				? existing.scopes
+				: normalizeScopes(payload.scopes, payload.visibility, existing.ownerId);
 		assertWritable(scopes, principal);
 		return scopes;
 	} catch (error) {
@@ -664,7 +663,7 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 		const citedReadable = cited.every((record) => record && canRead(record, principal));
 		const createScopes =
 			!preExisting && ifMatch === undefined && parsedTitle !== undefined && parsedContent !== undefined && citedReadable
-				? plannedScopes(payload, principal, principal.id)
+				? plannedScopes(payload, principal)
 				: undefined;
 		const refused = (target: any) => supersedeRefusal(target, createScopes!, principal) !== undefined;
 		const explicitTargets = createScopes
@@ -677,10 +676,10 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 			matchesIfMatch(ifMatch, preExisting.revision) &&
 			(ifNoneMatch === undefined || !matchesIfNoneMatch(ifNoneMatch, preExisting.revision)) &&
 			payload.supersedes === undefined &&
-			(preExisting.ownerId === principal.id || principal.superUser) &&
+			(actsAsOwner(preExisting, principal) || principal.superUser) &&
 			preExisting.status === STATUS_ACTIVE &&
 			citedReadable
-				? plannedScopes(payload, principal, preExisting.ownerId, preExisting.scopes)
+				? plannedScopes(payload, principal, preExisting)
 				: undefined;
 		const mayRevise = revisedScopes !== undefined;
 		const writesContent =
@@ -775,14 +774,19 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 				const existing = await Memory.get(id, txn);
 				const now = new Date();
 				if (existing) {
+					const owner = actsAsOwner(existing, principal);
 					// A customer review (super_user's included) changes scopes only, so it leaves the owner's review flag alone.
-					const reviewing = existing.ownerId !== principal.id && isReviewRescope(existing, payload, principal);
-					if (existing.ownerId !== principal.id && !principal.superUser) {
+					const reviewing = !owner && isReviewRescope(existing, payload, principal);
+					if (!owner && !principal.superUser) {
 						if (!canRead(existing, principal)) {
 							throw memoryError('Memory id is not available', 409, 'id_unavailable');
 						}
 						if (!isReviewRescope(existing, payload, principal)) {
-							throw memoryError('Only the owner can modify this memory', 403, 'not_memory_owner');
+							throw memoryError(
+								`Only the owner, or a principal acting for it, can revise this memory. To correct it, create a merged replacement with supersedes: ["${id}"] and scopes that include all of its scopes.`,
+								403,
+								'not_memory_owner',
+							);
 						}
 					}
 					if (ifNoneMatch !== undefined && matchesIfNoneMatch(ifNoneMatch, existing.revision)) {
@@ -906,7 +910,7 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 				}
 				const title = boundedText(payload.title, 'title', settings.titleChars, true)!;
 				const content = boundedText(payload.content, 'content', settings.contentChars, true)!;
-				const scopes = normalizeScopes(payload.scopes, payload.visibility, principal.id);
+				const { scopes, ownerId } = createScopesAndOwner(payload.scopes, payload.visibility, principal);
 				assertWritable(scopes, principal);
 				const tags = parsedTags ?? [];
 				const evidence = parsedEvidence ?? [];
@@ -965,7 +969,7 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 						embedding: planned.vector,
 						tags,
 						scopes,
-						ownerId: principal.id,
+						ownerId,
 						status: STATUS_ACTIVE,
 						revision: 1,
 						lastEventKind: 'created',
@@ -984,6 +988,7 @@ export async function putMemory(id: unknown, input: unknown, principal: Principa
 						validUntil,
 						withdrawnAt: null,
 						withdrawnReason: null,
+						withdrawnBy: null,
 						embeddingModel: settings.embeddingModel,
 					},
 					txn,
@@ -1247,7 +1252,7 @@ export async function withdrawMemory(
 		ifMatch !== undefined &&
 		matchesIfMatch(ifMatch, planned.revision) &&
 		planned.status !== STATUS_WITHDRAWN &&
-		(planned.ownerId === principal.id || principal.superUser || mayReviewWithdraw(planned, principal));
+		(actsAsOwner(planned, principal) || principal.superUser || mayReviewWithdraw(planned, principal));
 	const plan = mayWithdraw
 		? [id, ...(planned.supersedes ?? []), ...(await activeDependentIds(Memory, [id], requestContext))]
 		: [id];
@@ -1260,7 +1265,7 @@ export async function withdrawMemory(
 			if (!existing) throw notFound();
 			// A caller that cannot read the memory gets the same 404 as a missing one, so a write attempt does not
 			// confirm another principal's memory exists. One that can read it gets an informative 403.
-			if (existing.ownerId !== principal.id && !principal.superUser && !mayReviewWithdraw(existing, principal)) {
+			if (!actsAsOwner(existing, principal) && !principal.superUser && !mayReviewWithdraw(existing, principal)) {
 				if (!canRead(existing, principal)) throw notFound();
 				throw memoryError('Only the owner can modify this memory', 403, 'not_memory_owner');
 			}
@@ -1284,6 +1289,7 @@ export async function withdrawMemory(
 					status: STATUS_WITHDRAWN,
 					withdrawnAt: now,
 					withdrawnReason: reason ?? null,
+					withdrawnBy: principal.id,
 					lastEventKind: 'withdrawn',
 					revision: existing.revision + 1,
 				},
@@ -1361,7 +1367,7 @@ export async function linkSupersedes(id: unknown, input: unknown, principal: Pri
 		planned &&
 		plannedNewIds.length > 0 &&
 		planned.status !== STATUS_WITHDRAWN &&
-		(planned.ownerId === principal.id || principal.superUser) &&
+		(actsAsOwner(planned, principal) || principal.superUser) &&
 		canWrite(planned.scopes ?? [], principal) &&
 		ifMatch !== undefined &&
 		matchesIfMatch(ifMatch, planned.revision) &&
@@ -1387,7 +1393,7 @@ export async function linkSupersedes(id: unknown, input: unknown, principal: Pri
 		async (txn, locks) => {
 			const existing = await Memory.get(id, txn);
 			if (!existing) throw notFound();
-			if (existing.ownerId !== principal.id && !principal.superUser) {
+			if (!actsAsOwner(existing, principal) && !principal.superUser) {
 				if (!canRead(existing, principal)) throw notFound();
 				throw memoryError('Only the owner can modify this memory', 403, 'not_memory_owner');
 			}
@@ -1477,7 +1483,7 @@ export async function confirmMemory(
 	return withLockPlan(requestContext, [id], async (txn) => {
 		const existing = await Memory.get(id, txn);
 		if (!existing) throw notFound();
-		if (existing.ownerId !== principal.id && !principal.superUser) {
+		if (!actsAsOwner(existing, principal) && !principal.superUser) {
 			if (!canRead(existing, principal)) throw notFound();
 			throw memoryError('Only the owner can modify this memory', 403, 'not_memory_owner');
 		}
