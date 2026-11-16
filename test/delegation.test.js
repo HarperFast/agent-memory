@@ -340,4 +340,39 @@ describe('subscriber principal cache', () => {
 			release();
 		}
 	});
+	it('keeps resolving while invalidations land during the lookup', async () => {
+		await grant('user:carol', ['global', 'team:eng'], ['global']);
+		await grant('user:kris', ['global', 'team:eng'], ['global', 'team:eng']);
+		const ScopeGrant = databases.memory.ScopeGrant;
+		const originalGet = ScopeGrant.get;
+		const releases = [];
+		const gates = [0, 1].map(() => new Promise((resolve) => releases.push(resolve)));
+		let armed = false;
+		let held = 0;
+		ScopeGrant.get = async function (id, context) {
+			const row = await originalGet.call(this, id, context);
+			if (armed && id === 'user:carol' && held < gates.length) await gates[held++];
+			return row;
+		};
+		try {
+			const events = collectEvents(await MemoryResource.subscribe(target('', { rest: '' }), ctx(carol)));
+			armed = true;
+			await put(kris, idOf('fence2'), note('team note', { scopes: ['team:eng'] }));
+			await events.settle();
+			await grant('user:agent-b', ['global'], ['global']);
+			await events.settle();
+			releases[0]();
+			await events.settle();
+			assert.equal(held, 2, 'the lookup should have retried');
+			await grant('user:carol', ['global'], ['global']);
+			await events.settle();
+			releases[1]();
+			await events.settle();
+			await events.close();
+			assert.deepEqual(events.received, []);
+		} finally {
+			ScopeGrant.get = originalGet;
+			for (const release of releases) release();
+		}
+	});
 });

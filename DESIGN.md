@@ -295,7 +295,7 @@ first-class operation, and the write path proposes it.
   that already exist, typically imported history whose source never recorded the link. It runs the
   create-time code (`planSupersede` / `applySupersede`, shared with `PUT`): the same refusals per target
   (404 missing or unreadable, 409 withdrawn, 403 narrowing), the same pointer rule, and the same flags.
-  The caller owns the replacement or is `super_user` (a reader that is not the owner gets 403, a
+  The caller owns the replacement, acts for its owner, or is `super_user` (a reader that is not the owner gets 403, a
   non-reader the missing-id 404) and, as on a create, can still write every label of the replacement
   (403 `scope_not_writable`). `If-Match` names the replacement's revision; `revisions`, when sent,
   maps every id to the target revision the caller judged, checked under the target's lock (412). The
@@ -320,7 +320,7 @@ first-class operation, and the write path proposes it.
   lists is still stored `active` (only import derives the new row's own status from the graph).
 - **Candidates for an existing memory** (`GET /Memory/<id>/candidates`, `memoryCandidates`): the write-time
   candidates (below) of a stored memory, from its stored vector, restricted to memories created before it
-  (`createdAt`, then id), as `{ candidates: [{ id, title, similarity }] }`. Owner or `super_user`, with the
+  (`createdAt`, then id), as `{ candidates: [{ id, title, similarity }] }`. Owner, its delegate or `super_user`, with the
   same 403 / missing-id 404 split as a link, and 409 for a withdrawn memory. It neither judges nor applies,
   ignores `supersession.mode` (which governs writes), and, unlike a write's advisory search, waits for index
   coverage (as a search does: about one index flush, 503 past 5 s) and fails with the search (503 / 500)
@@ -477,7 +477,7 @@ mounted with `hidden = false` only when the plugin option `mcp` is `true` (defau
 | `GET /Memory/?q=&tag=&scope=&limit=&includeSuperseded=&includeExpired=&flagged=&watch=` | search (no `q`: newest first; `flagged=true`: content-flagged memories the caller can read; `watch=true` watches every returned id) |
 | `GET /Memory/?order=created&after=<createdAt>,<id>&limit=`                              | list oldest first by `createdAt`, then id, one page after the cursor (no `q`)                                                       |
 | `GET /Memory/?…&includeWithdrawn=true`                                                  | also list withdrawn memories (`super_user` only; the response carries `includeWithdrawn: true`)                                     |
-| `GET /Memory/<id>/candidates`                                                           | older memories this one may replace (`{ candidates }`; owner or `super_user`)                                                       |
+| `GET /Memory/<id>/candidates`                                                           | older memories this one may replace (`{ candidates }`; owner, its delegate or `super_user`)                                         |
 | `POST /Memory/<id>/supersedes`                                                          | link existing memories as superseded by this one (`{ ids, revisions? }` + `If-Match`; `{ memory }`)                                 |
 | `GET /Memory/bootstrap?q=&budget=&entryOverhead=&sectionItemOverhead=&watch=`           | session-start context (`watch=true` watches every returned id)                                                                      |
 | `POST /Memory/<id>/pin` · `/unpin`                                                      | per-reader pin / unpin (empty or `{}` body)                                                                                         |

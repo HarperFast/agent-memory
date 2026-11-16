@@ -623,7 +623,7 @@ export async function bootstrapMemories(params: BootstrapParams, principal: Prin
 			},
 			context,
 		)) {
-			chunk.push(record);
+			if (assertReadable([record], principal).length > 0) chunk.push(record);
 			if (chunk.length < BOOTSTRAP_REVIEW_LIMIT) continue;
 			await admit();
 			if (visible.length === BOOTSTRAP_REVIEW_LIMIT) break;
@@ -660,7 +660,7 @@ export async function bootstrapMemories(params: BootstrapParams, principal: Prin
 				},
 				context,
 			),
-		).then((records) => forReader(records.map(toMemoryView), principal, context, access));
+		).then((records) => forReader(assertReadable(records, principal).map(toMemoryView), principal, context, access));
 	const loadRelevant = () =>
 		params.q
 			? searchMemories(

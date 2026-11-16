@@ -256,13 +256,23 @@ function harperUserCacheKey(context: Record<string, unknown>): string | undefine
 	return `${user.username}\0${roleName}\0${isSuper}`;
 }
 
+async function resolveCurrentPrincipal(
+	authContext: Record<string, unknown>,
+): Promise<{ principal: Principal; generation: number }> {
+	for (;;) {
+		const generation = principalCacheGeneration;
+		const principal = await resolvePrincipal(authContext);
+		if (generation === principalCacheGeneration) return { principal, generation };
+	}
+}
+
 async function resolveSubscriberPrincipal(
 	authContext: Record<string, unknown>,
 	fallbackKey?: string,
 ): Promise<Principal> {
 	const key = harperUserCacheKey(authContext) ?? fallbackKey;
 	if (!key) {
-		return resolvePrincipal(authContext);
+		return (await resolveCurrentPrincipal(authContext)).principal;
 	}
 	const now = Date.now();
 	const cached = principalCache.get(key);
@@ -271,13 +281,13 @@ async function resolveSubscriberPrincipal(
 	}
 	const existing = inflightPrincipals.get(key);
 	if (existing) return existing;
-	const generation = principalCacheGeneration;
-	const promise: Promise<Principal> = resolvePrincipal(authContext).then(
-		(resolved) => {
+	const promise: Promise<Principal> = resolveCurrentPrincipal(authContext).then(
+		({ principal, generation }) => {
 			if (inflightPrincipals.get(key) === promise) inflightPrincipals.delete(key);
-			if (generation !== principalCacheGeneration) return resolvePrincipal(authContext);
-			principalCache.set(key, { principal: resolved, expiresAtMs: Date.now() + PRINCIPAL_CACHE_TTL_MS });
-			return resolved;
+			if (generation === principalCacheGeneration) {
+				principalCache.set(key, { principal, expiresAtMs: Date.now() + PRINCIPAL_CACHE_TTL_MS });
+			}
+			return principal;
 		},
 		(error) => {
 			if (inflightPrincipals.get(key) === promise) inflightPrincipals.delete(key);
