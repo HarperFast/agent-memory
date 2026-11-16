@@ -226,6 +226,15 @@ describe('labels stay gated by the delegate’s own grants', () => {
 		assert.equal((await get(agentA, id)).status, 404);
 		assert.equal((await put(agentA, id, { content: 'scrubbed' }, 1)).status, 409);
 		assert.equal((await get(cleared, id)).status, 200);
+
+		// Only a create carrying global is content-checked, so an uncleared delegate keeps its private note.
+		const privateNote = idOf('private-host');
+		const body = note('outage on db.acme.test');
+		assert.equal((await put(agentA, privateNote, body)).status, 201);
+		assert.equal(stored(privateNote).ownerId, 'kris');
+		assert.equal(stored(privateNote).contentFlag, null);
+		assert.equal((await put(agentA, privateNote, body)).status, 200);
+		assert.equal((await get(agentA, privateNote)).status, 200);
 	});
 });
 

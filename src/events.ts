@@ -232,7 +232,7 @@ interface CachedPrincipal {
 
 const principalCache = new Map<string, CachedPrincipal>();
 const inflightPrincipals = new Map<string, Promise<Principal>>();
-// A resolution that spans an invalidation is neither cached nor trusted: it may predate a revocation.
+// A resolution that spans an invalidation is retried and never cached: it may predate a revocation.
 let principalCacheGeneration = 0;
 let nextListenerCacheId = 0;
 

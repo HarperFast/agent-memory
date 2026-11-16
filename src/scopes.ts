@@ -94,8 +94,8 @@ export function requirePrincipalId(id: unknown): string {
  * Compile grant patterns into a matcher. `user:<self>` is always included, and `user:<actsFor>` for a delegate;
  * neither counts toward MAX_GRANT_PATTERNS. A pattern that is neither an exact label nor `<namespace>:*` is
  * reported in `rejected` and grants nothing; patterns past MAX_GRANT_PATTERNS too. So is any pattern in the
- * `user` namespace: `user:<id>` means the owner only, and a grant such as `user:*` would quietly open every
- * private memory. Reading everything is what super_user is for.
+ * `user` namespace: `user:<id>` means the owner and its delegates only, and a grant such as `user:*` would quietly
+ * open every private memory. Reading everything is what super_user is for.
  */
 export function compileMatcher(
 	patterns: readonly unknown[] | undefined,
@@ -233,11 +233,7 @@ export function canRead(record: ScopedRecord, principal: Principal): boolean {
 	return canReadLabels(principal, record.scopes);
 }
 
-/**
- * Rule 3's edit gate, short of super_user: the owner, or a principal acting for the owner that can read the memory.
- * A delegate reads only through labels (its grants plus `user:<actsFor>`), so delegation never opens a memory its
- * own grants do not.
- */
+/** A delegate reads only through labels, so delegation never opens a memory its own grants do not. */
 export function actsAsOwner(record: ScopedRecord, principal: Principal): boolean {
 	return (
 		record.ownerId === principal.id ||

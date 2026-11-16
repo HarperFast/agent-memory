@@ -561,7 +561,6 @@ export async function bootstrapMemories(params: BootstrapParams, principal: Prin
 	const active = { attribute: 'status', comparator: 'equals', value: STATUS_ACTIVE };
 	const unexpired = unexpiredCondition(new Date());
 	const readable = readableConditions(principal);
-	// Both arms of a delegate's own view are readable labels; only the quarantine can still exclude a row.
 	const own =
 		principal.actsFor === null
 			? [ownViewCondition(principal)]
