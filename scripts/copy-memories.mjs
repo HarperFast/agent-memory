@@ -122,6 +122,7 @@ async function readSource(request, { maxBufferedChars, stderr }) {
 			if (view.confirmed) increment(summary.notCarried, 'confirmed');
 			if (view.scopeConfirmed) increment(summary.notCarried, 'scopeConfirmed');
 			if (view.autoSupersedes?.length) increment(summary.notCarried, 'autoSupersedes');
+			if (view.withdrawnBy) increment(summary.notCarried, 'withdrawnBy');
 		}
 		stderr.write(`read ${rows.length} source memories\n`);
 	}

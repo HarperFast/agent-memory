@@ -55,7 +55,7 @@ type ScopeGrant @table(database: "memory", audit: true) {
 	updatedAt: Date @updatedTime
 }
 
-# Keyed by the delegate's principal id: that principal acts for `actsFor` (DESIGN.md Identity).
+# Keyed by the delegate's principal id.
 type Delegation @table(database: "memory", audit: true) {
 	id: ID @primaryKey
 	actsFor: String

@@ -595,7 +595,6 @@ function mayReviewWithdraw(existing: any, principal: Principal): boolean {
 	return Boolean(existing.contentFlag) && reviewsCustomerContent(principal) && canRead(existing, principal);
 }
 
-/** The scopes a create (no `existing`) or a revise would write, or undefined when the write would be refused. */
 function plannedScopes(payload: Record<string, any>, principal: Principal, existing?: any): string[] | undefined {
 	try {
 		const scopes = !existing

@@ -11,7 +11,6 @@ import {
 } from '../dist/resource.js';
 import { applySettings, parseSettings } from '../dist/settings.js';
 
-// kris is the person; agent-a and agent-b are kris's agents (global only); carol is someone else.
 const kris = { username: 'kris' };
 const agentA = { username: 'agent-a' };
 const agentB = { username: 'agent-b' };
@@ -96,7 +95,6 @@ describe('delegated edit', () => {
 		assert.equal(stored(id).ownerId, 'kris');
 		assert.equal(stored(id).withdrawnBy, 'agent-a');
 		assert.equal(stored(id).lastEditor.principalId, 'agent-a');
-		// Withdrawn memories stay readable by their owner only: a delegate reads through labels.
 		assert.equal((await get(kris, id)).status, 200);
 		assert.equal((await get(agentA, id)).status, 404);
 	});
@@ -152,7 +150,6 @@ describe("the principal's private scope", () => {
 			assert.equal(stored(id).ownerId, 'kris');
 			assert.equal(stored(id).author.principalId, 'agent-a');
 		}
-		// An identical retry by the writer is still a retry.
 		assert.equal((await put(agentA, implicit, note('agent note'))).status, 200);
 
 		assert.equal((await get(agentB, implicit)).status, 200);
@@ -163,7 +160,6 @@ describe("the principal's private scope", () => {
 
 		assert.equal((await put(agentB, implicit, { content: 'agent-b edit' }, 1)).status, 200);
 		assert.equal((await put(kris, implicit, { content: 'kris edit' }, 2)).status, 200);
-		// A private shorthand on the principal's memory keeps resolving against the owner.
 		assert.equal((await put(agentB, explicit, { visibility: 'private', title: 'renamed' }, 1)).status, 200);
 		assert.deepEqual(stored(explicit).scopes, ['user:kris']);
 
@@ -307,7 +303,7 @@ describe("a delegate's own view", () => {
 });
 
 describe('subscriber principal cache', () => {
-	it('does not cache a resolution that started before a grant change', async () => {
+	it('neither caches nor trusts a resolution that started before a grant change', async () => {
 		await grant('user:carol', ['global', 'team:eng'], ['global']);
 		await grant('user:kris', ['global', 'team:eng'], ['global', 'team:eng']);
 		const ScopeGrant = databases.memory.ScopeGrant;
@@ -338,7 +334,7 @@ describe('subscriber principal cache', () => {
 			await put(kris, id, { content: 'team note v2' }, 1);
 			await events.settle();
 			await events.close();
-			assert.ok(!events.received.some((event) => event.revision === 2), JSON.stringify(events.received));
+			assert.deepEqual(events.received, []);
 		} finally {
 			ScopeGrant.get = originalGet;
 			release();

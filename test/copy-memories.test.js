@@ -273,13 +273,14 @@ describe('run', () => {
 	it('--dry-run reads the source only and counts by status and scope', async () => {
 		seed(10);
 		source.memories[1].confirmed = { by: 'alice', at: '2025-01-01T00:00:00.000Z' };
+		source.memories.find((memory) => memory.status === 'withdrawn').withdrawnBy = 'alice';
 		const { code, report } = await cli(['--from', sourceUrl, '--dry-run'], {
 			env: { AGENT_MEMORY_FROM_AUTHORIZATION: FROM_AUTH },
 		});
 		assert.equal(code, 0);
 		assert.deepEqual(report.source.byStatus, { withdrawn: 2, active: 8 });
 		assert.deepEqual(report.source.byScope, { 'user:alice': 4, global: 6 });
-		assert.deepEqual(report.source.notCarried, { confirmed: 1 });
+		assert.deepEqual(report.source.notCarried, { confirmed: 1, withdrawnBy: 1 });
 		assert.equal(target.requests.length, 0);
 	});
 

@@ -469,7 +469,8 @@ node scripts/copy-memories.mjs --from https://test.example.com --to https://app.
 - **Same people, same grants.** Labels are copied as they are, so `user:alice` and every `ScopeGrant` must mean the
   same on the target. Grants, delegations, pins and watches are not copied; recreate the `ScopeGrant` and `Delegation` rows by hand.
 - **Not carried:** revision numbers, author and last editor (the target records `source: import`), `confirmed`,
-  `scopeConfirmed` (the target's own check may flag a memory again for review), and which links the judge added. The
+  `scopeConfirmed` (the target's own check may flag a memory again for review), `withdrawnBy`, and which links the
+  judge added. The
   dry run counts the rows that lose one.
 - Stdout and stderr carry ids, counts, scope labels and codes only.
 

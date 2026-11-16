@@ -232,11 +232,10 @@ interface CachedPrincipal {
 
 const principalCache = new Map<string, CachedPrincipal>();
 const inflightPrincipals = new Map<string, Promise<Principal>>();
-// Bumped on every invalidation, so a resolution that started before a grant or delegation change is not cached.
+// A resolution that spans an invalidation is neither cached nor trusted: it may predate a revocation.
 let principalCacheGeneration = 0;
 let nextListenerCacheId = 0;
 
-// The tables a principal is resolved from: a change to either invalidates the cache.
 function authTables(): any[] {
 	const memory = (databases as any).memory;
 	return [memory?.ScopeGrant, memory?.Delegation];
@@ -276,9 +275,8 @@ async function resolveSubscriberPrincipal(
 	const promise: Promise<Principal> = resolvePrincipal(authContext).then(
 		(resolved) => {
 			if (inflightPrincipals.get(key) === promise) inflightPrincipals.delete(key);
-			if (generation === principalCacheGeneration) {
-				principalCache.set(key, { principal: resolved, expiresAtMs: Date.now() + PRINCIPAL_CACHE_TTL_MS });
-			}
+			if (generation !== principalCacheGeneration) return resolvePrincipal(authContext);
+			principalCache.set(key, { principal: resolved, expiresAtMs: Date.now() + PRINCIPAL_CACHE_TTL_MS });
 			return resolved;
 		},
 		(error) => {

@@ -175,6 +175,8 @@ Rules:
    links or lists candidates, apart from the customer-content review (rule 4). A delegate must still read the
    memory through its labels (`actsAsOwner`): delegation never adds the owner's other labels or the owner's
    ownership-based reads (withdrawn, content-flagged), so a delegate that cannot read gets what a stranger gets.
+   The owner keeps its own read of whatever labels a delegate gives its memory, as it does after a customer
+   reviewer's rescope; a delegate can publish to the principal through `user:<actsFor>` anyway.
    Read access never grants edit; a reader that is not the owner gets 403 (`not_memory_owner`; on a revise it
    names the route left, a merged replacement with `supersedes: [id]`), and a non-reader gets 404 on `DELETE`
    or 409 `id_unavailable` on `PUT`.

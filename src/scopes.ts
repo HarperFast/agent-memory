@@ -169,10 +169,7 @@ export function matches(patterns: readonly string[], label: string): boolean {
 	return covers((patterns as CompiledList)[MATCHER]!, label);
 }
 
-/**
- * `onRejected` hears each grant pattern and each `actsFor` that grants nothing. An `actsFor` naming the principal
- * itself, or one that is not a valid principal id, is ignored: `:` would let it forge a label (`user:a:b`).
- */
+/** An invalid `actsFor` is ignored, not rejected: `:` would let it forge a label (`user:a:b`). */
 export function createPrincipal(
 	input: PrincipalInput,
 	onRejected?: (value: unknown, kind: 'pattern' | 'actsFor') => void,
@@ -248,7 +245,6 @@ export function actsAsOwner(record: ScopedRecord, principal: Principal): boolean
 	);
 }
 
-/** The memories shown as the caller's own (bootstrap, own-flag events): owned, or in its principal's private scope. */
 export function inOwnView(record: ScopedRecord, principal: Principal): boolean {
 	return (
 		record.ownerId === principal.id ||
@@ -283,9 +279,9 @@ export function isSuperset(next: readonly string[], previous: readonly string[])
 }
 
 /**
- * A create's scopes and owner. A delegate's private shorthand lands in its principal's scope, and a create carrying
- * exactly that label belongs to the principal, so the principal and its other delegates can edit it. Any other
- * create belongs to its writer: a mixed create stays editable, and readable through content flags, by the writer.
+ * A delegate's create carrying exactly its principal's label belongs to the principal, so the principal's other
+ * delegates can edit it. Any other create stays the writer's, so an uncleared writer can still read and fix it once
+ * content-flagged (the owner exemption in `canRead`).
  */
 export function createScopesAndOwner(
 	scopes: unknown,
@@ -359,6 +355,11 @@ export function readableConditions(principal: Principal): Condition[] {
 	for (const namespace of namespaces) {
 		labels.push({ attribute: 'scopes', comparator: 'gelt', value: [`${namespace}:`, `${namespace};`] });
 	}
-	if (readsCustomerContent(principal)) return [anyOf(labels)];
-	return [anyOf(labels), anyOf([{ attribute: 'contentFlagged', comparator: 'not_equal', value: true }, owned])];
+	return [anyOf(labels), ...quarantineConditions(principal)];
+}
+
+export function quarantineConditions(principal: Principal): Condition[] {
+	if (readsCustomerContent(principal)) return [];
+	const owned: Condition = { attribute: 'ownerId', comparator: 'equals', value: principal.id };
+	return [anyOf([{ attribute: 'contentFlagged', comparator: 'not_equal', value: true }, owned])];
 }

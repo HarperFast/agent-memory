@@ -9,7 +9,6 @@ const require = createRequire(import.meta.url);
 const fixturePath = join(import.meta.dirname, 'fixtures', 'memory-app');
 const PASSWORD = 'Delegation-test-1!';
 
-// kris is the person; agent-a acts for kris with global-only grants; carol is someone else.
 suite('@harperfast/agent-memory delegation over HTTP', (ctx: ContextWithHarper) => {
 	const basic = (username: string, password: string) =>
 		'Basic ' + Buffer.from(`${username}:${password}`).toString('base64');
@@ -47,6 +46,45 @@ suite('@harperfast/agent-memory delegation over HTTP', (ctx: ContextWithHarper) 
 			parsed = text;
 		}
 		return { status: response.status, body: parsed };
+	}
+
+	async function openSSE(user: string, urlPath: string) {
+		const controller = new AbortController();
+		const response = await fetch(`${ctx.harper.httpURL}${urlPath}`, {
+			headers: { Accept: 'text/event-stream', Authorization: basic(user, PASSWORD) },
+			signal: controller.signal,
+		});
+		strictEqual(response.status, 200);
+		const events: any[] = [];
+		const reader = response.body!.getReader();
+		const decoder = new TextDecoder();
+		let buffer = '';
+		void (async () => {
+			try {
+				while (true) {
+					const { value, done } = await reader.read();
+					if (done) break;
+					buffer += decoder.decode(value, { stream: true });
+					const lines = buffer.split('\n');
+					buffer = lines.pop() ?? '';
+					for (const line of lines) {
+						const raw = line.startsWith('data:') ? line.slice(5).trim() : '';
+						if (raw) events.push(JSON.parse(raw));
+					}
+				}
+			} catch {}
+		})();
+		return {
+			events,
+			async waitFor(predicate: (event: any) => boolean, timeoutMs = 10_000) {
+				const deadline = Date.now() + timeoutMs;
+				while (!events.some(predicate)) {
+					if (Date.now() > deadline) throw new Error(`no matching event in ${JSON.stringify(events)}`);
+					await new Promise((resolve) => setTimeout(resolve, 50));
+				}
+			},
+			close: () => controller.abort(),
+		};
 	}
 
 	const memId = (tag: string) => `mem-dlg-${tag}`.padEnd(16, '_');
@@ -142,6 +180,42 @@ suite('@harperfast/agent-memory delegation over HTTP', (ctx: ContextWithHarper) 
 		ok(!carolSees.includes(byAgent) && !carolSees.includes(byKris));
 		const agentSees = (await call('agent-a', 'GET', '?limit=50')).body.memories.map((memory: any) => memory.id);
 		ok(agentSees.includes(byAgent) && agentSees.includes(byKris));
+	});
+
+	test('bootstrap and live events follow user:<principal>, and a revoked row stops them', async () => {
+		const note = memId('live-note');
+		const shared = memId('live-shared');
+		const stream = await openSSE('agent-a', '/Memory/');
+		try {
+			strictEqual(
+				(await call('kris', 'PUT', shared, { title: 'shared', content: 'kris shared', visibility: 'shared' })).status,
+				201,
+			);
+			strictEqual((await call('kris', 'PUT', note, { title: 'note', content: 'kris private' })).status, 201);
+			await stream.waitFor((event) => event.id === note && event.kind === 'created');
+
+			const boot = await call('agent-a', 'GET', 'bootstrap?budget=100000');
+			strictEqual(boot.status, 200, JSON.stringify(boot.body));
+			const recent = boot.body.memories
+				.filter((memory: any) => memory.section === 'recent')
+				.map((memory: any) => memory.id);
+			ok(recent.includes(note), JSON.stringify(recent));
+			ok(!recent.includes(shared), JSON.stringify(recent));
+
+			await revoke('agent-a');
+			await new Promise((resolve) => setTimeout(resolve, 500));
+			strictEqual((await call('kris', 'PUT', note, { content: 'kris private v2' }, 1)).status, 200);
+			const sentinel = memId('live-sentinel');
+			strictEqual(
+				(await call('kris', 'PUT', sentinel, { title: 's', content: 'sentinel', visibility: 'shared' })).status,
+				201,
+			);
+			await stream.waitFor((event) => event.id === sentinel);
+			ok(!stream.events.some((event) => event.id === note && event.revision === 2), JSON.stringify(stream.events));
+		} finally {
+			stream.close();
+			await delegate('agent-a', 'kris');
+		}
 	});
 
 	test("a global-only delegate is denied the principal's customer memory", async () => {

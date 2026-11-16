@@ -20,6 +20,7 @@ import {
 	canRead,
 	isScopeLabel,
 	ownViewCondition,
+	quarantineConditions,
 	readableConditions,
 	type Condition,
 	type Principal,
@@ -560,8 +561,11 @@ export async function bootstrapMemories(params: BootstrapParams, principal: Prin
 	const active = { attribute: 'status', comparator: 'equals', value: STATUS_ACTIVE };
 	const unexpired = unexpiredCondition(new Date());
 	const readable = readableConditions(principal);
-	// A delegate's own view adds its principal's private scope, which it reads through labels, quarantine included.
-	const own = principal.actsFor === null ? [ownViewCondition(principal)] : [ownViewCondition(principal), ...readable];
+	// Both arms of a delegate's own view are readable labels; only the quarantine can still exclude a row.
+	const own =
+		principal.actsFor === null
+			? [ownViewCondition(principal)]
+			: [ownViewCondition(principal), ...quarantineConditions(principal)];
 	const recentFirst = { attribute: 'updatedAt', descending: true };
 	// One lookup per flag source across every section.
 	const access = new Map<string, Promise<any>>();
