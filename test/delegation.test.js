@@ -24,8 +24,13 @@ const parse = async (response) => ({ status: response.status, body: await respon
 const stored = (id) => __test.stores.get('Memory').get(id);
 
 const grant = (id, read, write) => databases.memory.ScopeGrant.put({ id, read, write });
-const delegate = (id, actsFor) => databases.memory.Delegation.put({ id, actsFor });
-const revoke = (id) => databases.memory.Delegation.delete(id);
+// actsFor lives on the delegate's user ScopeGrant row, beside its own grants.
+async function setActsFor(id, actsFor) {
+	const row = await databases.memory.ScopeGrant.get(`user:${id}`);
+	await databases.memory.ScopeGrant.put({ ...row, id: `user:${id}`, actsFor });
+}
+const delegate = (id, actsFor) => setActsFor(id, actsFor);
+const revoke = (id) => setActsFor(id, null);
 
 const put = async (user, id, body, revision) =>
 	parse(await MemoryItemResource.put(target('', { id }), body, ctx(user, revision)));

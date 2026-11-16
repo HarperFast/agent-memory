@@ -91,11 +91,12 @@ Requires Harper 5.3.1 or later within 5.x, on RocksDB (the default).
    }
    ```
 
-   To let a person's agents act for the person, add one `Delegation` row per agent user, keyed by the agent:
-   `{ "id": "kris-laptop-agent", "actsFor": "kris" }` (table `Delegation`, same `upsert`). The agent may then
-   revise, withdraw and confirm kris's memories, and reads and writes `user:kris` (its private writes land there,
-   owned by kris). It keeps its own grants for every other label, and delegation is never transitive; delete the
-   row to revoke it on the next request.
+   To let a person's agents act for the person, set `actsFor` on each agent user's own grant row:
+   `{ "id": "user:kris-laptop-agent", "actsFor": "kris" }` (same `upsert`, which keeps any `read`/`write` the row
+   has; an agent whose grants come from its role gets a row carrying only `actsFor`). The agent may then revise,
+   withdraw and confirm kris's memories, and reads and writes `user:kris` (its private writes land there, owned by
+   kris). It keeps its own grants for every other label, and delegation is never transitive; set `actsFor` to
+   `null` to revoke it on the next request. `actsFor` on a `role:` row grants nothing.
 
 3. Use it as any Harper user:
 
@@ -467,7 +468,7 @@ node scripts/copy-memories.mjs --from https://test.example.com --to https://app.
   and refuses if the target has a memory of its own or one that differs. Exit status is 0 only when the final
   comparison matches.
 - **Same people, same grants.** Labels are copied as they are, so `user:alice` and every `ScopeGrant` must mean the
-  same on the target. Grants, delegations, pins and watches are not copied; recreate the `ScopeGrant` and `Delegation` rows by hand.
+  same on the target. Grants (with `actsFor`), pins and watches are not copied; recreate the `ScopeGrant` rows by hand.
 - **Not carried:** revision numbers, author and last editor (the target records `source: import`), `confirmed`,
   `scopeConfirmed` (the target's own check may flag a memory again for review), `withdrawnBy`, and which links the
   judge added. The

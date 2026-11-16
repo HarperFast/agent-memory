@@ -236,9 +236,8 @@ const inflightPrincipals = new Map<string, Promise<Principal>>();
 let principalCacheGeneration = 0;
 let nextListenerCacheId = 0;
 
-function authTables(): any[] {
-	const memory = (databases as any).memory;
-	return [memory?.ScopeGrant, memory?.Delegation];
+function scopeGrantTable(): any {
+	return (databases as any).memory?.ScopeGrant;
 }
 
 function clearPrincipalCache(): void {
@@ -481,7 +480,7 @@ const tableListeners = new Set<HubListener>();
 const itemListeners = new Map<string, Set<HubListener>>();
 let hubSub: UpstreamSub | undefined;
 let watchHubSub: UpstreamSub | undefined;
-let authHubSubs: UpstreamSub[] = [];
+let grantHubSub: UpstreamSub | undefined;
 let hubOpening: Promise<void> | undefined;
 
 function closeUpstreamSub(sub: UpstreamSub | undefined): void {
@@ -494,10 +493,10 @@ function closeUpstreamSub(sub: UpstreamSub | undefined): void {
 function resetHubState(): void {
 	const activeMem = hubSub;
 	const activeWatch = watchHubSub;
-	const activeAuth = authHubSubs;
+	const activeGrant = grantHubSub;
 	hubSub = undefined;
 	watchHubSub = undefined;
-	authHubSubs = [];
+	grantHubSub = undefined;
 	watchesByPrincipal.clear();
 	seededWatchPrincipals.clear();
 	seedingWatchPrincipals.clear();
@@ -505,7 +504,7 @@ function resetHubState(): void {
 	clearPrincipalCache();
 	closeUpstreamSub(activeMem);
 	closeUpstreamSub(activeWatch);
-	for (const sub of activeAuth) closeUpstreamSub(sub);
+	closeUpstreamSub(activeGrant);
 }
 
 function teardownActiveHub(): void {
@@ -538,29 +537,29 @@ async function ensureHubSubscription(): Promise<void> {
 	opening = (async () => {
 		let rawSub: UpstreamSub | undefined;
 		let rawWatchSub: UpstreamSub | undefined;
-		const rawAuthSubs: UpstreamSub[] = [];
+		let rawGrantSub: UpstreamSub | undefined;
 		try {
 			await null;
 			const Memory = memoryTable();
 			const MemoryWatch = memoryWatchTable();
+			const ScopeGrant = scopeGrantTable();
 			const memSub: UpstreamSub = await Memory.subscribe({ omitCurrent: true, includeSuperseded: true }, {});
 			rawSub = memSub;
 			rawWatchSub =
 				typeof MemoryWatch?.subscribe === 'function'
 					? await MemoryWatch.subscribe({ omitCurrent: true }, {})
 					: undefined;
-			for (const table of authTables()) {
-				if (typeof table?.subscribe === 'function') rawAuthSubs.push(await table.subscribe({ omitCurrent: true }, {}));
-			}
+			rawGrantSub =
+				typeof ScopeGrant?.subscribe === 'function' ? await ScopeGrant.subscribe({ omitCurrent: true }, {}) : undefined;
 			if (tableListeners.size === 0 && itemListeners.size === 0) {
 				closeUpstreamSub(rawSub);
 				closeUpstreamSub(rawWatchSub);
-				for (const sub of rawAuthSubs) closeUpstreamSub(sub);
+				closeUpstreamSub(rawGrantSub);
 				return;
 			}
 			hubSub = memSub;
 			watchHubSub = rawWatchSub;
-			authHubSubs = rawAuthSubs;
+			grantHubSub = rawGrantSub;
 
 			if (rawWatchSub) {
 				const watchSub = rawWatchSub;
@@ -580,17 +579,18 @@ async function ensureHubSubscription(): Promise<void> {
 				})();
 			}
 
-			for (const authSub of rawAuthSubs) {
+			if (rawGrantSub) {
+				const grantSub = rawGrantSub;
 				void (async () => {
 					try {
-						for await (const _ of authSub) {
-							if (!authHubSubs.includes(authSub)) break;
+						for await (const _ of grantSub) {
+							if (grantHubSub !== grantSub) break;
 							clearPrincipalCache();
 						}
 					} catch (error) {
-						if (authHubSubs.includes(authSub)) normalizeError(error, 'subscribe');
+						if (grantHubSub === grantSub) normalizeError(error, 'subscribe');
 					} finally {
-						if (authHubSubs.includes(authSub)) {
+						if (grantHubSub === grantSub) {
 							teardownActiveHub();
 						}
 					}
@@ -618,7 +618,7 @@ async function ensureHubSubscription(): Promise<void> {
 		} catch (error) {
 			closeUpstreamSub(rawSub);
 			closeUpstreamSub(rawWatchSub);
-			for (const sub of rawAuthSubs) closeUpstreamSub(sub);
+			closeUpstreamSub(rawGrantSub);
 			throw error;
 		} finally {
 			if (hubOpening === opening) {

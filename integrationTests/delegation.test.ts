@@ -88,9 +88,16 @@ suite('@harperfast/agent-memory delegation over HTTP', (ctx: ContextWithHarper) 
 	}
 
 	const memId = (tag: string) => `mem-dlg-${tag}`.padEnd(16, '_');
-	const delegate = (id: string, actsFor: string) =>
-		operation({ operation: 'upsert', database: 'memory', table: 'Delegation', records: [{ id, actsFor }] });
-	const revoke = (id: string) => operation({ operation: 'delete', database: 'memory', table: 'Delegation', ids: [id] });
+	// actsFor rides the delegate's user ScopeGrant row; agent-a's grants come from its role, so the row carries only it.
+	const setActsFor = (id: string, actsFor: string | null) =>
+		operation({
+			operation: 'upsert',
+			database: 'memory',
+			table: 'ScopeGrant',
+			records: [{ id: `user:${id}`, actsFor }],
+		});
+	const delegate = (id: string, actsFor: string) => setActsFor(id, actsFor);
+	const revoke = (id: string) => setActsFor(id, null);
 
 	before(async () => {
 		await setupHarperWithFixture(ctx, fixturePath, {

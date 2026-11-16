@@ -48,16 +48,11 @@ type MemoryPin @table(database: "memory") @sealed {
 }
 
 # Keyed "role:<roleName>" or "user:<username>". Patterns are exact labels or "<namespace>:*".
+# actsFor, on a user row only, names the principal this user acts for (DESIGN.md Identity › Delegation).
 type ScopeGrant @table(database: "memory", audit: true) {
 	id: ID @primaryKey
 	read: [String]
 	write: [String]
-	updatedAt: Date @updatedTime
-}
-
-# Keyed by the delegate's principal id.
-type Delegation @table(database: "memory", audit: true) {
-	id: ID @primaryKey
 	actsFor: String
 	updatedAt: Date @updatedTime
 }

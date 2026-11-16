@@ -245,7 +245,6 @@ export const databases = {
 		MemoryPin: new StubTable('MemoryPin'),
 		MemoryWatch: new StubTable('MemoryWatch'),
 		ScopeGrant: new StubTable('ScopeGrant'),
-		Delegation: new StubTable('Delegation'),
 	},
 };
 export const tables = {};

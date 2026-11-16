@@ -39,7 +39,7 @@ export interface ScopeMatcher {
  * `read` and `write` are the effective grant patterns: `user:<id>` (and `user:<actsFor>`) first, then exact labels,
  * then namespace wildcards (`customer:*`). A pattern that grants nothing (invalid, in the `user` namespace, past
  * MAX_GRANT_PATTERNS, or inside a granted wildcard) is not listed. A super_user's lists do not enumerate its
- * access; `superUser` does. `actsFor` is the principal this one acts for (a Delegation), or null.
+ * access; `superUser` does. `actsFor` is the principal this one acts for (delegation), or null.
  */
 export interface Principal {
 	readonly id: string;

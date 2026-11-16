@@ -23,13 +23,14 @@ All notable changes to `@harperfast/agent-memory` are documented here. The forma
 
 ### Added
 
-- Delegation ([#55](https://github.com/HarperFast/agent-memory/issues/55)): a `Delegation` row
-  `{ id: <delegate>, actsFor: <principal> }` lets a person's agent users act for the person. A delegate may revise,
+- Delegation ([#55](https://github.com/HarperFast/agent-memory/issues/55)): `actsFor` on an agent user's
+  `ScopeGrant` row (`{ id: "user:<delegate>", actsFor: <principal> }`) lets a person's agent users act for the person. A delegate may revise,
   withdraw, confirm, link and list candidates for the principal's memories (`ownerId` stays the principal; `lastEditor`,
   `confirmed.by` and the new `withdrawnBy` name the delegate) and reads and writes `user:<principal>`: its private
   writes land there, owned by the principal, so the principal and every other delegate can edit them. A delegate
   still reads only through labels, so it never reaches a memory its own grants do not. The row is read on every
-  request, and deleting it revokes the delegation on the next one. `resolvePrincipal` returns `actsFor`, and a custom
+  request, and clearing `actsFor` revokes the delegation on the next one; `actsFor` on a `role:` row grants nothing.
+  `provision-user.sh --acts-for <user>` sets it. `resolvePrincipal` returns `actsFor`, and a custom
   principal resolver may return it.
 - A delegate's bootstrap `recent` and `needsReview` sections, and its `/MemoryEvents` flag notices, include memories in
   its principal's private scope.

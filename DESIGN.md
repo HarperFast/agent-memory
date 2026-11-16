@@ -64,8 +64,8 @@ database).
   every embed into another vector space, with no refusal to see. One write, import or search takes its model,
   caps and flag from one settings snapshot (`EmbeddingSettings`); the table embedder truncates only a row
   recorded under the configured `embeddingModel`.
-- `ScopeGrant` — read/write scope patterns held by a Harper role or user.
-- `Delegation` — the principal a delegate acts for (Identity), keyed by the delegate's principal id.
+- `ScopeGrant` — read/write scope patterns held by a Harper role or user; a user's row may also name the
+  principal it acts for (`actsFor`, Identity).
 - `MemoryPin` — a principal's pinned memories (`<principalId>:<memoryId>`), loaded first at session bootstrap.
 - `MemoryWatch` — a principal's time-bounded interest in specific memories (live updates).
 
@@ -113,12 +113,16 @@ Principal ids must not contain whitespace, `:` or `*`, and are capped at 122 cha
 `user:<id>` fits a 128-character scope label.
 
 **Delegation.** A person often reaches the plugin through several principals: their own user (owning history
-imported for them) and one agent user per machine. A `Delegation` row `{ id: <delegate>, actsFor: <principal> }`
-lets the delegate act for the principal: edit the principal's memories and share its private scope (Scopes and
-grants). Keyed by the delegate, so a principal acts for at most one other and its private writes have one
-destination; only the caller's own row is read, so it is not transitive. The default resolution reads it with the
-grants on every request, so deleting it takes effect on the next request; a custom resolver returns `actsFor`
-itself. An `actsFor` naming the principal itself, or not a valid principal id, grants nothing and is logged.
+imported for them) and one agent user per machine. `actsFor` on the delegate's user grant row
+(`ScopeGrant` `{ id: "user:<delegate>", actsFor: <principal> }`) lets the delegate act for the principal: edit the
+principal's memories and share its private scope (Scopes and grants). It sits on the user row because that row is
+already keyed by the delegate and read on every request; a delegate whose grants all come from its role gets a
+user row carrying only `actsFor`. One field per delegate, so a principal acts for at most one other and its private
+writes have one destination; only the caller's own row is read, so it is not transitive. The default resolution
+reads it on every request, so clearing it (or deleting the row) takes effect on the next request; a custom
+resolver returns `actsFor` itself. An `actsFor` naming the principal itself, or not a valid principal id, grants
+nothing and is logged. So does one on a `role:` row: a role is shared by many people's agents, so it can never
+name the one principal they act for.
 Delegation never merges the two principals: `author`, `lastEditor`, `confirmed.by` and `withdrawnBy` name the
 delegate, and the delegate keeps its own grants and `user:<self>`.
 
@@ -145,7 +149,7 @@ Each memory carries `scopes: [String]`. A caller sees a memory when **any** of i
 caller's readable set. To restrict content, use one specific label (`customer:acme`), not a list.
 
 Grants are `ScopeGrant` rows keyed `role:<roleName>` or `user:<username>`, with `read` and `write`
-pattern lists. A pattern is an exact label or a namespace wildcard (`customer:*`); a wildcard never
+pattern lists (a user row may also carry `actsFor`, Identity). A pattern is an exact label or a namespace wildcard (`customer:*`); a wildcard never
 covers the bare `global`. Every principal implicitly reads and writes `user:<self>`, a delegate also
 `user:<actsFor>`, and no grant reaches into the `user` namespace: `user:<id>` means the owner and its
 delegates only, so a pattern such as `user:*` or `user:bob` is ignored rather than quietly opening private
@@ -605,8 +609,8 @@ Three levels, built in order:
 1. **Record changes**: `Memory` (`/Memory` and `/Memory/<id>`) supports Harper real-time subscriptions
    over WebSocket and SSE (`Accept: text/event-stream`). Every event is checked against the subscriber's
    read rule (`canRead`) at delivery time: `ScopeGrant` rows and custom principal resolver results are
-   cached for up to 5 s and invalidated via the worker hub's `ScopeGrant` and `Delegation` subscriptions (a
-   resolution that began before an invalidation is not cached), so a scope
+   cached for up to 5 s and invalidated via the worker hub's `ScopeGrant` subscription, which carries
+   `actsFor` too (a resolution that began before an invalidation is not cached), so a scope
    narrowing or grant revocation revokes visibility mid-subscription; Harper user role assignments on
    `context.user` are captured when the connection opens and take effect on reconnect. For `withdrawn`,
    read access checks the memory's scope labels ignoring `status = withdrawn` (matching Provenance), so
@@ -621,7 +625,7 @@ Three levels, built in order:
    window, rows may replay their stored `lastEventKind`, which clients handle idempotently by comparing
    `revision`. If a slow subscriber accumulates more than 256 undrained events in its client buffer (or
    its filter stalls for 30 s with 256 pending events), or if the worker's `Memory`, `MemoryWatch`, or
-   `ScopeGrant` or `Delegation` subscription ends, active streams close so the client reconnects and re-reads watched ids
+   `ScopeGrant` subscription ends, active streams close so the client reconnects and re-reads watched ids
    (comparing `revision`) or re-bootstraps (`watch=true`) to catch up.
 2. **Watches**: `POST /Memory/watch { ids, ttlSeconds? }` (1–100 ids; `ttlSeconds` integer in
    `1..86400`, default 3600) and `watch=true` on search and bootstrap record `MemoryWatch` rows
@@ -765,7 +769,7 @@ context })` (sync or async) returns a `Map` from memory id to a JSON value, or n
   return or the objects they are handed. They are awaited with no time bound, so a slow one delays the response.
 - `setPrincipalResolver(fn)` — see Identity.
 - `resolvePrincipal(context)` — the caller behind a request context, resolved exactly as the plugin's own routes
-  resolve it (custom resolver, else the Harper user, its `ScopeGrant` rows and its `Delegation` row, read on every
+  resolve it (custom resolver, else the Harper user and its `ScopeGrant` rows, `actsFor` included, read on every
   call). It resolves to a frozen `{ id, superUser, source, actsFor, read, write }` (`actsFor` null unless
   delegating). `read` and `write` are frozen lists of the effective grant patterns: `user:<id>` (and
   `user:<actsFor>`) first, then exact labels, then namespace wildcards (`customer:*`), role and user
@@ -962,8 +966,8 @@ broader reads (labels are copied verbatim; that precondition is documented, not 
 - **Row**: the view's import fields (`contentFlag` and `needsReview` included), never the embedding: the target
   re-embeds with its own model. Not carried, because import cannot set them: `revision`, `author` / `lastEditor`,
   `confirmed`, `scopeConfirmed` (the target's own pattern check may flag the row again, which fails closed),
-  `autoSupersedes` (the links themselves are in `supersedes`), `withdrawnBy`, pins, watches, `ScopeGrant` and
-  `Delegation` rows.
+  `autoSupersedes` (the links themselves are in `supersedes`), `withdrawnBy`, pins, watches, and `ScopeGrant`
+  rows (`actsFor` included).
 - **Order**: successors first (Kahn's order over live rows' `supersedes`; withdrawn rows supersede nothing), so
   no batch ever supersedes a row already stored. Import would turn such a row superseded and flag its active
   citers, raising reviews the source's owners had already answered. Rows left on a cycle refuse the copy.
