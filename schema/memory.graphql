@@ -31,6 +31,7 @@ type Memory @table(database: "memory", audit: true) {
 	validUntil: Date
 	withdrawnAt: Date
 	withdrawnReason: String
+	withdrawnBy: String
 	# The plugin installs its own embedder for every model; it embeds with the model recorded on the row.
 	embedding: [Float] @embed(source: "content", model: "default")
 	embeddingModel: String @indexed
@@ -51,6 +52,13 @@ type ScopeGrant @table(database: "memory", audit: true) {
 	id: ID @primaryKey
 	read: [String]
 	write: [String]
+	updatedAt: Date @updatedTime
+}
+
+# Keyed by the delegate's principal id: that principal acts for `actsFor` (DESIGN.md Identity).
+type Delegation @table(database: "memory", audit: true) {
+	id: ID @primaryKey
+	actsFor: String
 	updatedAt: Date @updatedTime
 }
 

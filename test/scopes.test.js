@@ -1,10 +1,13 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+	actsAsOwner,
 	assertWritable,
 	canRead,
 	compileMatcher,
 	createPrincipal,
+	createScopesAndOwner,
+	inOwnView,
 	isSuperset,
 	matches,
 	MAX_GRANT_PATTERNS,
@@ -281,5 +284,85 @@ describe('the customer-content quarantine', () => {
 		assert.equal(reviewsCustomerContent(principal('dave', [], ['customer:*'])), false);
 		assert.equal(reviewsCustomerContent(principal('dave', ['customer:*'], ['customer:*'])), true);
 		assert.equal(reviewsCustomerContent(principal('root', [], [], true)), true);
+	});
+});
+
+describe('delegation', () => {
+	const agent = (read = ['global'], write = ['global']) =>
+		createPrincipal({ id: 'agent-a', actsFor: 'kris', grants: { read, write } });
+
+	it("adds the principal's private label to both matchers, outside the pattern cap", () => {
+		const delegate = agent();
+		assert.equal(delegate.actsFor, 'kris');
+		assert.deepEqual(delegate.read, ['user:agent-a', 'user:kris', 'global']);
+		assert.deepEqual(delegate.write, ['user:agent-a', 'user:kris', 'global']);
+		assert.ok(!matches(delegate.read, 'user:bob'));
+
+		const many = Array.from({ length: MAX_GRANT_PATTERNS + 5 }, (_, i) => `team:t${i}`);
+		const capped = compileMatcher(many, 'agent-a', 'kris');
+		assert.equal(capped.matcher.exact.size, MAX_GRANT_PATTERNS + 2);
+		assert.equal(capped.rejected.length, 5);
+	});
+
+	it('ignores an actsFor that is not a valid principal id, or names the principal itself', () => {
+		for (const actsFor of [42, '', 'a:b', 'two words', 'team*', 'agent-a', 'x'.repeat(123), { id: 'kris' }]) {
+			const reported = [];
+			const delegate = createPrincipal({ id: 'agent-a', actsFor }, (value, kind) => reported.push([value, kind]));
+			assert.equal(delegate.actsFor, null, JSON.stringify(actsFor));
+			assert.deepEqual(delegate.read, ['user:agent-a']);
+			assert.deepEqual(reported, [[actsFor, 'actsFor']]);
+		}
+		assert.equal(createPrincipal({ id: 'agent-a', actsFor: null }).actsFor, null);
+	});
+
+	it("searches the principal's private label exactly, and never by the principal's ownership", () => {
+		const [labels] = readableConditions(agent());
+		assert.deepEqual(labels.conditions, [
+			{ attribute: 'ownerId', comparator: 'equals', value: 'agent-a' },
+			{ attribute: 'scopes', comparator: 'equals', value: 'user:agent-a' },
+			{ attribute: 'scopes', comparator: 'equals', value: 'user:kris' },
+			{ attribute: 'scopes', comparator: 'equals', value: 'global' },
+		]);
+	});
+
+	it('edits as the owner only what it can read through its labels', () => {
+		const delegate = agent();
+		const owned = { ownerId: 'kris', status: 'active' };
+		assert.ok(actsAsOwner({ ...owned, scopes: ['global'] }, delegate));
+		assert.ok(actsAsOwner({ ...owned, scopes: ['user:kris'] }, delegate));
+		assert.ok(actsAsOwner({ ownerId: 'agent-a', scopes: ['customer:x'], status: 'active' }, delegate));
+		assert.ok(!actsAsOwner({ ...owned, scopes: ['customer:x'] }, delegate));
+		assert.ok(!actsAsOwner({ ...owned, scopes: ['global'], status: 'withdrawn' }, delegate));
+		assert.ok(!actsAsOwner({ ...owned, scopes: ['global'], contentFlag: { kind: 'x' } }, delegate));
+		assert.ok(!actsAsOwner({ ownerId: 'bob', scopes: ['global'], status: 'active' }, delegate));
+		assert.ok(!actsAsOwner({ ...owned, scopes: ['global'] }, principal('carol', ['global'])));
+	});
+
+	it("puts a delegate's private create in its principal's scope, owned by the principal only when exactly private", () => {
+		const delegate = agent();
+		assert.deepEqual(createScopesAndOwner(undefined, undefined, delegate), { scopes: ['user:kris'], ownerId: 'kris' });
+		assert.deepEqual(createScopesAndOwner(undefined, 'private', delegate), { scopes: ['user:kris'], ownerId: 'kris' });
+		assert.deepEqual(createScopesAndOwner(['user:kris'], undefined, delegate), {
+			scopes: ['user:kris'],
+			ownerId: 'kris',
+		});
+		assert.equal(createScopesAndOwner(['user:kris', 'global'], undefined, delegate).ownerId, 'agent-a');
+		assert.equal(createScopesAndOwner(undefined, 'shared', delegate).ownerId, 'agent-a');
+		assert.deepEqual(createScopesAndOwner(['user:agent-a'], undefined, delegate), {
+			scopes: ['user:agent-a'],
+			ownerId: 'agent-a',
+		});
+		assert.deepEqual(createScopesAndOwner(undefined, undefined, principal('carol')), {
+			scopes: ['user:carol'],
+			ownerId: 'carol',
+		});
+	});
+
+	it("counts the principal's private scope as the delegate's own view", () => {
+		const delegate = agent();
+		assert.ok(inOwnView({ ownerId: 'agent-a', scopes: ['global'] }, delegate));
+		assert.ok(inOwnView({ ownerId: 'kris', scopes: ['user:kris'] }, delegate));
+		assert.ok(!inOwnView({ ownerId: 'kris', scopes: ['global'] }, delegate));
+		assert.ok(!inOwnView({ ownerId: 'kris', scopes: ['user:kris'] }, principal('carol')));
 	});
 });

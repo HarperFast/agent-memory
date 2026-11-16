@@ -27,6 +27,7 @@ describe('resolvePrincipal', () => {
 			id: 'alice',
 			superUser: false,
 			source: 'harper',
+			actsFor: null,
 			read: ['user:alice', 'team:a', 'global', 'customer:*'],
 			write: ['user:alice', 'team:a', 'global'],
 		});
@@ -80,6 +81,7 @@ describe('resolvePrincipal', () => {
 			id: 'reflex-svc',
 			superUser: false,
 			source: 'api-key',
+			actsFor: null,
 			read: ['user:reflex-svc', 'global', 'team:*'],
 			write: ['user:reflex-svc'],
 		});
@@ -140,6 +142,65 @@ describe('resolvePrincipal', () => {
 		assert.ok(canReadLabels(await resolvePrincipal(member('alice')), ['team:a']));
 		await databases.memory.ScopeGrant.delete('user:alice');
 		assert.ok(!canReadLabels(await resolvePrincipal(member('alice')), ['team:a']));
+	});
+});
+
+describe('delegation', () => {
+	const delegate = (id, actsFor) => databases.memory.Delegation.put({ id, actsFor });
+
+	it('reads the Delegation row on every call, so a revoked delegation is gone from the next principal', async () => {
+		await grant('user:agent-a', ['global'], ['global']);
+		await delegate('agent-a', 'kris');
+		const acting = await resolvePrincipal(member('agent-a'));
+		assert.equal(acting.actsFor, 'kris');
+		assert.deepEqual(acting.read, ['user:agent-a', 'user:kris', 'global']);
+		assert.deepEqual(acting.write, ['user:agent-a', 'user:kris', 'global']);
+		await databases.memory.Delegation.delete('agent-a');
+		const revoked = await resolvePrincipal(member('agent-a'));
+		assert.equal(revoked.actsFor, null);
+		assert.deepEqual(revoked.read, ['user:agent-a', 'global']);
+	});
+
+	it('ignores a malformed row and a row for super_user', async () => {
+		await delegate('agent-a', 'not:valid');
+		assert.equal((await resolvePrincipal(member('agent-a'))).actsFor, null);
+		await delegate('agent-a', 7);
+		assert.equal((await resolvePrincipal(member('agent-a'))).actsFor, null);
+		await delegate('root', 'kris');
+		assert.equal((await resolvePrincipal(superUser)).actsFor, null);
+	});
+
+	it("takes a custom resolver's actsFor, and the row's through next()", async () => {
+		await delegate('agent-a', 'kris');
+		setPrincipalResolver((context, next) =>
+			context.headers?.['x-api-key'] ? { id: 'svc-agent', actsFor: 'kris', source: 'api-key' } : next(),
+		);
+		assert.equal((await resolvePrincipal({ headers: { 'x-api-key': 'k' } })).actsFor, 'kris');
+		assert.equal((await resolvePrincipal(member('agent-a'))).actsFor, 'kris');
+	});
+
+	it('reads the row in a context of its own and rejects with the original error when the read fails', async () => {
+		const Delegation = databases.memory.Delegation;
+		const originalGet = Delegation.get;
+		const contexts = [];
+		Delegation.get = function (id, context) {
+			contexts.push(context);
+			return originalGet.call(this, id, context);
+		};
+		const caller = { ...member('agent-a'), authorize: true };
+		try {
+			await resolvePrincipal(caller);
+			assert.equal(contexts.length, 1);
+			assert.equal(contexts[0].authorize, false);
+			assert.equal(caller.authorize, true);
+			const outage = new Error('storage unavailable');
+			Delegation.get = async () => {
+				throw outage;
+			};
+			await assert.rejects(resolvePrincipal(member('agent-a')), (error) => error === outage);
+		} finally {
+			Delegation.get = originalGet;
+		}
 	});
 });
 

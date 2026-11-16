@@ -27,6 +27,7 @@ export interface PrincipalInput {
 	superUser?: boolean;
 	source?: string;
 	grants?: GrantPatterns;
+	actsFor?: unknown;
 }
 
 export interface ScopeMatcher {
@@ -35,15 +36,16 @@ export interface ScopeMatcher {
 }
 
 /**
- * `read` and `write` are the effective grant patterns: `user:<id>` first, then exact labels, then namespace
- * wildcards (`customer:*`). A pattern that grants nothing (invalid, in the `user` namespace, past
+ * `read` and `write` are the effective grant patterns: `user:<id>` (and `user:<actsFor>`) first, then exact labels,
+ * then namespace wildcards (`customer:*`). A pattern that grants nothing (invalid, in the `user` namespace, past
  * MAX_GRANT_PATTERNS, or inside a granted wildcard) is not listed. A super_user's lists do not enumerate its
- * access; `superUser` does.
+ * access; `superUser` does. `actsFor` is the principal this one acts for (a Delegation), or null.
  */
 export interface Principal {
 	readonly id: string;
 	readonly superUser: boolean;
 	readonly source: string;
+	readonly actsFor: string | null;
 	readonly read: readonly string[];
 	readonly write: readonly string[];
 }
@@ -69,6 +71,12 @@ export function isScopeLabel(label: unknown): label is string {
 	);
 }
 
+function isPrincipalId(id: unknown): id is string {
+	return (
+		typeof id === 'string' && id.length > 0 && id.length <= PRINCIPAL_ID_MAX_CHARS && !PRINCIPAL_ID_FORBIDDEN.test(id)
+	);
+}
+
 export function requirePrincipalId(id: unknown): string {
 	if (typeof id !== 'string' || id.length === 0) {
 		throw memoryError('Authenticated principal required', 401, 'principal_required');
@@ -83,20 +91,24 @@ export function requirePrincipalId(id: unknown): string {
 }
 
 /**
- * Compile grant patterns into a matcher. `user:<self>` is always included. A pattern that is neither an exact
- * label nor `<namespace>:*` is reported in `rejected` and grants nothing; patterns past MAX_GRANT_PATTERNS too.
- * So is any pattern in the `user` namespace: `user:<id>` means the owner only, and a grant such as `user:*`
- * would quietly open every private memory. Reading everything is what super_user is for.
+ * Compile grant patterns into a matcher. `user:<self>` is always included, and `user:<actsFor>` for a delegate;
+ * neither counts toward MAX_GRANT_PATTERNS. A pattern that is neither an exact label nor `<namespace>:*` is
+ * reported in `rejected` and grants nothing; patterns past MAX_GRANT_PATTERNS too. So is any pattern in the
+ * `user` namespace: `user:<id>` means the owner only, and a grant such as `user:*` would quietly open every
+ * private memory. Reading everything is what super_user is for.
  */
 export function compileMatcher(
 	patterns: readonly unknown[] | undefined,
 	principalId: string,
+	actsFor?: string | null,
 ): { matcher: ScopeMatcher; rejected: unknown[] } {
 	const exact = new Set<string>([userScope(principalId)]);
+	if (actsFor) exact.add(userScope(actsFor));
+	const implicit = exact.size;
 	const namespaces = new Set<string>();
 	const rejected: unknown[] = [];
 	for (const pattern of patterns ?? []) {
-		if (exact.size + namespaces.size >= MAX_GRANT_PATTERNS + 1) {
+		if (exact.size + namespaces.size >= MAX_GRANT_PATTERNS + implicit) {
 			rejected.push(pattern);
 			continue;
 		}
@@ -157,15 +169,28 @@ export function matches(patterns: readonly string[], label: string): boolean {
 	return covers((patterns as CompiledList)[MATCHER]!, label);
 }
 
-export function createPrincipal(input: PrincipalInput, onRejectedPattern?: (pattern: unknown) => void): Principal {
+/**
+ * `onRejected` hears each grant pattern and each `actsFor` that grants nothing. An `actsFor` naming the principal
+ * itself, or one that is not a valid principal id, is ignored: `:` would let it forge a label (`user:a:b`).
+ */
+export function createPrincipal(
+	input: PrincipalInput,
+	onRejected?: (value: unknown, kind: 'pattern' | 'actsFor') => void,
+): Principal {
 	const id = requirePrincipalId(input.id);
-	const read = compileMatcher(input.grants?.read, id);
-	const write = compileMatcher(input.grants?.write, id);
-	if (onRejectedPattern) for (const pattern of [...read.rejected, ...write.rejected]) onRejectedPattern(pattern);
+	let actsFor: string | null = null;
+	if (input.actsFor !== undefined && input.actsFor !== null) {
+		if (isPrincipalId(input.actsFor) && input.actsFor !== id) actsFor = input.actsFor;
+		else onRejected?.(input.actsFor, 'actsFor');
+	}
+	const read = compileMatcher(input.grants?.read, id, actsFor);
+	const write = compileMatcher(input.grants?.write, id, actsFor);
+	if (onRejected) for (const pattern of [...read.rejected, ...write.rejected]) onRejected(pattern, 'pattern');
 	const principal = {
 		id,
 		superUser: input.superUser === true,
 		source: input.source || 'harper',
+		actsFor,
 		read: patternList(read.matcher),
 		write: patternList(write.matcher),
 	};
@@ -211,6 +236,32 @@ export function canRead(record: ScopedRecord, principal: Principal): boolean {
 	return canReadLabels(principal, record.scopes);
 }
 
+/**
+ * Rule 3's edit gate, short of super_user: the owner, or a principal acting for the owner that can read the memory.
+ * A delegate reads only through labels (its grants plus `user:<actsFor>`), so delegation never opens a memory its
+ * own grants do not.
+ */
+export function actsAsOwner(record: ScopedRecord, principal: Principal): boolean {
+	return (
+		record.ownerId === principal.id ||
+		(principal.actsFor !== null && record.ownerId === principal.actsFor && canRead(record, principal))
+	);
+}
+
+/** The memories shown as the caller's own (bootstrap, own-flag events): owned, or in its principal's private scope. */
+export function inOwnView(record: ScopedRecord, principal: Principal): boolean {
+	return (
+		record.ownerId === principal.id ||
+		(principal.actsFor !== null && (record.scopes ?? []).includes(userScope(principal.actsFor)))
+	);
+}
+
+export function ownViewCondition(principal: Principal): Condition {
+	const owned: Condition = { attribute: 'ownerId', comparator: 'equals', value: principal.id };
+	if (principal.actsFor === null) return owned;
+	return anyOf([owned, { attribute: 'scopes', comparator: 'equals', value: userScope(principal.actsFor) }]);
+}
+
 export function canWrite(scopes: readonly string[], principal: Principal): boolean {
 	const { write } = matchersOf(principal);
 	return principal.superUser || scopes.every((label) => covers(write, label));
@@ -229,6 +280,22 @@ export function assertWritable(scopes: readonly string[], principal: Principal):
 /** Supersede: every reader of the old memory (by label) must be able to read its replacement. */
 export function isSuperset(next: readonly string[], previous: readonly string[]): boolean {
 	return previous.every((label) => next.includes(label));
+}
+
+/**
+ * A create's scopes and owner. A delegate's private shorthand lands in its principal's scope, and a create carrying
+ * exactly that label belongs to the principal, so the principal and its other delegates can edit it. Any other
+ * create belongs to its writer: a mixed create stays editable, and readable through content flags, by the writer.
+ */
+export function createScopesAndOwner(
+	scopes: unknown,
+	visibility: unknown,
+	principal: Principal,
+): { scopes: string[]; ownerId: string } {
+	const { actsFor } = principal;
+	const resolved = normalizeScopes(scopes, visibility, actsFor ?? principal.id);
+	const privateToPrincipal = actsFor !== null && resolved.length === 1 && resolved[0] === userScope(actsFor);
+	return { scopes: resolved, ownerId: privateToPrincipal ? actsFor : principal.id };
 }
 
 /**

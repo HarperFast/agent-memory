@@ -10,7 +10,7 @@ import {
 } from './lifecycle.ts';
 import { hasCustomPrincipalResolver, resolvePrincipal } from './principal.ts';
 import { forReader } from './provenance.ts';
-import { canRead, type Principal } from './scopes.ts';
+import { canRead, inOwnView, type Principal } from './scopes.ts';
 
 const EVENT_KINDS = ['created', 'revised', 'superseded', 'withdrawn', 'restored', 'flagged'] as const;
 type MemoryEventKind = (typeof EVENT_KINDS)[number];
@@ -232,13 +232,18 @@ interface CachedPrincipal {
 
 const principalCache = new Map<string, CachedPrincipal>();
 const inflightPrincipals = new Map<string, Promise<Principal>>();
+// Bumped on every invalidation, so a resolution that started before a grant or delegation change is not cached.
+let principalCacheGeneration = 0;
 let nextListenerCacheId = 0;
 
-function scopeGrantTable(): any {
-	return (databases as any).memory?.ScopeGrant;
+// The tables a principal is resolved from: a change to either invalidates the cache.
+function authTables(): any[] {
+	const memory = (databases as any).memory;
+	return [memory?.ScopeGrant, memory?.Delegation];
 }
 
 function clearPrincipalCache(): void {
+	principalCacheGeneration++;
 	principalCache.clear();
 	inflightPrincipals.clear();
 }
@@ -267,14 +272,17 @@ async function resolveSubscriberPrincipal(
 	}
 	const existing = inflightPrincipals.get(key);
 	if (existing) return existing;
-	const promise = resolvePrincipal(authContext).then(
+	const generation = principalCacheGeneration;
+	const promise: Promise<Principal> = resolvePrincipal(authContext).then(
 		(resolved) => {
-			inflightPrincipals.delete(key);
-			principalCache.set(key, { principal: resolved, expiresAtMs: Date.now() + PRINCIPAL_CACHE_TTL_MS });
+			if (inflightPrincipals.get(key) === promise) inflightPrincipals.delete(key);
+			if (generation === principalCacheGeneration) {
+				principalCache.set(key, { principal: resolved, expiresAtMs: Date.now() + PRINCIPAL_CACHE_TTL_MS });
+			}
 			return resolved;
 		},
 		(error) => {
-			inflightPrincipals.delete(key);
+			if (inflightPrincipals.get(key) === promise) inflightPrincipals.delete(key);
 			throw error;
 		},
 	);
@@ -465,7 +473,7 @@ const tableListeners = new Set<HubListener>();
 const itemListeners = new Map<string, Set<HubListener>>();
 let hubSub: UpstreamSub | undefined;
 let watchHubSub: UpstreamSub | undefined;
-let grantHubSub: UpstreamSub | undefined;
+let authHubSubs: UpstreamSub[] = [];
 let hubOpening: Promise<void> | undefined;
 
 function closeUpstreamSub(sub: UpstreamSub | undefined): void {
@@ -478,10 +486,10 @@ function closeUpstreamSub(sub: UpstreamSub | undefined): void {
 function resetHubState(): void {
 	const activeMem = hubSub;
 	const activeWatch = watchHubSub;
-	const activeGrant = grantHubSub;
+	const activeAuth = authHubSubs;
 	hubSub = undefined;
 	watchHubSub = undefined;
-	grantHubSub = undefined;
+	authHubSubs = [];
 	watchesByPrincipal.clear();
 	seededWatchPrincipals.clear();
 	seedingWatchPrincipals.clear();
@@ -489,7 +497,7 @@ function resetHubState(): void {
 	clearPrincipalCache();
 	closeUpstreamSub(activeMem);
 	closeUpstreamSub(activeWatch);
-	closeUpstreamSub(activeGrant);
+	for (const sub of activeAuth) closeUpstreamSub(sub);
 }
 
 function teardownActiveHub(): void {
@@ -522,29 +530,29 @@ async function ensureHubSubscription(): Promise<void> {
 	opening = (async () => {
 		let rawSub: UpstreamSub | undefined;
 		let rawWatchSub: UpstreamSub | undefined;
-		let rawGrantSub: UpstreamSub | undefined;
+		const rawAuthSubs: UpstreamSub[] = [];
 		try {
 			await null;
 			const Memory = memoryTable();
 			const MemoryWatch = memoryWatchTable();
-			const ScopeGrant = scopeGrantTable();
 			const memSub: UpstreamSub = await Memory.subscribe({ omitCurrent: true, includeSuperseded: true }, {});
 			rawSub = memSub;
 			rawWatchSub =
 				typeof MemoryWatch?.subscribe === 'function'
 					? await MemoryWatch.subscribe({ omitCurrent: true }, {})
 					: undefined;
-			rawGrantSub =
-				typeof ScopeGrant?.subscribe === 'function' ? await ScopeGrant.subscribe({ omitCurrent: true }, {}) : undefined;
+			for (const table of authTables()) {
+				if (typeof table?.subscribe === 'function') rawAuthSubs.push(await table.subscribe({ omitCurrent: true }, {}));
+			}
 			if (tableListeners.size === 0 && itemListeners.size === 0) {
 				closeUpstreamSub(rawSub);
 				closeUpstreamSub(rawWatchSub);
-				closeUpstreamSub(rawGrantSub);
+				for (const sub of rawAuthSubs) closeUpstreamSub(sub);
 				return;
 			}
 			hubSub = memSub;
 			watchHubSub = rawWatchSub;
-			grantHubSub = rawGrantSub;
+			authHubSubs = rawAuthSubs;
 
 			if (rawWatchSub) {
 				const watchSub = rawWatchSub;
@@ -564,18 +572,17 @@ async function ensureHubSubscription(): Promise<void> {
 				})();
 			}
 
-			if (rawGrantSub) {
-				const grantSub = rawGrantSub;
+			for (const authSub of rawAuthSubs) {
 				void (async () => {
 					try {
-						for await (const _ of grantSub) {
-							if (grantHubSub !== grantSub) break;
+						for await (const _ of authSub) {
+							if (!authHubSubs.includes(authSub)) break;
 							clearPrincipalCache();
 						}
 					} catch (error) {
-						if (grantHubSub === grantSub) normalizeError(error, 'subscribe');
+						if (authHubSubs.includes(authSub)) normalizeError(error, 'subscribe');
 					} finally {
-						if (grantHubSub === grantSub) {
+						if (authHubSubs.includes(authSub)) {
 							teardownActiveHub();
 						}
 					}
@@ -603,7 +610,7 @@ async function ensureHubSubscription(): Promise<void> {
 		} catch (error) {
 			closeUpstreamSub(rawSub);
 			closeUpstreamSub(rawWatchSub);
-			closeUpstreamSub(rawGrantSub);
+			for (const sub of rawAuthSubs) closeUpstreamSub(sub);
 			throw error;
 		} finally {
 			if (hubOpening === opening) {
@@ -759,7 +766,10 @@ export async function subscribeMemoryEvents(
 		const kind = eventRecord?.lastEventKind;
 		if (!id || !isEventKind(kind)) return undefined;
 		const maybeOwnFlagged =
-			isFlagEvent(kind, eventRecord) && (!eventRecord?.ownerId || eventRecord.ownerId === principal.id);
+			isFlagEvent(kind, eventRecord) &&
+			(!eventRecord?.ownerId ||
+				inOwnView(eventRecord, principal) ||
+				(principal.actsFor !== null && !Array.isArray(eventRecord.scopes)));
 		if (maybeOwnFlagged) return { maybeOwnFlagged: true, watchConfirmed: false };
 		if (!hasActiveWatch(principal.id, id)) return undefined;
 		return { maybeOwnFlagged: false, watchConfirmed: true };
@@ -779,7 +789,7 @@ export async function subscribeMemoryEvents(
 			if (!deliverable) return undefined;
 			const { event, record, currentPrincipal, dedupToken } = deliverable;
 
-			if (isFlagEvent(event.kind, record) && record.ownerId === currentPrincipal.id) {
+			if (isFlagEvent(event.kind, record) && inOwnView(record, currentPrincipal)) {
 				if (
 					event.kind === 'flagged' ||
 					isNewContentFlag(event.kind, record) ||

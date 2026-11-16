@@ -8,12 +8,13 @@ export interface PrincipalResolution {
 	grants?: GrantPatterns;
 	superUser?: boolean;
 	source?: string;
+	actsFor?: string;
 }
 
 /**
- * Maps a request context to a principal. `next()` is the default resolution (the Harper user and its
- * ScopeGrant rows), so a resolver can handle its own credentials and defer everything else. Returning
- * undefined means unauthenticated.
+ * Maps a request context to a principal. `next()` is the default resolution (the Harper user, its ScopeGrant
+ * rows and its Delegation row), so a resolver can handle its own credentials and defer everything else.
+ * Returning undefined means unauthenticated.
  */
 export type PrincipalResolver = (
 	context: any,
@@ -33,6 +34,10 @@ function grantRows(): any {
 	return (databases as any).memory.ScopeGrant;
 }
 
+function delegationRows(): any {
+	return (databases as any).memory.Delegation;
+}
+
 async function resolveHarperUser(context: any): Promise<PrincipalResolution | undefined> {
 	const user = context?.user;
 	if (typeof user?.username !== 'string') return undefined;
@@ -41,9 +46,10 @@ async function resolveHarperUser(context: any): Promise<PrincipalResolution | un
 	// Read on every request rather than cached, so revoking a grant takes effect immediately. Each read gets its own
 	// context: without one Harper takes the caller's, checks its user against ScopeGrant while its `authorize` is
 	// pending, and clears that flag before the caller's own read.
-	const [roleGrant, userGrant] = await Promise.all([
+	const [roleGrant, userGrant, delegation] = await Promise.all([
 		typeof roleName === 'string' ? grantRows().get(`role:${roleName}`, { authorize: false }) : undefined,
 		grantRows().get(`user:${user.username}`, { authorize: false }),
+		delegationRows().get(user.username, { authorize: false }),
 	]);
 	return {
 		id: user.username,
@@ -51,24 +57,30 @@ async function resolveHarperUser(context: any): Promise<PrincipalResolution | un
 			read: [...(roleGrant?.read ?? []), ...(userGrant?.read ?? [])],
 			write: [...(roleGrant?.write ?? []), ...(userGrant?.write ?? [])],
 		},
+		actsFor: delegation?.actsFor,
 	};
 }
 
-// Grants are compiled on every request; warn once per pattern rather than once per request.
-const warnedPatterns = new Set<string>();
-const MAX_WARNED_PATTERNS = 1000;
+// Grants are compiled on every request; warn once per value rather than once per request.
+const warnedValues = new Set<string>();
+const MAX_WARNED_VALUES = 1000;
 
-function warnRejectedPattern(pattern: unknown): void {
-	const key = JSON.stringify(pattern);
-	if (warnedPatterns.has(key) || warnedPatterns.size >= MAX_WARNED_PATTERNS) return;
-	warnedPatterns.add(key);
-	logger.warn?.(`[agent-memory] ignoring invalid scope grant pattern ${key}`);
+function warnRejected(value: unknown, kind: 'pattern' | 'actsFor'): void {
+	const text = JSON.stringify(value);
+	const key = `${kind}:${text}`;
+	if (warnedValues.has(key) || warnedValues.size >= MAX_WARNED_VALUES) return;
+	warnedValues.add(key);
+	logger.warn?.(
+		kind === 'pattern'
+			? `[agent-memory] ignoring invalid scope grant pattern ${text}`
+			: `[agent-memory] ignoring invalid delegation actsFor ${text}`,
+	);
 }
 
 /**
- * The caller behind a request context: the custom resolver's answer, else the Harper user and its `ScopeGrant`
- * rows. Rejects with a 401 `principal_required` MemoryError when there is no caller; a failed grant read or a
- * throwing resolver rejects with its own error.
+ * The caller behind a request context: the custom resolver's answer, else the Harper user, its `ScopeGrant` rows
+ * and its `Delegation` row. Rejects with a 401 `principal_required` MemoryError when there is no caller; a failed
+ * grant or delegation read, or a throwing resolver, rejects with its own error.
  */
 export async function resolvePrincipal(context: any): Promise<Principal> {
 	const resolver = domain().resolver;
@@ -76,5 +88,5 @@ export async function resolvePrincipal(context: any): Promise<Principal> {
 		? await resolver(context, () => resolveHarperUser(context))
 		: await resolveHarperUser(context);
 	if (!resolution) throw memoryError('Authenticated principal required', 401, 'principal_required');
-	return createPrincipal(resolution, warnRejectedPattern);
+	return createPrincipal(resolution, warnRejected);
 }

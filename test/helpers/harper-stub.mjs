@@ -103,17 +103,19 @@ class StubTable {
 	#rows(context) {
 		return context?.transaction?.rows.get(this.name) ?? stores.get(this.name);
 	}
-	#stageWrite(record, context) {
+	#stageWrite(record, context, type = 'put') {
+		const event = { id: record.id, type, value: type === 'delete' ? undefined : structuredClone(record) };
 		if (context?.transaction) {
-			context.transaction.writes.get(this.name).push({ id: record.id, value: structuredClone(record) });
+			context.transaction.writes.get(this.name).push(event);
 		} else {
-			this.#emitWrite({ id: record.id, value: structuredClone(record) });
+			this.#emitWrite(event);
 		}
 	}
 	#emitWrite(event) {
 		for (const sub of subscribers.get(this.name)) {
 			if (sub.id !== undefined && sub.id !== event.id) continue;
-			sub.push({ id: event.id, type: 'put', value: Object.freeze(structuredClone(event.value)) });
+			const value = event.value === undefined ? undefined : Object.freeze(structuredClone(event.value));
+			sub.push({ id: event.id, type: event.type ?? 'put', value });
 		}
 	}
 	emitCommittedWrites(writes) {
@@ -160,7 +162,9 @@ class StubTable {
 		this.#stageWrite(next, context);
 	}
 	async delete(id, context) {
-		return this.#rows(context).delete(id);
+		const deleted = this.#rows(context).delete(id);
+		if (deleted) this.#stageWrite({ id }, context, 'delete');
+		return deleted;
 	}
 	async subscribe(options = {}) {
 		const buffer = [];
@@ -241,6 +245,7 @@ export const databases = {
 		MemoryPin: new StubTable('MemoryPin'),
 		MemoryWatch: new StubTable('MemoryWatch'),
 		ScopeGrant: new StubTable('ScopeGrant'),
+		Delegation: new StubTable('Delegation'),
 	},
 };
 export const tables = {};

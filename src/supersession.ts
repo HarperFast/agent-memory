@@ -1,7 +1,7 @@
 import { logger, models } from 'harper';
 import { memoryError, notFound } from './errors.ts';
 import { isMemoryId, memoryTable, STATUS_ACTIVE, STATUS_WITHDRAWN } from './lifecycle.ts';
-import { anyOf, canRead, readableConditions, type Principal } from './scopes.ts';
+import { actsAsOwner, anyOf, canRead, readableConditions, type Principal } from './scopes.ts';
 import { DEFAULT_EMBEDDING_MODEL, getSettings } from './settings.ts';
 import {
 	assertReadable,
@@ -149,7 +149,7 @@ export async function findCandidates(
 export async function memoryCandidates(id: string, principal: Principal, context: object): Promise<Candidate[]> {
 	const record = isMemoryId(id) ? await memoryTable().get(id, context) : undefined;
 	if (!record) throw notFound();
-	if (record.ownerId !== principal.id && !principal.superUser) {
+	if (!actsAsOwner(record, principal) && !principal.superUser) {
 		if (!canRead(record, principal)) throw notFound();
 		throw memoryError('Only the owner can list candidates for this memory', 403, 'not_memory_owner');
 	}
