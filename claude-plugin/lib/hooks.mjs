@@ -30,7 +30,8 @@ const FILLER_TERMS = new Set(
 );
 const SHORT_WORD_SCRIPT = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
 const UNCONFIGURED_REMEDY = {
-	invalid_url: 'AGENT_MEMORY_URL must be https, or http to a loopback host unless AGENT_MEMORY_ALLOW_INSECURE_HTTP=1.',
+	invalid_url:
+		'AGENT_MEMORY_URL must be https (or http to a loopback host unless AGENT_MEMORY_ALLOW_INSECURE_HTTP=1), with no user:password@ part.',
 	invalid_token: 'AGENT_MEMORY_TOKEN must be a single-line token or Basic credential.',
 };
 

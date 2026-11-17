@@ -78,7 +78,7 @@ export function recordDiagnostic(config, entry, maxBytes = MAX_BYTES) {
 	}
 }
 
-// Reads at most the cap's worth from the end: a file grown past it by something else cannot exhaust memory.
+// Something other than the writer may have grown the file past the cap.
 function readRegularFile(path) {
 	let file;
 	try {

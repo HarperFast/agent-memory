@@ -1748,6 +1748,7 @@ describe('recall diagnostics log, search gate, and best-effort persistence', () 
 			const badUrl = resolveConfig({ ...env, AGENT_MEMORY_URL: 'http://remote.example.com' });
 			const badUrlText = (await start(badUrl)).hookSpecificOutput.additionalContext;
 			assert.ok(badUrlText.includes('(invalid_url)') && badUrlText.includes('AGENT_MEMORY_ALLOW_INSECURE_HTTP=1'));
+			assert.ok(badUrlText.includes('no user:password@ part'));
 			assert.ok(!badUrlText.includes('AGENT_MEMORY_ENV_FILE'), 'another env file cannot fix a rejected URL');
 
 			assert.deepEqual(
