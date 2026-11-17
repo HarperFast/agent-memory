@@ -1688,6 +1688,8 @@ describe('recall diagnostics log, search gate, and best-effort persistence', () 
 			assert.equal(line.outcome, 'http_502');
 			assert.equal(line.stale, 1);
 
+			// AbortSignal.timeout's timer is unref'd; with no socket open, something must keep the loop alive.
+			const keepAlive = setInterval(() => {}, 1000);
 			const cutOff = await start(
 				{ ...config, bootstrapTimeoutMs: 60 },
 				async (_url, init) =>
@@ -1700,7 +1702,7 @@ describe('recall diagnostics log, search gate, and best-effort persistence', () 
 						}),
 						{ status: 200 },
 					),
-			);
+			).finally(() => clearInterval(keepAlive));
 			assert.ok(
 				cutOff.hookSpecificOutput.additionalContext.includes('STALE CACHE'),
 				'a body cut off by the deadline uses the cache',
