@@ -16,7 +16,22 @@ jsResource:
   lockScope: cluster
   supersession:
     mode: suggest
+  # Quarantines a new global write that names a customer, so dispatch-worker users (global only) never read it.
+  # The names list is a scoped secret granted to agent-memory-app (set_secret), never in this public repo.
+  customerContentCheck:
+    mode: flag
+    patterns:
+      namesSecret: AGENT_MEMORY_CUSTOMER_NAMES
   limits:
     # vLLM cuts each input at nomic's 2,048 tokens; this only bounds the request. 12,000 is above what 2,048
     # tokens of English prose cover, so the model decides the cut. Back to 4000 if embeddingTruncate goes off.
     embeddingInputChars: 12000
+
+'@harperfast/summary-tree':
+  package: '@harperfast/summary-tree'
+  generativeModel: default
+  # vLLM serves the generative model with max-model-len 32768.
+  contextTokens: 32768
+  # Reuses the vectors agent-memory stored; "default" would re-embed every memory without nomic's prefix.
+  embeddingModel: nomic-prefixed
+  mcp: true
