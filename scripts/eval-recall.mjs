@@ -9,7 +9,7 @@ import {
 	resolveConfig,
 	validateBaseUrl,
 } from '../claude-plugin/lib/config.mjs';
-import { buildRecallQuery } from '../claude-plugin/lib/hooks.mjs';
+import { buildRecallQuery, hasDistinctiveTerm } from '../claude-plugin/lib/hooks.mjs';
 
 export function parseDatasetJsonl(content) {
 	const rows = [];
@@ -108,7 +108,8 @@ export async function evaluateRecallDataset(rows, { baseUrl, authorization, k, t
 	let skipped = 0;
 
 	for (const row of rows) {
-		const query = buildRecallQuery(row.prompt);
+		const builtQuery = buildRecallQuery(row.prompt);
+		const query = hasDistinctiveTerm(builtQuery) ? builtQuery : '';
 		if (!query) skipped++;
 		const watchParam = watch ? '&watch=true' : '';
 		const url = `${baseUrl}/Memory/?q=${encodeURIComponent(query)}&limit=${encodeURIComponent(k)}${watchParam}`;
@@ -151,6 +152,7 @@ export async function evaluateRecallDataset(rows, { baseUrl, authorization, k, t
 				recallAtK: Number(recall.toFixed(4)),
 				latencyMs: elapsed,
 				timedOut: false,
+				...(query ? {} : { skipped: true }),
 				...(errorMsg ? { error: errorMsg } : {}),
 			});
 		} catch (error) {

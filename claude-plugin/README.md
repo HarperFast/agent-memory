@@ -43,8 +43,19 @@ Configure your Harper endpoint and user-bound credential:
 - `AGENT_MEMORY_RECALL_BUDGET`: character budget for `UserPromptSubmit` recall injection (default `2000`).
 - `AGENT_MEMORY_RECALL_TIMEOUT_MS`: hard timeout in ms for `UserPromptSubmit` recall request (default `1500`).
 - `AGENT_MEMORY_RECALL_LIMIT`: maximum memories fetched per prompt (default `5`, max `50`).
-- `AGENT_MEMORY_RECALL=off`: disable per-prompt `UserPromptSubmit` recall. With recall enabled, queries inspect the first `32000` prompt characters, normalize Unicode, strip fenced code blocks and URLs, and keep at most `1000` characters and `32` letter/number terms before being sent as `GET /Memory/?q=<query>`. Queries may appear in server/proxy access logs and be sent to the server's embedding provider. Code-only, URL-only and punctuation-only prompts skip recall.
+- `AGENT_MEMORY_RECALL=off`: disable per-prompt `UserPromptSubmit` recall. With recall enabled, queries inspect the first `32000` prompt characters, normalize Unicode, strip fenced code blocks and URLs, and keep at most `1000` characters and `32` letter/number terms before being sent as `GET /Memory/?q=<query>`. Queries may appear in server/proxy access logs and be sent to the server's embedding provider. Code-only, URL-only and punctuation-only prompts skip recall, and so do prompts with no distinctive term (`1, 2, 3`, `yes`, `please continue`): a term counts if it has at least 4 characters (2 in Chinese, Japanese or Korean script) and is not a conversational word. Queued change notices are still delivered on those prompts.
 - `AGENT_MEMORY_DISABLE_FOLLOWER=1`: disable the per-session detached `/MemoryEvents` SSE follower.
+- `AGENT_MEMORY_ENV_FILE`: path of the env file holding `AGENT_MEMORY_TOKEN` (default `$HOME/.config/agent-memory/env`). A harness that gives Claude Code its own `HOME` must set this (for example to the account's real `~/.config/agent-memory/env`), or the hooks find no token; `SessionStart` then injects a notice saying so.
+- `AGENT_MEMORY_CACHE_DIR`: directory for session state, the offline cache and the diagnostics log (default `$HOME/.cache/agent-memory/claude-plugin`). Point it outside a per-run `HOME` that is deleted after the run to keep the log.
+
+## Diagnostics
+
+Every `SessionStart` and `UserPromptSubmit` appends one line to `<AGENT_MEMORY_CACHE_DIR>/diagnostics.jsonl` with its outcome (`injected`, `empty`, `deduped`, `over_budget`, `http_<status>`, `timeout`, `error`, `skipped`, `disabled` or `unconfigured`, plus a `reason` where one applies), the request latency in ms and hit counts. Lines never contain prompt text, memory ids or content, URLs or credentials. The file rotates to `diagnostics.jsonl.1` at 256 KiB. Summarize it with the plugin's own script (the plugin root is where Claude Code installed it, such as `~/.claude/plugins/cache/agent-memory/agent-memory/<version>`):
+
+```bash
+node "<plugin root>/bin/diagnostics.mjs"            # counts by outcome and latency percentiles
+node "<plugin root>/bin/diagnostics.mjs" --tail 20  # plus the last 20 lines; --json for machine output
+```
 
 ## Memory Routing
 

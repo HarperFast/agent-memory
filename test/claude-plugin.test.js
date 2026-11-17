@@ -9,6 +9,8 @@ import {
 	readdirSync,
 	readFileSync,
 	rmSync,
+	statSync,
+	symlinkSync,
 	utimesSync,
 	writeFileSync,
 } from 'node:fs';
@@ -46,10 +48,18 @@ import {
 } from '../claude-plugin/lib/follower.mjs';
 import { bootstrapRequest, escapeAttr, formatInjectionBlock, sanitizeBody } from '../claude-plugin/lib/format.mjs';
 import {
+	getDiagnosticsPath,
+	readDiagnostics,
+	recordDiagnostic,
+	summarizeDiagnostics,
+} from '../claude-plugin/lib/diagnostics.mjs';
+import { runDiagnostics } from '../claude-plugin/bin/diagnostics.mjs';
+import {
 	handleHookEvent,
 	handleSessionEnd,
 	handleSessionStart,
 	handleUserPromptSubmit,
+	hasDistinctiveTerm,
 	truncatePrompt,
 } from '../claude-plugin/lib/hooks.mjs';
 import {
@@ -1280,6 +1290,507 @@ describe('UserPromptSubmit recall hook, deduplication, timeout, and fail-safe', 
 		} finally {
 			server.closeAllConnections?.();
 			await new Promise((r) => server.close(r));
+			rmSync(tmp, { recursive: true, force: true });
+		}
+	});
+});
+
+describe('recall diagnostics log, search gate, and best-effort persistence', () => {
+	const PROMPT = 'zebrafish telemetry rollout';
+	const TOKEN = 'secret-token-xyz';
+	const memory = (id, extra = {}) => ({
+		id,
+		title: `title ${id}`,
+		content: `content ${id}`,
+		author: 'alice',
+		scopes: ['global'],
+		revision: 1,
+		status: 'active',
+		...extra,
+	});
+	const json = (body, status = 200) =>
+		new Response(typeof body === 'string' ? body : JSON.stringify(body), {
+			status,
+			headers: { 'Content-Type': 'application/json' },
+		});
+	const setup = (extraEnv = {}) => {
+		const tmp = makeTempDir();
+		const env = {
+			AGENT_MEMORY_URL: 'https://memory.example.com',
+			AGENT_MEMORY_TOKEN: TOKEN,
+			AGENT_MEMORY_CACHE_DIR: tmp,
+			...extraEnv,
+		};
+		return { tmp, env, config: resolveConfig(env) };
+	};
+	const assertPrivate = (config) => {
+		const raw = readFileSync(getDiagnosticsPath(config), 'utf8');
+		for (const secret of ['zebrafish', 'telemetry', TOKEN, 'memory.example.com', 'content mem_', 'title mem_']) {
+			assert.ok(!raw.includes(secret), `diagnostics must not contain ${secret}`);
+		}
+	};
+
+	it('records one line per recall for every outcome, without prompt text, memory content or credentials', async () => {
+		const { tmp, env, config } = setup();
+		const hungServer = createServer(() => {});
+		await new Promise((r) => hungServer.listen(0, '127.0.0.1', r));
+		try {
+			let n = 0;
+			const recall = async (fetchImpl, { prompt = PROMPT, cfg = config, session } = {}) => {
+				const res = await handleUserPromptSubmit(
+					{ session_id: session ?? `diag-${n++}`, prompt },
+					{ config: cfg, env, spawnFollower: false, fetchImpl },
+				);
+				return { res, line: readDiagnostics(cfg).at(-1) };
+			};
+
+			let r = await recall(async () =>
+				json({ memories: [memory('mem_diag_injected_01'), memory('mem_diag_injected_02')] }),
+			);
+			assert.ok(r.res.hookSpecificOutput.additionalContext.includes('mem_diag_injected_01'));
+			assert.equal(r.line.event, 'recall');
+			assert.equal(r.line.outcome, 'injected');
+			assert.equal(r.line.hits, 2);
+			assert.equal(r.line.injected, 2);
+			assert.equal(r.line.notices, 0);
+			assert.equal(typeof r.line.ms, 'number');
+			assert.match(r.line.session, /^[0-9a-f]{24}$/);
+			assert.ok(
+				getSessionPaths(config, 'diag-0').stateFile.includes(r.line.session),
+				'session key names the state file',
+			);
+
+			const seeded = loadSessionState(config, 'diag-dedupe');
+			seeded.injectedIds = ['mem_diag_dedupe_0001'];
+			saveSessionState(config, 'diag-dedupe', seeded);
+			r = await recall(async () => json({ memories: [memory('mem_diag_dedupe_0001')] }), { session: 'diag-dedupe' });
+			assert.deepEqual(r.res, {});
+			assert.equal(r.line.outcome, 'deduped');
+			assert.equal(r.line.hits, 1);
+
+			r = await recall(async () => json({ memories: [] }));
+			assert.equal(r.line.outcome, 'empty');
+			assert.equal(r.line.hits, 0);
+
+			r = await recall(async () => json({ memories: [memory('mem_diag_withdrawn_1', { status: 'withdrawn' })] }));
+			assert.equal(r.line.outcome, 'empty', 'only inactive hits');
+
+			r = await recall(async () => json({ memories: [memory('mem_diag_budget_0001')] }), {
+				cfg: { ...config, recallBudget: 100 },
+			});
+			assert.deepEqual(r.res, {});
+			assert.equal(r.line.outcome, 'over_budget');
+
+			saveBootstrapCache(config, [memory('mem_cached_000000001', { scopes: ['user:alice'] })]);
+			r = await recall(async () => json({}, 401));
+			assert.deepEqual(r.res, {});
+			assert.equal(r.line.outcome, 'http_401');
+			assert.equal(loadBootstrapCache(config), undefined, '401 still purges the offline cache');
+
+			r = await recall(async () => json({}, 503));
+			assert.equal(r.line.outcome, 'http_503');
+
+			const fetchFailed = new TypeError('fetch failed', {
+				cause: Object.assign(new Error('x'), { code: 'ECONNREFUSED' }),
+			});
+			r = await recall(async () => {
+				throw fetchFailed;
+			});
+			assert.deepEqual(r.res, {});
+			assert.equal(r.line.outcome, 'error');
+			assert.equal(r.line.reason, 'network');
+			assert.equal(r.line.code, 'ECONNREFUSED');
+
+			r = await recall(async () => json('{not json'));
+			assert.equal(r.line.outcome, 'error');
+			assert.equal(r.line.reason, 'bad_json');
+
+			r = await recall(async () => json({ results: [] }));
+			assert.equal(r.line.outcome, 'error');
+			assert.equal(r.line.reason, 'bad_body');
+
+			const { port } = hungServer.address();
+			const timeoutConfig = resolveConfig({
+				...env,
+				AGENT_MEMORY_URL: `http://127.0.0.1:${port}`,
+				AGENT_MEMORY_RECALL_TIMEOUT_MS: '80',
+			});
+			r = await recall(globalThis.fetch, { cfg: timeoutConfig });
+			assert.deepEqual(r.res, {});
+			assert.equal(r.line.outcome, 'timeout');
+			assert.ok(r.line.ms >= 70, `timeout after the deadline, got ${r.line.ms}`);
+
+			r = await recall(
+				async (_url, init) =>
+					new Response(
+						new ReadableStream({
+							start(controller) {
+								controller.enqueue(new TextEncoder().encode('{"memories":['));
+								init.signal.addEventListener('abort', () => controller.error(init.signal.reason));
+							},
+						}),
+						{ status: 200 },
+					),
+				{ cfg: { ...config, recallTimeoutMs: 60 } },
+			);
+			assert.equal(r.line.outcome, 'timeout', 'a body read the deadline cut short is a timeout, not bad_json');
+
+			const { sessionsDir, stateFile } = getSessionPaths(config, 'diag-corrupt');
+			mkdirSync(sessionsDir, { recursive: true });
+			writeFileSync(stateFile, '{corrupt', 'utf8');
+			r = await recall(async () => assert.fail('no request on corrupt state'), { session: 'diag-corrupt' });
+			assert.equal(r.line.outcome, 'error');
+			assert.equal(r.line.reason, 'corrupt_state');
+
+			r = await recall(async () => assert.fail('no request for an empty query'), { prompt: '```js\nsecret\n```' });
+			assert.equal(r.line.outcome, 'skipped');
+			assert.equal(r.line.reason, 'empty_query');
+
+			r = await recall(async () => assert.fail('no request for a short query'), { prompt: '1, 2, 3' });
+			assert.deepEqual(r.res, {});
+			assert.equal(r.line.outcome, 'skipped');
+			assert.equal(r.line.reason, 'short_query');
+
+			r = await recall(async () => assert.fail('no request when recall is off'), {
+				cfg: resolveConfig({ ...env, AGENT_MEMORY_RECALL: 'off' }),
+			});
+			assert.equal(r.line.outcome, 'disabled');
+
+			r = await recall(async () => assert.fail('no request when unconfigured'), {
+				cfg: resolveConfig({ ...env, AGENT_MEMORY_TOKEN: '', AGENT_MEMORY_ENV_FILE: join(tmp, 'missing-env') }),
+			});
+			assert.equal(r.line.outcome, 'unconfigured');
+			assert.equal(r.line.reason, 'missing_token');
+
+			const throwing = await handleUserPromptSubmit(
+				{
+					session_id: 'diag-throw',
+					get prompt() {
+						throw new Error('boom');
+					},
+				},
+				{ config, env, spawnFollower: false, fetchImpl: async () => json({ memories: [] }) },
+			);
+			assert.deepEqual(throwing, {});
+			assert.equal(readDiagnostics(config).at(-1).outcome, 'error');
+			assert.equal(readDiagnostics(config).at(-1).reason, 'exception');
+
+			assertPrivate(config);
+		} finally {
+			hungServer.closeAllConnections?.();
+			await new Promise((r) => hungServer.close(r));
+			rmSync(tmp, { recursive: true, force: true });
+		}
+	});
+
+	it('caps the log by rotating once, refuses a planted symlink, and reads past a partial last line', () => {
+		const { tmp, config } = setup();
+		try {
+			const path = getDiagnosticsPath(config);
+			const maxBytes = 1000;
+			for (let i = 0; i < 60; i++) {
+				recordDiagnostic(config, { event: 'recall', session: 'a'.repeat(24), outcome: 'empty', hits: i }, maxBytes);
+				assert.ok(statSync(path).size <= maxBytes, `current file within cap after ${i + 1} writes`);
+			}
+			assert.ok(statSync(`${path}.1`).size <= maxBytes);
+			assert.equal((statSync(path).mode & 0o777).toString(8), '600');
+			const entries = readDiagnostics(config);
+			assert.ok(entries.length > 8 && entries.length < 60, 'older lines rotate away');
+			assert.equal(entries.at(-1).hits, 59);
+			assert.ok(
+				entries.every((e, i) => i === 0 || e.hits > entries[i - 1].hits),
+				'rotated file is read first, in order',
+			);
+
+			writeFileSync(path, readFileSync(path, 'utf8') + '{"outcome":"inj', 'utf8');
+			assert.equal(readDiagnostics(config).at(-1).hits, 59, 'a partial last line is skipped');
+
+			recordDiagnostic(config, {
+				event: 'recall',
+				outcome: 'empty',
+				prompt: 'leak',
+				url: 'https://x',
+				code: 'x'.repeat(40),
+			});
+			const extra = readDiagnostics(config).at(-1);
+			assert.equal(extra.prompt, undefined, 'only allowlisted fields are written');
+			assert.equal(extra.url, undefined);
+
+			const target = join(tmp, 'target.txt');
+			writeFileSync(target, 'keep\n', 'utf8');
+			rmSync(path);
+			symlinkSync(target, path);
+			recordDiagnostic(config, { event: 'recall', outcome: 'empty' });
+			assert.equal(readFileSync(target, 'utf8'), 'keep\n', 'never appends through a symlink');
+
+			const readOnly = { ...config, cacheDir: join(target, 'not-a-dir') };
+			assert.doesNotThrow(() => recordDiagnostic(readOnly, { event: 'recall', outcome: 'empty' }));
+		} finally {
+			rmSync(tmp, { recursive: true, force: true });
+		}
+	});
+
+	it('searches only for queries with a distinctive term, and still delivers change notices for short prompts', async () => {
+		for (const query of [
+			'1 2 3',
+			'yes',
+			'abc',
+			'ok go',
+			'please continue',
+			'sounds good',
+			'PR 2368',
+			'Try again',
+			'',
+		]) {
+			assert.equal(hasDistinctiveTerm(query), false, `no search for "${query}"`);
+		}
+		for (const query of ['lmdb', 'ECONNREFUSED', 'db migration', 'fix the build', '修复', '복제', 'abc123def']) {
+			assert.equal(hasDistinctiveTerm(query), true, `search for "${query}"`);
+		}
+
+		const { tmp, env, config } = setup();
+		try {
+			const state = loadSessionState(config, 'gate-notice');
+			state.injectedIds = ['mem_gate_notice_0001'];
+			state.revisions.mem_gate_notice_0001 = { revision: 1, status: 'active', author: 'bob', scopes: ['global'] };
+			state.pendingNotices = [
+				{
+					id: 'mem_gate_notice_0001',
+					kind: 'withdrawn',
+					revision: 2,
+					author: 'bob',
+					scopes: ['global'],
+					summary: 'gone',
+				},
+			];
+			saveSessionState(config, 'gate-notice', state);
+			let requests = 0;
+			const res = await handleUserPromptSubmit(
+				{ session_id: 'gate-notice', prompt: 'yes' },
+				{
+					config,
+					env,
+					spawnFollower: false,
+					fetchImpl: async () => {
+						requests++;
+						return json({ memories: [memory('mem_unrelated_00001')] });
+					},
+				},
+			);
+			assert.equal(requests, 0);
+			const text = res.hookSpecificOutput.additionalContext;
+			assert.ok(text.includes('change="withdrawn"'), 'the queued notice is still delivered');
+			assert.ok(!text.includes('mem_unrelated_00001'));
+			const line = readDiagnostics(config).at(-1);
+			assert.equal(line.outcome, 'skipped');
+			assert.equal(line.reason, 'short_query');
+			assert.equal(line.notices, 1);
+			assert.equal(line.injected, 0);
+		} finally {
+			rmSync(tmp, { recursive: true, force: true });
+		}
+	});
+
+	it('returns the injection when state or cache writes fail, recording the failure', async () => {
+		const { tmp, env, config } = setup();
+		const { sessionsDir } = getSessionPaths(config, 'persist-recall');
+		const endpointDir = join(sessionsDir, '..');
+		try {
+			saveSessionState(config, 'persist-recall', loadSessionState(config, 'persist-recall'));
+			chmodSync(sessionsDir, 0o500);
+			const res = await handleUserPromptSubmit(
+				{ session_id: 'persist-recall', prompt: PROMPT },
+				{
+					config,
+					env,
+					spawnFollower: false,
+					fetchImpl: async () => json({ memories: [memory('mem_persist_recall_1')] }),
+				},
+			);
+			assert.ok(res.hookSpecificOutput.additionalContext.includes('mem_persist_recall_1'));
+			let line = readDiagnostics(config).at(-1);
+			assert.equal(line.outcome, 'injected');
+			assert.equal(line.stateError, 'EACCES');
+			chmodSync(sessionsDir, 0o700);
+
+			chmodSync(endpointDir, 0o500);
+			const boot = await handleSessionStart(
+				{ session_id: 'persist-recall', source: 'startup' },
+				{
+					config,
+					env,
+					spawnFollower: false,
+					fetchImpl: async () => json({ memories: [memory('mem_persist_boot_001')] }),
+				},
+			);
+			assert.ok(boot.hookSpecificOutput.additionalContext.includes('mem_persist_boot_001'));
+			line = readDiagnostics(config).at(-1);
+			assert.equal(line.event, 'bootstrap');
+			assert.equal(line.outcome, 'injected');
+			assert.equal(line.stateError, 'EACCES', 'the bootstrap cache write failed after the state write');
+			chmodSync(endpointDir, 0o700);
+			assert.ok(loadSessionState(config, 'persist-recall').injectedIds.includes('mem_persist_boot_001'));
+		} finally {
+			chmodSync(sessionsDir, 0o700);
+			chmodSync(endpointDir, 0o700);
+			rmSync(tmp, { recursive: true, force: true });
+		}
+	});
+
+	it('records bootstrap outcomes and tells a partially configured session why the plugin is off', async () => {
+		const { tmp, env, config } = setup();
+		try {
+			const start = (cfg, fetchImpl, session = 'boot-diag') =>
+				handleSessionStart(
+					{ session_id: session, source: 'startup' },
+					{ config: cfg, env, spawnFollower: false, fetchImpl },
+				);
+
+			await start(config, async () => json({ memories: [memory('mem_boot_diag_00001')] }));
+			let line = readDiagnostics(config).at(-1);
+			assert.equal(line.event, 'bootstrap');
+			assert.equal(line.outcome, 'injected');
+			assert.equal(line.hits, 1);
+			assert.equal(line.injected, 1);
+
+			saveBootstrapCache(config, [memory('mem_boot_cached_0001', { scopes: ['user:alice'] })]);
+			const offline = await start(config, async () => json({}, 502));
+			assert.ok(offline.hookSpecificOutput.additionalContext.includes('STALE CACHE'));
+			line = readDiagnostics(config).at(-1);
+			assert.equal(line.outcome, 'http_502');
+			assert.equal(line.stale, 1);
+
+			const missingToken = resolveConfig({
+				...env,
+				AGENT_MEMORY_TOKEN: '',
+				AGENT_MEMORY_ENV_FILE: join(tmp, 'missing-env'),
+			});
+			const notice = await start(missingToken, async () => assert.fail('no request when unconfigured'));
+			const text = notice.hookSpecificOutput.additionalContext;
+			assert.ok(text.includes('agent-memory is not configured (missing_token)'), text);
+			assert.ok(text.includes(join(tmp, 'missing-env')));
+			assert.ok(text.includes('AGENT_MEMORY_ENV_FILE'));
+			line = readDiagnostics(config).at(-1);
+			assert.equal(line.outcome, 'unconfigured');
+			assert.equal(line.reason, 'missing_token');
+
+			const badUrl = resolveConfig({ ...env, AGENT_MEMORY_URL: 'http://remote.example.com' });
+			assert.ok((await start(badUrl)).hookSpecificOutput.additionalContext.includes('(invalid_url)'));
+
+			const nothing = resolveConfig({
+				AGENT_MEMORY_URL: '',
+				AGENT_MEMORY_TOKEN: '',
+				AGENT_MEMORY_ENV_FILE: join(tmp, 'missing-env'),
+				AGENT_MEMORY_CACHE_DIR: tmp,
+			});
+			assert.deepEqual(await start(nothing), {}, 'a never-configured install injects nothing');
+			assert.equal(readDiagnostics(config).at(-1).reason, 'missing_url');
+			assertPrivate(config);
+		} finally {
+			rmSync(tmp, { recursive: true, force: true });
+		}
+	});
+
+	it('reproduces the dispatch miss: a private HOME hides the token file until AGENT_MEMORY_ENV_FILE names it', async () => {
+		const tmp = makeTempDir();
+		const server = createServer((req, res) => {
+			if (req.headers.authorization !== `Bearer ${TOKEN}`) {
+				res.writeHead(401).end('{}');
+				return;
+			}
+			res.writeHead(200, { 'Content-Type': 'application/json' });
+			res.end(
+				JSON.stringify({ memories: req.url.startsWith('/Memory/bootstrap') ? [] : [memory('mem_dispatch_repro_1')] }),
+			);
+		});
+		await new Promise((r) => server.listen(0, '127.0.0.1', r));
+		try {
+			const url = `http://127.0.0.1:${server.address().port}`;
+			const hostEnvFile = join(tmp, 'host', '.config', 'agent-memory', 'env');
+			mkdirSync(join(hostEnvFile, '..'), { recursive: true });
+			writeFileSync(hostEnvFile, `AGENT_MEMORY_URL=${url}\nAGENT_MEMORY_TOKEN=${TOKEN}\n`, { mode: 0o600 });
+			const privateHome = join(tmp, 'private-home');
+			mkdirSync(privateHome);
+			const dispatchEnv = {
+				HOME: privateHome,
+				AGENT_MEMORY_URL: url,
+				AGENT_MEMORY_TOKEN: '',
+				AGENT_MEMORY_ENV_FILE: '',
+				AGENT_MEMORY_CACHE_DIR: '',
+				AGENT_MEMORY_DISABLE_FOLLOWER: '1',
+			};
+			const hookScript = resolve('claude-plugin/hooks/hook.mjs');
+			const runHook = async (event, env) => {
+				const input = { hook_event_name: event, session_id: 'dispatch-repro', source: 'startup', prompt: PROMPT };
+				const { code, stdout } = await runSubprocess(hookScript, [], JSON.stringify(input), env);
+				assert.equal(code, 0);
+				return JSON.parse(stdout).hookSpecificOutput?.additionalContext ?? '';
+			};
+
+			const boot = await runHook('SessionStart', dispatchEnv);
+			assert.ok(boot.includes('agent-memory is not configured (missing_token)'), `notice expected, got: ${boot}`);
+			assert.equal(await runHook('UserPromptSubmit', dispatchEnv), '');
+			const privateCache = resolveConfig(dispatchEnv);
+			assert.equal(privateCache.cacheDir, join(privateHome, '.cache', 'agent-memory', 'claude-plugin'));
+			assert.deepEqual(
+				readDiagnostics(privateCache).map(({ event, outcome, reason }) => [event, outcome, reason]),
+				[
+					['bootstrap', 'unconfigured', 'missing_token'],
+					['recall', 'unconfigured', 'missing_token'],
+				],
+			);
+
+			const fixedEnv = {
+				...dispatchEnv,
+				AGENT_MEMORY_ENV_FILE: hostEnvFile,
+				AGENT_MEMORY_CACHE_DIR: join(tmp, 'host-cache'),
+			};
+			assert.ok((await runHook('UserPromptSubmit', fixedEnv)).includes('mem_dispatch_repro_1'));
+			assert.equal(readDiagnostics(resolveConfig(fixedEnv)).at(-1).outcome, 'injected');
+		} finally {
+			server.closeAllConnections?.();
+			await new Promise((r) => server.close(r));
+			rmSync(tmp, { recursive: true, force: true });
+		}
+	});
+
+	it('summarizes the log with bin/diagnostics.mjs', () => {
+		const { tmp, env, config } = setup();
+		try {
+			for (const entry of [
+				{ event: 'recall', outcome: 'injected', ms: 10 },
+				{ event: 'recall', outcome: 'injected', ms: 30 },
+				{ event: 'recall', outcome: 'timeout', ms: 1500 },
+				{ event: 'recall', outcome: 'skipped', reason: 'short_query' },
+				{ event: 'bootstrap', outcome: 'unconfigured', reason: 'missing_token' },
+			]) {
+				recordDiagnostic(config, entry);
+			}
+			const summary = summarizeDiagnostics(readDiagnostics(config));
+			assert.deepEqual(summary.recall.outcomes, { injected: 2, timeout: 1, 'skipped:short_query': 1 });
+			assert.deepEqual(summary.recall.ms, { count: 3, p50: 30, p95: 1500, max: 1500 });
+			assert.equal(summary.bootstrap.ms, undefined);
+
+			const out = [];
+			assert.equal(
+				runDiagnostics(['--json', '--tail', '2'], env, (text) => out.push(text)),
+				0,
+			);
+			const parsed = JSON.parse(out[0]);
+			assert.equal(parsed.path, getDiagnosticsPath(config));
+			assert.equal(parsed.entries, 5);
+			assert.equal(parsed.recent.length, 2);
+			assert.equal(parsed.summary.bootstrap.outcomes['unconfigured:missing_token'], 1);
+
+			const text = [];
+			runDiagnostics([], env, (line) => text.push(line));
+			assert.ok(text.includes('  injected: 2'));
+			assert.ok(text.some((line) => line.startsWith('  ms: p50 30, p95 1500')));
+			assert.equal(
+				runDiagnostics(['--bogus'], env, () => {}),
+				2,
+			);
+		} finally {
 			rmSync(tmp, { recursive: true, force: true });
 		}
 	});

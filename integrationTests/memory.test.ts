@@ -2082,7 +2082,7 @@ suite('@harperfast/agent-memory over HTTP', (ctx: ContextWithHarper) => {
 		await create('alice', 'fts-hook', { title: 'w0', content: 'w0 bounded hook recall' });
 		try {
 			const prompts = [
-				Array.from({ length: 65 }, (_, i) => `w${i}`).join(' '),
+				['bounded', ...Array.from({ length: 64 }, (_, i) => `w${i}`)].join(' '),
 				'w0\n```js\nconst s = \"```secretToken\";\n```\nhttps://example.com/private ' +
 					Array.from({ length: 65 }, (_, i) => `code${i}`).join('.'),
 				'w0 ' + Array.from({ length: 100 }, (_, i) => String.fromCodePoint(0x4e00 + i)).join(''),

@@ -9,14 +9,27 @@ import {
 	recordMemoriesInState,
 	saveBootstrapCache,
 	saveSessionState,
+	sessionKey,
 	writeStopFile,
 } from './cache.mjs';
 import { QUERY_MAX_CHARS, resolveConfig } from './config.mjs';
+import { errorCode, recordDiagnostic } from './diagnostics.mjs';
 import { ensureFollowerRunning } from './follower.mjs';
 import { bootstrapRequest, formatInjectionBlock, isNeedsReview, resolveAuthorPrincipal } from './format.mjs';
 
 const VALID_BOOTSTRAP_SOURCES = new Set(['startup', 'resume', 'compact']);
 const NOTICE_EVENT_KINDS = new Set(['superseded', 'revised', 'withdrawn', 'flagged']);
+// Conversational and function words that carry no topic of their own.
+const FILLER_TERMS = new Set(
+	(
+		'about actually again agree agreed ahead alright also always anyway awesome been before being cancel could ' +
+		'continue cool correct does doing done exactly fine from going good great have hello here into just keep know ' +
+		'lgtm like looks make maybe more much need next nice nope okay only perfect please proceed really retry right ' +
+		'same seems should some sorry sounds start still stop sure thank thanks that them then there these they thing ' +
+		'think this those very wait want well were what when where which will with would yeah your yours'
+	).split(' '),
+);
+const SHORT_WORD_SCRIPT = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
 
 export function truncatePrompt(prompt) {
 	const text = String(prompt ?? '').trim();
@@ -48,6 +61,43 @@ export function buildRecallQuery(prompt) {
 		.replace(/\b(?:https?:\/\/|ftp:\/\/|www\.)\S+/gi, ' ');
 	const query = (text.match(/[\p{L}\p{N}]+/gu) ?? []).slice(0, 32).join(' ');
 	return truncatePrompt(query).replace(/[\uD800-\uDBFF]$/, '');
+}
+
+// Search fuses ranks only and the vector lane has no distance cutoff, so a query without a topic term would still
+// get its nearest, unrelated memory.
+export function hasDistinctiveTerm(query) {
+	for (const term of String(query ?? '').split(' ')) {
+		if (!/\p{L}/u.test(term) || FILLER_TERMS.has(term.toLowerCase())) continue;
+		const length = [...term].length;
+		if (length >= 4 || (length >= 2 && SHORT_WORD_SCRIPT.test(term))) return true;
+	}
+	return false;
+}
+
+function persist(entry, write) {
+	try {
+		write();
+	} catch (error) {
+		entry.stateError ??= errorCode(error) ?? 'unknown';
+	}
+}
+
+function hookOutput(hookEventName, text) {
+	if (!text) return {};
+	return { hookSpecificOutput: { hookEventName, additionalContext: text } };
+}
+
+async function recordedHook(config, entry, run) {
+	try {
+		return await run();
+	} catch (error) {
+		entry.outcome = 'error';
+		entry.reason = 'exception';
+		entry.code = errorCode(error);
+		return {};
+	} finally {
+		recordDiagnostic(config, entry);
+	}
 }
 
 function buildChangeNotices(state, drainedEvents, recalledMemories = []) {
@@ -223,12 +273,28 @@ function commitChangeNotices(state, candidateNotices, includedNotices, config) {
 export async function handleSessionStart(input = {}, options = {}) {
 	const env = options.env ?? process.env;
 	const config = options.config ?? resolveConfig(env);
-	if (!config.configured) return {};
-
 	const source = input.source ? String(input.source) : 'startup';
 	if (!VALID_BOOTSTRAP_SOURCES.has(source)) return {};
-
 	const sessionId = String(input.session_id || 'default');
+	const entry = { event: 'bootstrap', session: sessionKey(sessionId) };
+	return recordedHook(config, entry, () => bootstrapSession(config, env, source, sessionId, options, entry));
+}
+
+async function bootstrapSession(config, env, source, sessionId, options, entry) {
+	if (!config.configured) {
+		entry.outcome = 'unconfigured';
+		entry.reason = config.unconfiguredReason;
+		if (!config.partiallyConfigured) return {};
+		const formatted = formatInjectionBlock({
+			banners: [
+				`agent-memory is not configured (${config.unconfiguredReason}); session bootstrap and per-prompt recall are off. Credentials are read from the environment or ${config.envFilePath}; a harness that replaces HOME must pass AGENT_MEMORY_ENV_FILE.`,
+			],
+			budget: config.bootstrapBudget,
+			nonce: options.nonce,
+		});
+		return hookOutput('SessionStart', formatted.text);
+	}
+
 	const fetchImpl = options.fetchImpl ?? globalThis.fetch;
 	const shouldSpawnFollower = options.spawnFollower ?? !options.fetchImpl;
 
@@ -260,6 +326,8 @@ export async function handleSessionStart(input = {}, options = {}) {
 
 	const request = bootstrapRequest(config.bootstrapBudget, banners);
 	const url = `${config.baseUrl}/Memory/bootstrap?budget=${request.budget}&entryOverhead=${request.entryOverhead}&sectionItemOverhead=${request.sectionItemOverhead}&watch=true`;
+	const signal = AbortSignal.timeout(config.bootstrapTimeoutMs);
+	const start = performance.now();
 	let response;
 	try {
 		response = await fetchImpl(url, {
@@ -269,26 +337,27 @@ export async function handleSessionStart(input = {}, options = {}) {
 				Authorization: config.authorization,
 			},
 			redirect: 'error',
-			signal: AbortSignal.timeout(config.bootstrapTimeoutMs),
+			signal,
 		});
-	} catch {
+	} catch (error) {
 		response = undefined;
+		entry.outcome = signal.aborted ? 'timeout' : 'error';
+		if (!signal.aborted) {
+			entry.reason = 'network';
+			entry.code = errorCode(error);
+		}
 	}
+	if (response && !response.ok) entry.outcome = `http_${response.status}`;
 
 	if (response && (response.status === 401 || response.status === 403)) {
+		entry.ms = Math.round(performance.now() - start);
 		purgeBootstrapCache(config);
 		const formatted = formatInjectionBlock({
 			banners: [`agent-memory authentication failed (HTTP ${response.status}); cached bootstrap data cleared.`],
 			budget: config.bootstrapBudget,
 			nonce: options.nonce,
 		});
-		if (!formatted.text) return {};
-		return {
-			hookSpecificOutput: {
-				hookEventName: 'SessionStart',
-				additionalContext: formatted.text,
-			},
-		};
+		return hookOutput('SessionStart', formatted.text);
 	}
 
 	if (response && response.ok) {
@@ -297,7 +366,10 @@ export async function handleSessionStart(input = {}, options = {}) {
 			body = await response.json();
 		} catch {
 			body = undefined;
+			entry.outcome = signal.aborted ? 'timeout' : 'error';
+			if (!signal.aborted) entry.reason = 'bad_json';
 		}
+		entry.ms = Math.round(performance.now() - start);
 		if (body && Array.isArray(body.memories)) {
 			const memories = body.memories;
 			const formatted = formatInjectionBlock({
@@ -307,21 +379,23 @@ export async function handleSessionStart(input = {}, options = {}) {
 				nonce: options.nonce,
 				ordered: true,
 			});
+			entry.hits = memories.length;
+			entry.injected = formatted.includedMemories.length;
+			entry.outcome = entry.injected > 0 ? 'injected' : 'empty';
 			recordMemoriesInState(state, memories, formatted.includedMemories);
-			saveSessionState(config, sessionId, state);
-			saveBootstrapCache(config, memories);
+			persist(entry, () => saveSessionState(config, sessionId, state));
+			persist(entry, () => saveBootstrapCache(config, memories));
 			if (shouldSpawnFollower) {
 				ensureFollowerRunning(config, sessionId, env);
 			}
-			if (!formatted.text) return {};
-			return {
-				hookSpecificOutput: {
-					hookEventName: 'SessionStart',
-					additionalContext: formatted.text,
-				},
-			};
+			return hookOutput('SessionStart', formatted.text);
+		}
+		if (!entry.outcome) {
+			entry.outcome = 'error';
+			entry.reason = 'bad_body';
 		}
 	}
+	entry.ms ??= Math.round(performance.now() - start);
 
 	if (response && response.status < 500) {
 		return {};
@@ -342,28 +416,74 @@ export async function handleSessionStart(input = {}, options = {}) {
 		budget: config.bootstrapBudget,
 		nonce: options.nonce,
 	});
+	entry.stale = formatted.includedMemories.length;
 	recordMemoriesInState(state, cached.memories, formatted.includedMemories);
-	saveSessionState(config, sessionId, state);
-	if (!formatted.text) return {};
-	return {
-		hookSpecificOutput: {
-			hookEventName: 'SessionStart',
-			additionalContext: formatted.text,
-		},
-	};
+	persist(entry, () => saveSessionState(config, sessionId, state));
+	return hookOutput('SessionStart', formatted.text);
+}
+
+async function searchForRecall(config, query, fetchImpl, entry) {
+	const url = `${config.baseUrl}/Memory/?q=${encodeURIComponent(query)}&limit=${encodeURIComponent(config.recallLimit)}&watch=true`;
+	const signal = AbortSignal.timeout(config.recallTimeoutMs);
+	const start = performance.now();
+	try {
+		const response = await fetchImpl(url, {
+			method: 'GET',
+			headers: {
+				Accept: 'application/json',
+				Authorization: config.authorization,
+			},
+			redirect: 'error',
+			signal,
+		});
+		if (!response.ok) {
+			entry.outcome = `http_${response.status}`;
+			return response.status === 401 || response.status === 403 ? undefined : [];
+		}
+		const body = await response.json();
+		if (!Array.isArray(body?.memories)) {
+			entry.outcome = 'error';
+			entry.reason = 'bad_body';
+			return [];
+		}
+		entry.hits = body.memories.length;
+		return body.memories;
+	} catch (error) {
+		if (signal.aborted) {
+			entry.outcome = 'timeout';
+		} else {
+			entry.outcome = 'error';
+			entry.reason = error instanceof SyntaxError ? 'bad_json' : 'network';
+			entry.code = errorCode(error);
+		}
+		return [];
+	} finally {
+		entry.ms = Math.round(performance.now() - start);
+	}
 }
 
 export async function handleUserPromptSubmit(input = {}, options = {}) {
 	const env = options.env ?? process.env;
 	const config = options.config ?? resolveConfig(env);
-	if (!config.configured) return {};
-
 	const sessionId = String(input.session_id || 'default');
+	const entry = { event: 'recall', session: sessionKey(sessionId) };
+	return recordedHook(config, entry, () => recallForPrompt(config, env, sessionId, input, options, entry));
+}
+
+async function recallForPrompt(config, env, sessionId, input, options, entry) {
+	if (!config.configured) {
+		entry.outcome = 'unconfigured';
+		entry.reason = config.unconfiguredReason;
+		return {};
+	}
+
 	const rawPrompt = input.prompt ?? input.user_prompt ?? '';
 	const query = buildRecallQuery(rawPrompt);
 
 	const state = loadSessionState(config, sessionId);
 	if (state.corrupt) {
+		entry.outcome = 'error';
+		entry.reason = 'corrupt_state';
 		return {};
 	}
 
@@ -375,31 +495,19 @@ export async function handleUserPromptSubmit(input = {}, options = {}) {
 	const { events: drainedEvents, nextOffset } = drainFollowerEvents(config, sessionId, state.eventsOffset);
 	let recalledMemories = [];
 
-	if (config.recallEnabled && query.length > 0) {
-		const fetchImpl = options.fetchImpl ?? globalThis.fetch;
-		const url = `${config.baseUrl}/Memory/?q=${encodeURIComponent(query)}&limit=${encodeURIComponent(config.recallLimit)}&watch=true`;
-		try {
-			const response = await fetchImpl(url, {
-				method: 'GET',
-				headers: {
-					Accept: 'application/json',
-					Authorization: config.authorization,
-				},
-				redirect: 'error',
-				signal: AbortSignal.timeout(config.recallTimeoutMs),
-			});
-			if (response.status === 401 || response.status === 403) {
-				purgeBootstrapCache(config);
-				return {};
-			}
-			if (response.ok) {
-				const body = await response.json();
-				if (Array.isArray(body?.memories)) {
-					recalledMemories = body.memories;
-				}
-			}
-		} catch {
-			recalledMemories = [];
+	if (!config.recallEnabled) {
+		entry.outcome = 'disabled';
+	} else if (query.length === 0) {
+		entry.outcome = 'skipped';
+		entry.reason = 'empty_query';
+	} else if (!hasDistinctiveTerm(query)) {
+		entry.outcome = 'skipped';
+		entry.reason = 'short_query';
+	} else {
+		recalledMemories = await searchForRecall(config, query, options.fetchImpl ?? globalThis.fetch, entry);
+		if (recalledMemories === undefined) {
+			purgeBootstrapCache(config);
+			return {};
 		}
 	}
 
@@ -423,6 +531,14 @@ export async function handleUserPromptSubmit(input = {}, options = {}) {
 		budget: config.recallBudget,
 		nonce: options.nonce,
 	});
+	entry.injected = formatted.includedMemories.length;
+	entry.notices = formatted.includedNotices.length;
+	if (!entry.outcome) {
+		if (entry.injected > 0) entry.outcome = 'injected';
+		else if (activeRecalledMemories.length === 0) entry.outcome = 'empty';
+		else if (uninjectedMemories.length === 0) entry.outcome = 'deduped';
+		else entry.outcome = 'over_budget';
+	}
 
 	if (commitChangeNotices(state, candidateNotices, formatted.includedNotices, config)) {
 		dirty = true;
@@ -433,16 +549,10 @@ export async function handleUserPromptSubmit(input = {}, options = {}) {
 	}
 
 	if (dirty) {
-		saveSessionState(config, sessionId, state);
+		persist(entry, () => saveSessionState(config, sessionId, state));
 	}
 
-	if (!formatted.text) return {};
-	return {
-		hookSpecificOutput: {
-			hookEventName: 'UserPromptSubmit',
-			additionalContext: formatted.text,
-		},
-	};
+	return hookOutput('UserPromptSubmit', formatted.text);
 }
 
 export async function handleSessionEnd(input = {}, options = {}) {

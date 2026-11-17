@@ -378,7 +378,11 @@ export function ensureFollowerRunning(config, sessionId, env = process.env) {
 	clearStopFile(config, sessionId);
 	if (!config.followerEnabled || !config.configured) return false;
 	const { sessionsDir, lockFile } = getSessionPaths(config, sessionId);
-	mkdirSync(sessionsDir, { recursive: true, mode: 0o700 });
+	try {
+		mkdirSync(sessionsDir, { recursive: true, mode: 0o700 });
+	} catch {
+		return false;
+	}
 	if (isFollowerLockActive(lockFile, config.heartbeatMs)) {
 		return false;
 	}
@@ -389,6 +393,8 @@ export function ensureFollowerRunning(config, sessionId, env = process.env) {
 			stdio: 'ignore',
 			env,
 		});
+		// A spawn failure such as EAGAIN arrives as an 'error' event; unheard, it would end the hook as uncaught.
+		child.on('error', () => {});
 		child.unref();
 		return true;
 	} catch {

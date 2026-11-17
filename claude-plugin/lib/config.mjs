@@ -129,11 +129,18 @@ export function resolveConfig(env = process.env) {
 		.toLowerCase();
 	const followerEnabled =
 		disableFollowerFlag !== '1' && disableFollowerFlag !== 'true' && disableFollowerFlag !== 'off';
+	let unconfiguredReason;
+	if (!rawUrl.trim()) unconfiguredReason = 'missing_url';
+	else if (!baseUrl) unconfiguredReason = 'invalid_url';
+	else if (!rawToken.trim()) unconfiguredReason = 'missing_token';
+	else if (!authorization) unconfiguredReason = 'invalid_token';
 
 	return {
 		baseUrl,
 		authorization,
 		configured: Boolean(baseUrl && authorization),
+		unconfiguredReason,
+		partiallyConfigured: Boolean(unconfiguredReason && (rawUrl.trim() || rawToken.trim())),
 		urlFromEnvFile: !hasEnvUrl && Boolean(fileData.entries.AGENT_MEMORY_URL),
 		envFileInsecurePermissions: fileData.insecurePermissions,
 		envFilePath,
