@@ -172,13 +172,19 @@ describe('claude-plugin config and credential resolution', () => {
 
 	it('executes bin/headers.mjs and emits Authorization JSON without leaking secrets on unconfigured exit', async () => {
 		const headersScript = resolve('claude-plugin/bin/headers.mjs');
-		const unconfigured = await runSubprocess(headersScript, [], '', {
+		const tmp = makeTempDir();
+		const unconfiguredEnv = {
 			AGENT_MEMORY_URL: '',
 			AGENT_MEMORY_TOKEN: '',
 			AGENT_MEMORY_ENV_FILE: '/nonexistent/path/env',
-		});
+			AGENT_MEMORY_CACHE_DIR: tmp,
+		};
+		const unconfigured = await runSubprocess(headersScript, [], '', unconfiguredEnv);
 		assert.equal(unconfigured.code, 0);
 		assert.deepEqual(JSON.parse(unconfigured.stdout), {});
+		const [line] = readDiagnostics(resolveConfig(unconfiguredEnv));
+		assert.deepEqual([line.event, line.outcome, line.reason], ['mcp_headers', 'unconfigured', 'missing_url']);
+		rmSync(tmp, { recursive: true, force: true });
 
 		const configured = await runSubprocess(headersScript, [], '', {
 			AGENT_MEMORY_URL: 'https://memory.example.com',
@@ -1505,6 +1511,17 @@ describe('recall diagnostics log, search gate, and best-effort persistence', () 
 			writeFileSync(path, readFileSync(path, 'utf8') + '{"outcome":"inj', 'utf8');
 			assert.equal(readDiagnostics(config).at(-1).hits, 59, 'a partial last line is skipped');
 
+			const grown = Array.from({ length: 4000 }, (_, i) =>
+				JSON.stringify({ event: 'recall', session: 'a'.repeat(24), outcome: 'empty', hits: i, ms: 1000 + i }),
+			);
+			writeFileSync(path, grown.join('\n') + '\n');
+			rmSync(`${path}.1`);
+			assert.ok(statSync(path).size > 256 * 1024);
+			const tail = readDiagnostics(config);
+			assert.ok(tail.length > 1000 && tail.length < 4000, 'only the last 256 KiB is read');
+			assert.equal(tail.at(-1).hits, 3999);
+			assert.ok(tail[0].hits > 0, 'the cut first line is skipped, not misparsed');
+
 			recordDiagnostic(config, {
 				event: 'recall',
 				outcome: 'empty',
@@ -1727,7 +1744,22 @@ describe('recall diagnostics log, search gate, and best-effort persistence', () 
 			);
 
 			const badUrl = resolveConfig({ ...env, AGENT_MEMORY_URL: 'http://remote.example.com' });
-			assert.ok((await start(badUrl)).hookSpecificOutput.additionalContext.includes('(invalid_url)'));
+			const badUrlText = (await start(badUrl)).hookSpecificOutput.additionalContext;
+			assert.ok(badUrlText.includes('(invalid_url)') && badUrlText.includes('AGENT_MEMORY_ALLOW_INSECURE_HTTP=1'));
+			assert.ok(!badUrlText.includes('AGENT_MEMORY_ENV_FILE'), 'another env file cannot fix a rejected URL');
+
+			assert.deepEqual(
+				await handleSessionStart(
+					{ session_id: 'boot-diag', source: 'clear' },
+					{ config, env, fetchImpl: async () => assert.fail() },
+				),
+				{},
+			);
+			assert.deepEqual((({ event, outcome, reason }) => [event, outcome, reason])(readDiagnostics(config).at(-1)), [
+				'bootstrap',
+				'skipped',
+				'unsupported_source',
+			]);
 
 			const wrongEnvFile = resolveConfig({
 				AGENT_MEMORY_URL: '',
@@ -2539,6 +2571,21 @@ describe('scripts/eval-recall.mjs', () => {
 			assert.equal(Number(summary.recallAtK.toFixed(2)), 0.33);
 			assert.equal(Number(summary.hitRate.toFixed(2)), 0.33);
 			assert.equal(Number(summary.timeoutRate.toFixed(2)), 0.33);
+
+			writeFileSync(datasetPath, JSON.stringify({ prompt: '1, 2, 3', expectedIds: ['mem_1'] }), 'utf8');
+			const text = [];
+			const gated = await runEval(
+				['--dataset', datasetPath],
+				{ AGENT_MEMORY_URL: 'https://memory.example.com', AGENT_MEMORY_TOKEN: 'tok' },
+				{
+					stdout: (msg) => text.push(msg),
+					stderr: () => {},
+					fetchImpl: async () => assert.fail('gated prompts send nothing'),
+				},
+			);
+			assert.equal(gated.summary.skipped, 1);
+			assert.equal(gated.summary.results[0].skipped, true);
+			assert.ok(text[0].includes('skipped by the hook: 1'), text[0]);
 		} finally {
 			rmSync(tmp, { recursive: true, force: true });
 		}

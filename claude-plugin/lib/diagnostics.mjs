@@ -1,4 +1,4 @@
-import { closeSync, constants, fstatSync, mkdirSync, openSync, readFileSync, renameSync, writeSync } from 'node:fs';
+import { closeSync, constants, fstatSync, mkdirSync, openSync, readSync, renameSync, writeSync } from 'node:fs';
 import { join } from 'node:path';
 
 const MAX_BYTES = 256 * 1024;
@@ -78,11 +78,16 @@ export function recordDiagnostic(config, entry, maxBytes = MAX_BYTES) {
 	}
 }
 
+// Reads at most the cap's worth from the end: a file grown past it by something else cannot exhaust memory.
 function readRegularFile(path) {
 	let file;
 	try {
 		file = openRegularFile(path, READ_FLAGS);
-		return file ? readFileSync(file.fd, 'utf8') : '';
+		if (!file) return '';
+		const length = Math.min(file.size, MAX_BYTES);
+		const buffer = Buffer.alloc(length);
+		const read = readSync(file.fd, buffer, 0, length, file.size - length);
+		return buffer.toString('utf8', 0, read);
 	} catch {
 		return '';
 	} finally {

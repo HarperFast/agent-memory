@@ -1125,14 +1125,15 @@ needsReview, author, ownerId, scopes }` for all watched and injected memories in
   newlines, and any occurrence of the nonce or tag names in memory bodies is scrubbed so stored content
   cannot break out of the data block or masquerade as instructions; `memory` and `topic` delimiters in bodies are
   escaped whatever their nonce, closed or not.
-- **Diagnostics log (`<cacheDir>/diagnostics.jsonl`)**: `UserPromptSubmit` and `SessionStart` (for the sources it
-  handles; `hooks.json` invokes it for no other) each append one line naming their outcome (`recordedHook` → `recordDiagnostic`), so a recall that injects nothing can be told apart from
+- **Diagnostics log (`<cacheDir>/diagnostics.jsonl`)**: `UserPromptSubmit` and `SessionStart` each append one line
+  naming their outcome, and `bin/headers.mjs` one when it has no credential (`mcp_headers`) (`recordedHook` → `recordDiagnostic`), so a recall that injects nothing can be told apart from
   "no relevant memories": `injected`, `empty`, `deduped`, `over_budget`, `http_<status>`, `timeout`, `error` (with a
   `reason`), `skipped`, `disabled` and `unconfigured`. Lines hold only the fields in `ENTRY_FIELDS` (timestamp, the session's
   state-file key, counts, latency and fixed reason/errno codes), never prompt text, the query, memory ids or content, URLs
   or credentials. The log sits in `cacheDir`, not an endpoint directory, so a run with no endpoint still logs. Logging
   is best-effort: a hook run killed at its command timeout, a `hook.mjs` exit before a handler runs, a full disk, or
-  two writers rotating at once leave no line or lose the rotated file. At 256 KiB the file is renamed to
+  two writers rotating at once leave no line or lose the rotated file. `injected` records what the handler returned
+  to `hook.mjs`; a stdout write that fails after it is not seen. At 256 KiB the file is renamed to
   `diagnostics.jsonl.1`; it is opened `O_NOFOLLOW | O_NONBLOCK` and only appended if it is a regular file.
   `bin/diagnostics.mjs` summarizes both files.
 - **Credentials come only from the environment, `AGENT_MEMORY_ENV_FILE`, or `$HOME/.config/agent-memory/env`**

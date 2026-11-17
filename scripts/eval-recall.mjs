@@ -245,7 +245,7 @@ export async function runEval(argv = [], env = process.env, io = {}) {
 		stdout(JSON.stringify(summary, null, 2));
 	} else {
 		stdout(
-			`Recall@${summary.k} over ${summary.count} queries (watch=${summary.watch}): ${(summary.recallAtK * 100).toFixed(1)}% (hit rate: ${(summary.hitRate * 100).toFixed(1)}%, timeouts: ${summary.timeouts}/${summary.count})`,
+			`Recall@${summary.k} over ${summary.count} queries (watch=${summary.watch}): ${(summary.recallAtK * 100).toFixed(1)}% (hit rate: ${(summary.hitRate * 100).toFixed(1)}%, timeouts: ${summary.timeouts}/${summary.count}, skipped by the hook: ${summary.skipped})`,
 		);
 		stdout(
 			`Latency (ms): min=${summary.latencyMs.min} p50=${summary.latencyMs.p50} p95=${summary.latencyMs.p95} max=${summary.latencyMs.max} mean=${summary.latencyMs.mean}`,

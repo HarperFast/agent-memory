@@ -29,6 +29,10 @@ const FILLER_TERMS = new Set(
 	).split(' '),
 );
 const SHORT_WORD_SCRIPT = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
+const UNCONFIGURED_REMEDY = {
+	invalid_url: 'AGENT_MEMORY_URL must be https, or http to a loopback host unless AGENT_MEMORY_ALLOW_INSECURE_HTTP=1.',
+	invalid_token: 'AGENT_MEMORY_TOKEN must be a single-line token or Basic credential.',
+};
 
 export function truncatePrompt(prompt) {
 	const text = String(prompt ?? '').trim();
@@ -77,7 +81,9 @@ function persist(entry, write) {
 	try {
 		write();
 	} catch (error) {
-		entry.stateError ??= errorCode(error) ?? 'unknown';
+		const code = errorCode(error) ?? 'unknown';
+		if (!entry.stateError?.split(',').includes(code))
+			entry.stateError = entry.stateError ? `${entry.stateError},${code}` : code;
 	}
 }
 
@@ -273,9 +279,12 @@ export async function handleSessionStart(input = {}, options = {}) {
 	const env = options.env ?? process.env;
 	const config = options.config ?? resolveConfig(env);
 	const source = input.source ? String(input.source) : 'startup';
-	if (!VALID_BOOTSTRAP_SOURCES.has(source)) return {};
 	const sessionId = String(input.session_id || 'default');
 	const entry = { event: 'bootstrap', session: sessionKey(sessionId) };
+	if (!VALID_BOOTSTRAP_SOURCES.has(source)) {
+		recordDiagnostic(config, { ...entry, outcome: 'skipped', reason: 'unsupported_source' });
+		return {};
+	}
 	return recordedHook(config, entry, () => bootstrapSession(config, env, source, sessionId, options, entry));
 }
 
@@ -285,10 +294,10 @@ async function bootstrapSession(config, env, source, sessionId, options, entry) 
 		entry.reason = config.unconfiguredReason;
 		if (!config.partiallyConfigured) return {};
 		const notice = `agent-memory is not configured (${config.unconfiguredReason})`;
-		for (const banner of [
-			`${notice}; session bootstrap and per-prompt recall are off. Credentials are read from the environment or ${config.envFilePath}; a harness that replaces HOME must pass AGENT_MEMORY_ENV_FILE.`,
-			`${notice}.`,
-		]) {
+		const remedy =
+			UNCONFIGURED_REMEDY[config.unconfiguredReason] ??
+			`Credentials are read from the environment or ${config.envFilePath}; a harness that replaces HOME must pass AGENT_MEMORY_ENV_FILE.`;
+		for (const banner of [`${notice}; session bootstrap and per-prompt recall are off. ${remedy}`, `${notice}.`]) {
 			const formatted = formatInjectionBlock({
 				banners: [banner],
 				budget: config.bootstrapBudget,

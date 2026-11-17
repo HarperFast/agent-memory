@@ -50,7 +50,7 @@ Configure your Harper endpoint and user-bound credential:
 
 ## Diagnostics
 
-Every `SessionStart` and `UserPromptSubmit` appends one line to `<AGENT_MEMORY_CACHE_DIR>/diagnostics.jsonl` with its outcome (`injected`, `empty`, `deduped`, `over_budget`, `http_<status>`, `timeout`, `error`, `skipped`, `disabled` or `unconfigured`, plus a `reason` where one applies), the request latency in ms and hit counts. Lines never contain prompt text, memory ids or content, URLs or credentials. The file rotates to `diagnostics.jsonl.1` at 256 KiB. Summarize it with the plugin's own script (the plugin root is where Claude Code installed it, such as `~/.claude/plugins/cache/agent-memory/agent-memory/<version>`):
+Every `SessionStart` and `UserPromptSubmit` (and the MCP headers helper, when it finds no credential) appends one line to `<AGENT_MEMORY_CACHE_DIR>/diagnostics.jsonl` with its outcome (`injected`, `empty`, `deduped`, `over_budget`, `http_<status>`, `timeout`, `error`, `skipped`, `disabled` or `unconfigured`, plus a `reason` where one applies), the request latency in ms and hit counts. Lines never contain prompt text, memory ids or content, URLs or credentials. The file rotates to `diagnostics.jsonl.1` at 256 KiB. Summarize it with the plugin's own script (the plugin root is where Claude Code installed it, such as `~/.claude/plugins/cache/agent-memory/agent-memory/<version>`):
 
 ```bash
 node "<plugin root>/bin/diagnostics.mjs"            # counts by outcome and latency percentiles
