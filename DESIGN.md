@@ -1125,8 +1125,8 @@ needsReview, author, ownerId, scopes }` for all watched and injected memories in
   newlines, and any occurrence of the nonce or tag names in memory bodies is scrubbed so stored content
   cannot break out of the data block or masquerade as instructions; `memory` and `topic` delimiters in bodies are
   escaped whatever their nonce, closed or not.
-- **Diagnostics log (`<cacheDir>/diagnostics.jsonl`)**: `SessionStart` and `UserPromptSubmit` each append one line
-  naming their outcome (`recordedHook` → `recordDiagnostic`), so a recall that injects nothing can be told apart from
+- **Diagnostics log (`<cacheDir>/diagnostics.jsonl`)**: `UserPromptSubmit` and `SessionStart` (for the sources it
+  handles; `hooks.json` invokes it for no other) each append one line naming their outcome (`recordedHook` → `recordDiagnostic`), so a recall that injects nothing can be told apart from
   "no relevant memories": `injected`, `empty`, `deduped`, `over_budget`, `http_<status>`, `timeout`, `error` (with a
   `reason`), `skipped`, `disabled` and `unconfigured`. Lines hold only the fields in `ENTRY_FIELDS` (timestamp, the session's
   state-file key, counts, latency and fixed reason/errno codes), never prompt text, the query, memory ids or content, URLs
@@ -1136,11 +1136,12 @@ needsReview, author, ownerId, scopes }` for all watched and injected memories in
   `diagnostics.jsonl.1`; it is opened `O_NOFOLLOW | O_NONBLOCK` and only appended if it is a regular file.
   `bin/diagnostics.mjs` summarizes both files.
 - **Credentials come only from the environment, `AGENT_MEMORY_ENV_FILE`, or `$HOME/.config/agent-memory/env`**
-  (`resolveConfig`). The plugin never falls back to the account's passwd home: a harness that replaces `HOME` (dispatch
-  gives each run a private one) does so to keep host directories out of reach, and passes the credential file as a
-  named capability (`AGENT_MEMORY_ENV_FILE`, plus `AGENT_MEMORY_CACHE_DIR` to keep the log). When only half the
-  configuration is found (`partiallyConfigured`), `SessionStart` injects a notice naming what is missing and where it
-  looked, instead of returning nothing.
+  (`resolveConfig`). A set `HOME` is never bypassed for the account's passwd home (that is read only when `HOME` is
+  unset): a harness that replaces `HOME` (dispatch gives each run a private one) does so to keep host directories out of
+  reach, and passes the credential file as a named capability (`AGENT_MEMORY_ENV_FILE`, plus `AGENT_MEMORY_CACHE_DIR`
+  to keep the log). When the configuration is incomplete but something was set (a URL, a token or
+  `AGENT_MEMORY_ENV_FILE`: `partiallyConfigured`), `SessionStart` injects a notice naming what is missing and where it
+  looked (shortened to the reason alone when the budget cannot hold it), instead of returning nothing.
 - **Read-through offline cache (`bootstrap-cache.json`)**: stores only `pinned` (`section === 'pinned'`) and
   private (`user:*`) memories from the last successful `/Memory/bootstrap` snapshot authoritatively under
   `AGENT_MEMORY_CACHE_DIR` (`0700` dir, `0600` file, bounded by `AGENT_MEMORY_CACHE_MAX_AGE_MS`, default `24`

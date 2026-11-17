@@ -140,7 +140,9 @@ export function resolveConfig(env = process.env) {
 		authorization,
 		configured: Boolean(baseUrl && authorization),
 		unconfiguredReason,
-		partiallyConfigured: Boolean(unconfiguredReason && (rawUrl.trim() || rawToken.trim())),
+		partiallyConfigured: Boolean(
+			unconfiguredReason && (rawUrl.trim() || rawToken.trim() || env.AGENT_MEMORY_ENV_FILE?.trim()),
+		),
 		urlFromEnvFile: !hasEnvUrl && Boolean(fileData.entries.AGENT_MEMORY_URL),
 		envFileInsecurePermissions: fileData.insecurePermissions,
 		envFilePath,

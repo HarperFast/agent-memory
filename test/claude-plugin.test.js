@@ -1591,51 +1591,57 @@ describe('recall diagnostics log, search gate, and best-effort persistence', () 
 		}
 	});
 
-	it('returns the injection when state or cache writes fail, recording the failure', async () => {
-		const { tmp, env, config } = setup();
-		const { sessionsDir } = getSessionPaths(config, 'persist-recall');
-		const endpointDir = join(sessionsDir, '..');
-		try {
-			saveSessionState(config, 'persist-recall', loadSessionState(config, 'persist-recall'));
-			chmodSync(sessionsDir, 0o500);
-			const res = await handleUserPromptSubmit(
-				{ session_id: 'persist-recall', prompt: PROMPT },
-				{
-					config,
-					env,
-					spawnFollower: false,
-					fetchImpl: async () => json({ memories: [memory('mem_persist_recall_1')] }),
-				},
-			);
-			assert.ok(res.hookSpecificOutput.additionalContext.includes('mem_persist_recall_1'));
-			let line = readDiagnostics(config).at(-1);
-			assert.equal(line.outcome, 'injected');
-			assert.equal(line.stateError, 'EACCES');
-			chmodSync(sessionsDir, 0o700);
+	it(
+		'returns the injection when state or cache writes fail, recording the failure',
+		{
+			skip: process.getuid?.() === 0 && 'directory permissions do not stop root from writing',
+		},
+		async () => {
+			const { tmp, env, config } = setup();
+			const { sessionsDir } = getSessionPaths(config, 'persist-recall');
+			const endpointDir = join(sessionsDir, '..');
+			try {
+				saveSessionState(config, 'persist-recall', loadSessionState(config, 'persist-recall'));
+				chmodSync(sessionsDir, 0o500);
+				const res = await handleUserPromptSubmit(
+					{ session_id: 'persist-recall', prompt: PROMPT },
+					{
+						config,
+						env,
+						spawnFollower: false,
+						fetchImpl: async () => json({ memories: [memory('mem_persist_recall_1')] }),
+					},
+				);
+				assert.ok(res.hookSpecificOutput.additionalContext.includes('mem_persist_recall_1'));
+				let line = readDiagnostics(config).at(-1);
+				assert.equal(line.outcome, 'injected');
+				assert.equal(line.stateError, 'EACCES');
+				chmodSync(sessionsDir, 0o700);
 
-			chmodSync(endpointDir, 0o500);
-			const boot = await handleSessionStart(
-				{ session_id: 'persist-recall', source: 'startup' },
-				{
-					config,
-					env,
-					spawnFollower: false,
-					fetchImpl: async () => json({ memories: [memory('mem_persist_boot_001')] }),
-				},
-			);
-			assert.ok(boot.hookSpecificOutput.additionalContext.includes('mem_persist_boot_001'));
-			line = readDiagnostics(config).at(-1);
-			assert.equal(line.event, 'bootstrap');
-			assert.equal(line.outcome, 'injected');
-			assert.equal(line.stateError, 'EACCES', 'the bootstrap cache write failed after the state write');
-			chmodSync(endpointDir, 0o700);
-			assert.ok(loadSessionState(config, 'persist-recall').injectedIds.includes('mem_persist_boot_001'));
-		} finally {
-			chmodSync(sessionsDir, 0o700);
-			chmodSync(endpointDir, 0o700);
-			rmSync(tmp, { recursive: true, force: true });
-		}
-	});
+				chmodSync(endpointDir, 0o500);
+				const boot = await handleSessionStart(
+					{ session_id: 'persist-recall', source: 'startup' },
+					{
+						config,
+						env,
+						spawnFollower: false,
+						fetchImpl: async () => json({ memories: [memory('mem_persist_boot_001')] }),
+					},
+				);
+				assert.ok(boot.hookSpecificOutput.additionalContext.includes('mem_persist_boot_001'));
+				line = readDiagnostics(config).at(-1);
+				assert.equal(line.event, 'bootstrap');
+				assert.equal(line.outcome, 'injected');
+				assert.equal(line.stateError, 'EACCES', 'the bootstrap cache write failed after the state write');
+				chmodSync(endpointDir, 0o700);
+				assert.ok(loadSessionState(config, 'persist-recall').injectedIds.includes('mem_persist_boot_001'));
+			} finally {
+				chmodSync(sessionsDir, 0o700);
+				chmodSync(endpointDir, 0o700);
+				rmSync(tmp, { recursive: true, force: true });
+			}
+		},
+	);
 
 	it('records bootstrap outcomes and tells a partially configured session why the plugin is off', async () => {
 		const { tmp, env, config } = setup();
@@ -1653,12 +1659,52 @@ describe('recall diagnostics log, search gate, and best-effort persistence', () 
 			assert.equal(line.hits, 1);
 			assert.equal(line.injected, 1);
 
+			await start({ ...config, bootstrapBudget: 100 }, async () =>
+				json({ memories: [memory('mem_boot_budget_0001')] }),
+			);
+			assert.equal(readDiagnostics(config).at(-1).outcome, 'over_budget');
+
 			saveBootstrapCache(config, [memory('mem_boot_cached_0001', { scopes: ['user:alice'] })]);
 			const offline = await start(config, async () => json({}, 502));
 			assert.ok(offline.hookSpecificOutput.additionalContext.includes('STALE CACHE'));
 			line = readDiagnostics(config).at(-1);
 			assert.equal(line.outcome, 'http_502');
 			assert.equal(line.stale, 1);
+
+			const cutOff = await start(
+				{ ...config, bootstrapTimeoutMs: 60 },
+				async (_url, init) =>
+					new Response(
+						new ReadableStream({
+							start(controller) {
+								controller.enqueue(new TextEncoder().encode('{"memories":['));
+								init.signal.addEventListener('abort', () => controller.error(init.signal.reason));
+							},
+						}),
+						{ status: 200 },
+					),
+			);
+			assert.ok(
+				cutOff.hookSpecificOutput.additionalContext.includes('STALE CACHE'),
+				'a body cut off by the deadline uses the cache',
+			);
+			line = readDiagnostics(config).at(-1);
+			assert.equal(line.outcome, 'timeout');
+			assert.equal(line.stale, 1);
+
+			const reset = Object.assign(new TypeError('terminated'), { cause: { code: 'ECONNRESET' } });
+			const resetRes = await start(config, async () => ({
+				ok: true,
+				status: 200,
+				json: async () => Promise.reject(reset),
+			}));
+			assert.ok(resetRes.hookSpecificOutput.additionalContext.includes('STALE CACHE'));
+			line = readDiagnostics(config).at(-1);
+			assert.deepEqual([line.outcome, line.reason, line.code], ['error', 'network', 'ECONNRESET']);
+
+			assert.deepEqual(await start(config, async () => json('{truncated')), {}, 'malformed JSON is not an outage');
+			line = readDiagnostics(config).at(-1);
+			assert.deepEqual([line.outcome, line.reason], ['error', 'bad_json']);
 
 			const missingToken = resolveConfig({
 				...env,
@@ -1674,13 +1720,28 @@ describe('recall diagnostics log, search gate, and best-effort persistence', () 
 			assert.equal(line.outcome, 'unconfigured');
 			assert.equal(line.reason, 'missing_token');
 
+			const tight = await start({ ...missingToken, bootstrapBudget: 400 });
+			assert.ok(
+				tight.hookSpecificOutput.additionalContext.includes('agent-memory is not configured (missing_token).'),
+				'a budget too small for the full notice still gets the short one',
+			);
+
 			const badUrl = resolveConfig({ ...env, AGENT_MEMORY_URL: 'http://remote.example.com' });
 			assert.ok((await start(badUrl)).hookSpecificOutput.additionalContext.includes('(invalid_url)'));
 
-			const nothing = resolveConfig({
+			const wrongEnvFile = resolveConfig({
 				AGENT_MEMORY_URL: '',
 				AGENT_MEMORY_TOKEN: '',
-				AGENT_MEMORY_ENV_FILE: join(tmp, 'missing-env'),
+				AGENT_MEMORY_ENV_FILE: join(tmp, 'wrong', 'env'),
+				AGENT_MEMORY_CACHE_DIR: tmp,
+			});
+			const wrongText = (await start(wrongEnvFile)).hookSpecificOutput.additionalContext;
+			assert.ok(wrongText.includes('(missing_url)') && wrongText.includes(join(tmp, 'wrong', 'env')));
+
+			const nothing = resolveConfig({
+				HOME: tmp,
+				AGENT_MEMORY_URL: '',
+				AGENT_MEMORY_TOKEN: '',
 				AGENT_MEMORY_CACHE_DIR: tmp,
 			});
 			assert.deepEqual(await start(nothing), {}, 'a never-configured install injects nothing');
@@ -1790,6 +1851,21 @@ describe('recall diagnostics log, search gate, and best-effort persistence', () 
 				runDiagnostics(['--bogus'], env, () => {}),
 				2,
 			);
+
+			recordDiagnostic(config, { event: 'constructor', outcome: '__proto__' });
+			recordDiagnostic(config, { event: '__proto__', outcome: 'toString' });
+			const odd = summarizeDiagnostics(readDiagnostics(config));
+			assert.equal(odd.constructor.count, 1);
+			assert.equal(odd.constructor.outcomes.__proto__, 1);
+			assert.equal(Object.getOwnPropertyDescriptor(odd, '__proto__').value.count, 1);
+
+			const path = getDiagnosticsPath(config);
+			const target = join(tmp, 'elsewhere.jsonl');
+			writeFileSync(target, '{"event":"recall","outcome":"planted"}\n');
+			rmSync(path);
+			rmSync(`${path}.1`, { force: true });
+			symlinkSync(target, path);
+			assert.deepEqual(readDiagnostics(config), [], 'the reader does not follow a symlink either');
 		} finally {
 			rmSync(tmp, { recursive: true, force: true });
 		}

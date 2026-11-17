@@ -19,7 +19,6 @@ import { bootstrapRequest, formatInjectionBlock, isNeedsReview, resolveAuthorPri
 
 const VALID_BOOTSTRAP_SOURCES = new Set(['startup', 'resume', 'compact']);
 const NOTICE_EVENT_KINDS = new Set(['superseded', 'revised', 'withdrawn', 'flagged']);
-// Conversational and function words that carry no topic of their own.
 const FILLER_TERMS = new Set(
 	(
 		'about actually again agree agreed ahead alright also always anyway awesome been before being cancel could ' +
@@ -285,14 +284,19 @@ async function bootstrapSession(config, env, source, sessionId, options, entry) 
 		entry.outcome = 'unconfigured';
 		entry.reason = config.unconfiguredReason;
 		if (!config.partiallyConfigured) return {};
-		const formatted = formatInjectionBlock({
-			banners: [
-				`agent-memory is not configured (${config.unconfiguredReason}); session bootstrap and per-prompt recall are off. Credentials are read from the environment or ${config.envFilePath}; a harness that replaces HOME must pass AGENT_MEMORY_ENV_FILE.`,
-			],
-			budget: config.bootstrapBudget,
-			nonce: options.nonce,
-		});
-		return hookOutput('SessionStart', formatted.text);
+		const notice = `agent-memory is not configured (${config.unconfiguredReason})`;
+		for (const banner of [
+			`${notice}; session bootstrap and per-prompt recall are off. Credentials are read from the environment or ${config.envFilePath}; a harness that replaces HOME must pass AGENT_MEMORY_ENV_FILE.`,
+			`${notice}.`,
+		]) {
+			const formatted = formatInjectionBlock({
+				banners: [banner],
+				budget: config.bootstrapBudget,
+				nonce: options.nonce,
+			});
+			if (formatted.text) return hookOutput('SessionStart', formatted.text);
+		}
+		return {};
 	}
 
 	const fetchImpl = options.fetchImpl ?? globalThis.fetch;
@@ -364,10 +368,17 @@ async function bootstrapSession(config, env, source, sessionId, options, entry) 
 		let body;
 		try {
 			body = await response.json();
-		} catch {
+		} catch (error) {
 			body = undefined;
-			entry.outcome = signal.aborted ? 'timeout' : 'error';
-			if (!signal.aborted) entry.reason = 'bad_json';
+			if (signal.aborted) {
+				entry.outcome = 'timeout';
+			} else {
+				entry.outcome = 'error';
+				entry.reason = error instanceof SyntaxError ? 'bad_json' : 'network';
+				entry.code = errorCode(error);
+			}
+			// A body cut off by the deadline or the network is an unreachable server: fall back to the offline cache.
+			if (entry.reason !== 'bad_json') response = undefined;
 		}
 		entry.ms = Math.round(performance.now() - start);
 		if (body && Array.isArray(body.memories)) {
@@ -381,7 +392,8 @@ async function bootstrapSession(config, env, source, sessionId, options, entry) 
 			});
 			entry.hits = memories.length;
 			entry.injected = formatted.includedMemories.length;
-			entry.outcome = entry.injected > 0 ? 'injected' : 'empty';
+			if (entry.injected > 0) entry.outcome = 'injected';
+			else entry.outcome = memories.length === 0 ? 'empty' : 'over_budget';
 			recordMemoriesInState(state, memories, formatted.includedMemories);
 			persist(entry, () => saveSessionState(config, sessionId, state));
 			persist(entry, () => saveBootstrapCache(config, memories));
