@@ -28,11 +28,15 @@ export function getEndpointCacheDir(config) {
 	return join(config.cacheDir, hash);
 }
 
-export function getSessionPaths(config, sessionId) {
-	const safeId = createHash('sha256')
+export function sessionKey(sessionId) {
+	return createHash('sha256')
 		.update(String(sessionId || 'default'))
 		.digest('hex')
 		.slice(0, 24);
+}
+
+export function getSessionPaths(config, sessionId) {
+	const safeId = sessionKey(sessionId);
 	const sessionsDir = join(getEndpointCacheDir(config), 'sessions');
 	return {
 		sessionsDir,

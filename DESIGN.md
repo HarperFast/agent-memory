@@ -1063,8 +1063,11 @@ needsReview, author, ownerId, scopes }` for all watched and injected memories in
   an unclosed trailing fence) and URLs. Inline fence markers and diagnostic underlines remain prose;
   markers inside a code line do not close a block. It keeps at most 32 Unicode letter/number runs,
   joins them with spaces and truncates to `QUERY_MAX_CHARS` (`1000` characters) without a dangling surrogate. Splitting punctuation prevents code-like tokens from hiding many analyzed terms; 32 leaves
-  headroom under the measured 64-term budget. `eval-recall.mjs` uses the same builder. Empty sanitized
-  queries skip the network while still processing change notices. Code-only/URL-only prompts therefore
+  headroom under the measured 64-term budget. `eval-recall.mjs` uses the same builder and gate. Empty sanitized
+  queries skip the network while still processing change notices, and so does a query with no distinctive term
+  (`hasDistinctiveTerm`: a letter-containing term outside a short conversational/stopword list, at least 4 characters,
+  or 2 in Han, Kana or Hangul). Search fuses ranks only and its vector lane has no distance cutoff, so `1, 2, 3` or
+  `yes` would otherwise inject the nearest, unrelated memory. Code-only/URL-only prompts therefore
   skip automatic recall, as does a prompt whose first 32000 characters contain no usable prose; shortened text also changes embedding input, so ranking equivalence is not
   promised. Other search clients keep their original query. The hook calls
   `GET /Memory/?q=<query>&limit=<k>&watch=true` (`k` defaults to `5` via
@@ -1079,7 +1082,9 @@ needsReview, author, ownerId, scopes }` for all watched and injected memories in
   attributed to a hit's author. The block is placed beside that first hit or not at all in the injection, so it never follows a hit that references it. A topic id over 128 characters is
   ignored. On timeout, network error, or server error, or when `state.json` is corrupt, the hook skips
   recall and always exits `0` (`hook.mjs` installs top-level `uncaughtException`, `unhandledRejection`, and
-  `EPIPE` guards and calls `process.exit(0)` after flushing stdout). Setting `AGENT_MEMORY_RECALL=off` skips
+  `EPIPE` guards and calls `process.exit(0)` after flushing stdout). Writing `state.json` or
+  `bootstrap-cache.json` is best-effort in both hooks (`persist`): a failed write is logged, and the injection the server
+  returned is still printed, at the cost of a possible repeat next turn. Setting `AGENT_MEMORY_RECALL=off` skips
   the per-prompt network search when users do not want prompts sent in query strings or to the server's
   embedding provider, while still draining `<session>.events.jsonl` to surface pending live change notices.
 - **Live changes (`/MemoryEvents` follower + in-band revision diffing)**:
@@ -1120,6 +1125,24 @@ needsReview, author, ownerId, scopes }` for all watched and injected memories in
   newlines, and any occurrence of the nonce or tag names in memory bodies is scrubbed so stored content
   cannot break out of the data block or masquerade as instructions; `memory` and `topic` delimiters in bodies are
   escaped whatever their nonce, closed or not.
+- **Diagnostics log (`<cacheDir>/diagnostics.jsonl`)**: `UserPromptSubmit` and `SessionStart` each append one line
+  naming their outcome, and `bin/headers.mjs` one when it has no credential (`mcp_headers`) (`recordedHook` → `recordDiagnostic`), so a recall that injects nothing can be told apart from
+  "no relevant memories": `injected`, `empty`, `deduped`, `over_budget`, `http_<status>`, `timeout`, `error` (with a
+  `reason`), `skipped`, `disabled` and `unconfigured`. Lines hold only the fields in `ENTRY_FIELDS` (timestamp, the session's
+  state-file key, counts, latency and fixed reason/errno codes), never prompt text, the query, memory ids or content, URLs
+  or credentials. The log sits in `cacheDir`, not an endpoint directory, so a run with no endpoint still logs. Logging
+  is best-effort: a hook run killed at its command timeout, a `hook.mjs` exit before a handler runs, a full disk, or
+  two writers rotating at once leave no line or lose the rotated file. `injected` records what the handler returned
+  to `hook.mjs`; a stdout write that fails after it is not seen. At 256 KiB the file is renamed to
+  `diagnostics.jsonl.1`; it is opened `O_NOFOLLOW | O_NONBLOCK` and only appended if it is a regular file.
+  `bin/diagnostics.mjs` summarizes both files.
+- **Credentials come only from the environment, `AGENT_MEMORY_ENV_FILE`, or `$HOME/.config/agent-memory/env`**
+  (`resolveConfig`). A set `HOME` is never bypassed for the account's passwd home (that is read only when `HOME` is
+  unset): a harness that replaces `HOME` (dispatch gives each run a private one) does so to keep host directories out of
+  reach, and passes the credential file as a named capability (`AGENT_MEMORY_ENV_FILE`, plus `AGENT_MEMORY_CACHE_DIR`
+  to keep the log). When the configuration is incomplete but something was set (a URL, a token or
+  `AGENT_MEMORY_ENV_FILE`: `partiallyConfigured`), `SessionStart` injects a notice naming what is missing and where it
+  looked (shortened to the reason alone when the budget cannot hold it), instead of returning nothing.
 - **Read-through offline cache (`bootstrap-cache.json`)**: stores only `pinned` (`section === 'pinned'`) and
   private (`user:*`) memories from the last successful `/Memory/bootstrap` snapshot authoritatively under
   `AGENT_MEMORY_CACHE_DIR` (`0700` dir, `0600` file, bounded by `AGENT_MEMORY_CACHE_MAX_AGE_MS`, default `24`

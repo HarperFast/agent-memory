@@ -8,6 +8,14 @@ All notable changes to `@harperfast/agent-memory` are documented here. The forma
 
 ### Fixed
 
+- Claude Code plugin: a prompt with no distinctive term (`1, 2, 3`, `yes`, `please continue`) no longer recalls the
+  nearest unrelated memory; the recall search is skipped, and queued change notices are still delivered.
+- Claude Code plugin: a failed write of session state or the offline cache no longer discards the memories the server
+  returned for that prompt or session start, and a follower spawn failure can no longer end the hook with no output.
+- Claude Code plugin: when only part of the configuration is found (for example `AGENT_MEMORY_URL` without a token, as
+  under a harness that replaces `HOME`), session start injects a notice saying what is missing and where it looked,
+  instead of silently doing nothing.
+
 - Live updates: a principal resolution that started before a `ScopeGrant` change is no longer cached after it, so a
   revoked grant stops event delivery on the next event instead of up to 5 s later.
 
@@ -22,6 +30,11 @@ All notable changes to `@harperfast/agent-memory` are documented here. The forma
   `section`, instead of as a memory with `id="unknown"` and `author="unknown"`.
 
 ### Added
+
+- Claude Code plugin: every session start and prompt-time recall records its outcome (`injected`, `empty`, `deduped`,
+  `http_<status>`, `timeout`, `error`, `skipped`, `unconfigured`, …), latency and hit count in a size-capped
+  `diagnostics.jsonl` under `AGENT_MEMORY_CACHE_DIR`, with no prompt text, memory content or credentials;
+  `bin/diagnostics.mjs` summarizes it. `AGENT_MEMORY_ENV_FILE` and `AGENT_MEMORY_CACHE_DIR` are now documented.
 
 - Delegation ([#55](https://github.com/HarperFast/agent-memory/issues/55)): `actsFor` on an agent user's
   `ScopeGrant` row (`{ id: "user:<delegate>", actsFor: <principal> }`) lets a person's agent users act for the person. A delegate may revise,

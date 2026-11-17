@@ -9,7 +9,7 @@ import {
 	resolveConfig,
 	validateBaseUrl,
 } from '../claude-plugin/lib/config.mjs';
-import { buildRecallQuery } from '../claude-plugin/lib/hooks.mjs';
+import { buildRecallQuery, hasDistinctiveTerm } from '../claude-plugin/lib/hooks.mjs';
 
 export function parseDatasetJsonl(content) {
 	const rows = [];
@@ -108,7 +108,8 @@ export async function evaluateRecallDataset(rows, { baseUrl, authorization, k, t
 	let skipped = 0;
 
 	for (const row of rows) {
-		const query = buildRecallQuery(row.prompt);
+		const builtQuery = buildRecallQuery(row.prompt);
+		const query = hasDistinctiveTerm(builtQuery) ? builtQuery : '';
 		if (!query) skipped++;
 		const watchParam = watch ? '&watch=true' : '';
 		const url = `${baseUrl}/Memory/?q=${encodeURIComponent(query)}&limit=${encodeURIComponent(k)}${watchParam}`;
@@ -151,6 +152,7 @@ export async function evaluateRecallDataset(rows, { baseUrl, authorization, k, t
 				recallAtK: Number(recall.toFixed(4)),
 				latencyMs: elapsed,
 				timedOut: false,
+				...(query ? {} : { skipped: true }),
 				...(errorMsg ? { error: errorMsg } : {}),
 			});
 		} catch (error) {
@@ -243,7 +245,7 @@ export async function runEval(argv = [], env = process.env, io = {}) {
 		stdout(JSON.stringify(summary, null, 2));
 	} else {
 		stdout(
-			`Recall@${summary.k} over ${summary.count} queries (watch=${summary.watch}): ${(summary.recallAtK * 100).toFixed(1)}% (hit rate: ${(summary.hitRate * 100).toFixed(1)}%, timeouts: ${summary.timeouts}/${summary.count})`,
+			`Recall@${summary.k} over ${summary.count} queries (watch=${summary.watch}): ${(summary.recallAtK * 100).toFixed(1)}% (hit rate: ${(summary.hitRate * 100).toFixed(1)}%, timeouts: ${summary.timeouts}/${summary.count}, skipped by the hook: ${summary.skipped})`,
 		);
 		stdout(
 			`Latency (ms): min=${summary.latencyMs.min} p50=${summary.latencyMs.p50} p95=${summary.latencyMs.p95} max=${summary.latencyMs.max} mean=${summary.latencyMs.mean}`,
