@@ -20,8 +20,14 @@ node "$ONBOARDING_DIR/lib.mjs" check-credentials
 find_tools claude
 node "$ONBOARDING_DIR/lib.mjs" claude-settings "$CLAUDE_DIR/settings.json"
 
-if claude plugin marketplace list --json 2>/dev/null |
-	node -e 'process.exit(JSON.parse(require("fs").readFileSync(0, "utf8")).some((m) => m.name === "agent-memory") ? 0 : 1)'; then
+# An unreadable listing stops the install: it is not evidence that the marketplace is absent.
+LISTED="$(claude plugin marketplace list --json)" || die "claude plugin marketplace list failed"
+HAS_MARKETPLACE="$(printf '%s' "$LISTED" | node -e '
+const list = JSON.parse(require("fs").readFileSync(0, "utf8"));
+if (!Array.isArray(list)) throw new Error("unexpected marketplace list");
+process.stdout.write(list.some((m) => m.name === "agent-memory") ? "yes" : "no");
+' 2>/dev/null)" || die "could not read the output of claude plugin marketplace list --json"
+if [ "$HAS_MARKETPLACE" = yes ]; then
 	claude plugin marketplace update agent-memory >/dev/null
 else
 	claude plugin marketplace add "$SOURCE"

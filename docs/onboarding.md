@@ -134,7 +134,7 @@ SessionStart: injected, 3712 chars, orientation=5 memories=4 topics=0
 UserPromptSubmit: injected, 1650 chars, orientation=0 memories=2 topics=1
 ```
 
-It exits non-zero unless both hooks got an answer from the server:
+It exits non-zero unless session start got an answer from the server and recall either got one or is switched off:
 
 | Outcome                                       | Meaning                                                                                   |
 | --------------------------------------------- | ----------------------------------------------------------------------------------------- |
@@ -144,7 +144,7 @@ It exits non-zero unless both hooks got an answer from the server:
 | `unconfigured (<reason>)`                     | The env file is missing, or has no valid URL or token. Fix it, or provision again.        |
 | `http_401`, `http_403`                        | The server refused the credential. Ask the admin to rotate it or check the user's role.   |
 | `timeout`, `error`, `hook_timeout`            | The URL is wrong, or the server is unreachable from this machine.                         |
-| `hook_failed`                                 | The hook process itself failed: check that `node` is version 22 or later.                 |
+| `hook_failed`, `bad_output`                   | The hook process itself failed: check that `node` is version 22 or later.                 |
 | `no_diagnostics`                              | The install predates the plugin's diagnostics log. Update it ([below](#5-update)).        |
 
 In a session, `/mcp` should list `agent-memory` as connected. Every real session start and recall is logged too;

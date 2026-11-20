@@ -61,6 +61,13 @@ describe('onboarding scripts', () => {
 			});
 		});
 
+		it('deletes a key set to undefined', () => {
+			const path = join(dir, 'settings-remove.json');
+			writeFileSync(path, JSON.stringify({ env: { AGENT_MEMORY_ENV_FILE: '/old', FOO: '1' } }));
+			setSettingsEnv(path, { AGENT_MEMORY_ENV_FILE: undefined });
+			assert.deepEqual(JSON.parse(readFileSync(path, 'utf8')).env, { FOO: '1' });
+		});
+
 		it('refuses to overwrite a file that is not valid JSON', () => {
 			const path = join(dir, 'broken.json');
 			writeFileSync(path, '{"theme": ');
@@ -91,6 +98,14 @@ describe('onboarding scripts', () => {
 			assert.match(after, /\[mcp_servers\.agent-memory-tools\]\nurl = "keep"/);
 			assert.doesNotMatch(after, /old|quoted/);
 			assert.equal(after.match(/\[mcp_servers\.agent-memory\]/g).length, 1);
+		});
+
+		it('ignores agent-memory headers inside comments and removes indented and literal-quoted ones', () => {
+			const before =
+				'model = "o3"\n# [mcp_servers.agent-memory] example\nkeep = 1\n  [mcp_servers.\'agent-memory\']\nurl = "old"\n  [other]\nb = 2\n';
+			const after = setCodexMcpServer(before, 'https://memory.example.com/mcp', 'Basic dTpw');
+			assert.match(after, /^model = "o3"\n# \[mcp_servers\.agent-memory\] example\nkeep = 1\n {2}\[other\]\nb = 2\n/);
+			assert.doesNotMatch(after, /old/);
 		});
 
 		it('replaces an earlier agent-memory hook where it stands, so other hooks keep their positions', () => {
@@ -149,7 +164,7 @@ describe('onboarding scripts', () => {
 			assert.equal(readFileSync(join(codexHome, 'config.toml.pre-agent-memory'), 'utf8'), '[model]\nname = "x"\n');
 			assert.ok(existsSync(join(codexHome, 'agent-memory/plugin/lib/hooks.mjs')));
 			const hooks = JSON.parse(readFileSync(join(codexHome, 'hooks.json'), 'utf8')).hooks;
-			const command = `'/usr/bin/node' '${join(codexHome, 'agent-memory/plugin/hooks/hook.mjs')}'`;
+			const command = `env -u AGENT_MEMORY_URL -u AGENT_MEMORY_TOKEN '/usr/bin/node' '${join(codexHome, 'agent-memory/plugin/hooks/hook.mjs')}'`;
 			assert.equal(hooks.SessionStart[0].hooks[0].command, command);
 			assert.equal(first.match(/trusted_hash/g).length, 3);
 			const key = `${join(codexHome, 'hooks.json')}:session_start:0:0`;
@@ -174,7 +189,7 @@ describe('onboarding scripts', () => {
 			const hooks = JSON.parse(readFileSync(join(codexHome, 'hooks.json'), 'utf8')).hooks;
 			assert.match(
 				hooks.UserPromptSubmit[0].hooks[0].command,
-				/^env AGENT_MEMORY_ENV_FILE='\/etc\/team b\/env' '\/usr\/bin\/node' /,
+				/^env -u AGENT_MEMORY_URL -u AGENT_MEMORY_TOKEN AGENT_MEMORY_ENV_FILE='\/etc\/team b\/env' '\/usr\/bin\/node' /,
 			);
 		});
 	});
@@ -183,11 +198,15 @@ describe('onboarding scripts', () => {
 		let server;
 		let url;
 		before(async () => {
-			// In its own process: probeHooks blocks this one while the hook runs.
+			// In its own process: probeHooks blocks this one while the hook runs. Under /deny every request is refused;
+			// elsewhere every request finds no memories.
 			server = spawn(process.execPath, [
 				'-e',
-				`require('http').createServer((q, s) => { s.writeHead(401); s.end('{}'); })
-					.listen(0, '127.0.0.1', function () { console.log(this.address().port); });`,
+				`require('http').createServer((q, s) => {
+					const deny = q.url.startsWith('/deny/');
+					s.writeHead(deny ? 401 : 200, { 'content-type': 'application/json' });
+					s.end(deny ? '{}' : '{"memories":[]}');
+				}).listen(0, '127.0.0.1', function () { console.log(this.address().port); });`,
 			]);
 			const port = await new Promise((resolve) => server.stdout.once('data', (d) => resolve(String(d).trim())));
 			url = `http://127.0.0.1:${port}`;
@@ -200,7 +219,7 @@ describe('onboarding scripts', () => {
 			const result = probeHooks({
 				pluginRoot: pluginDir,
 				prompt: 'replication catch-up after restart',
-				env: { PATH: process.env.PATH, HOME: home, AGENT_MEMORY_ENV_FILE: envFile('probe', url) },
+				env: { PATH: process.env.PATH, HOME: home, AGENT_MEMORY_ENV_FILE: envFile('probe-deny', `${url}/deny`) },
 			});
 			assert.equal(result.ok, false);
 			assert.match(result.lines[0], /^SessionStart: http_401,/);
@@ -208,19 +227,24 @@ describe('onboarding scripts', () => {
 			assert.equal(existsSync(join(home, '.cache')), false);
 		});
 
-		it('fails on a skipped recall, which verified nothing, and accepts recall switched off', () => {
+		it('passes when both hooks get an answer, fails on a skipped recall, and accepts recall switched off', () => {
 			const env = {
 				PATH: process.env.PATH,
 				HOME: join(dir, 'probe-home'),
 				AGENT_MEMORY_ENV_FILE: envFile('probe', url),
 			};
+			const answered = probeHooks({ pluginRoot: pluginDir, prompt: 'replication catch-up after restart', env });
+			assert.deepEqual(
+				answered.lines.map((line) => line.split(',')[0]),
+				['SessionStart: empty', 'UserPromptSubmit: empty'],
+			);
+			assert.equal(answered.ok, true);
 			const skipped = probeHooks({ pluginRoot: pluginDir, prompt: 'yes', env });
 			assert.match(skipped.lines[1], /^UserPromptSubmit: skipped/);
+			assert.equal(skipped.ok, false);
 			const off = probeHooks({ pluginRoot: pluginDir, prompt: 'yes', env: { ...env, AGENT_MEMORY_RECALL: 'off' } });
 			assert.match(off.lines[1], /^UserPromptSubmit: disabled/);
-			// Both still fail here, on the bootstrap's 401.
-			assert.equal(skipped.ok, false);
-			assert.equal(off.ok, false);
+			assert.equal(off.ok, true);
 		});
 
 		it('reports an unconfigured install', () => {
@@ -244,6 +268,7 @@ describe('onboarding scripts', () => {
 				join(bin, 'claude'),
 				`#!/usr/bin/env bash
 echo "$CLAUDE_CONFIG_DIR $*" >> "${join(dir, 'claude.log')}"
+[ "$2 $3" = "marketplace list" ] && echo '[{"name":"team-agent-memory"}]'
 if [ "$2" = install ]; then
   mkdir -p "$CLAUDE_CONFIG_DIR/plugins/cache/p/hooks" && touch "$CLAUDE_CONFIG_DIR/plugins/cache/p/hooks/hook.mjs"
   printf '{"plugins":{"agent-memory@agent-memory":[{"scope":"user","installPath":"%s"}]}}' "$CLAUDE_CONFIG_DIR/plugins/cache/p" > "$CLAUDE_CONFIG_DIR/plugins/installed_plugins.json"
