@@ -193,13 +193,13 @@ describe('onboarding scripts', () => {
 			);
 		});
 
-		it('replaces its own trust records without taking an indented table that follows them', () => {
+		it('replaces its own trust records whole, ignoring a commented copy and keeping the table after them', () => {
 			const codexHome = join(dir, 'trust-codex');
 			mkdirSync(codexHome);
 			const key = JSON.stringify(`${join(codexHome, 'hooks.json')}:session_start:0:0`);
 			writeFileSync(
 				join(codexHome, 'config.toml'),
-				`[hooks.state.${key}]\ntrusted_hash = "sha256:old"\n  [keep]\nx = 1\n`,
+				`model = "o3"\n# [hooks.state.${key}]\nkeep_me = 1\n\n[hooks.state.${key}]\ntrusted_hash = "sha256:old"\n\nnote = 2\n  [keep]\nx = 1\n`,
 			);
 			configureCodex({
 				codexHome,
@@ -209,7 +209,8 @@ describe('onboarding scripts', () => {
 				authorization: 'Basic dTpw',
 			});
 			const toml = readFileSync(join(codexHome, 'config.toml'), 'utf8');
-			assert.match(toml, /^ {2}\[keep\]\nx = 1\n/);
+			assert.match(toml, /^model = "o3"\n# \[hooks\.state\.[^\n]*\nkeep_me = 1\n\n {2}\[keep\]\nx = 1\n/);
+			assert.doesNotMatch(toml, /note = 2/);
 			assert.doesNotMatch(toml, /sha256:old/);
 		});
 	});

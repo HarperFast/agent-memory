@@ -56,23 +56,33 @@ const CODEX_EVENTS = [
 	['SessionEnd', 'session_end', 3],
 ];
 
-// A table header line for `mcp_servers.agent-memory` (any key quoting) or one of its subtables, never
-// `mcp_servers.agent-memory-x`, and never text inside a comment or a value.
-const MCP_KEY = String.raw`mcp_servers\.(?:agent-memory|"agent-memory"|'agent-memory')`;
-const MCP_BLOCK = new RegExp(
-	String.raw`^[ \t]*\[${MCP_KEY}(?:\.[^\]\n]*)?\][\s\S]*?(?=^[ \t]*\[(?!${MCP_KEY}\.)|(?![\s\S]))`,
-	'gm',
-);
-const OUR_MCP_TABLE = new RegExp(String.raw`^[ \t]*\[${MCP_KEY}[.\]]`, 'm');
+// The header of `mcp_servers.agent-memory` (any key quoting) or one of its subtables, never `mcp_servers.agent-memory-x`.
+const MCP_HEADER = /^\[mcp_servers\.(?:agent-memory|"agent-memory"|'agent-memory')(?:\.[^\]]*)?\]\s*(?:#.*)?$/;
+const OUR_MCP_TABLE = /^[ \t]*\[mcp_servers\.(?:agent-memory|"agent-memory"|'agent-memory')[.\]]/m;
+
+/**
+ * Removes every TOML table whose header line satisfies `isHeader`: the header and each line up to the next header.
+ * Line-based, so a header quoted in a comment or a value line never matches. (A header-shaped line inside a
+ * multi-line string would; Codex's config has none, and this repo has no TOML parser to tell.)
+ */
+function removeTables(toml, isHeader) {
+	let removing = false;
+	const kept = toml.split('\n').filter((line) => {
+		const trimmed = line.trim();
+		if (trimmed.startsWith('[')) removing = isHeader(trimmed);
+		return !removing;
+	});
+	const text = kept.join('\n').replace(/^\n+/, '').replace(/\s*$/, '');
+	return text ? text + '\n' : '';
+}
 
 /** Codex config.toml: replaces any earlier agent-memory MCP server block with one for `mcpUrl`. */
 export function setCodexMcpServer(toml, mcpUrl, authorization) {
-	// The earlier block runs from its header to the next table header that is not one of its subtables.
-	const rest = toml.replace(MCP_BLOCK, '').replace(/^\n+/, '');
+	const rest = removeTables(toml, (header) => MCP_HEADER.test(header));
 	const q = JSON.stringify;
 	return (
-		rest.replace(/\s*$/, '\n') +
-		`\n[mcp_servers.agent-memory]\ndefault_tools_approval_mode = "approve"\nurl = ${q(mcpUrl)}\nhttp_headers = { Authorization = ${q(authorization)} }\n`
+		(rest && `${rest}\n`) +
+		`[mcp_servers.agent-memory]\ndefault_tools_approval_mode = "approve"\nurl = ${q(mcpUrl)}\nhttp_headers = { Authorization = ${q(authorization)} }\n`
 	);
 }
 
@@ -145,13 +155,8 @@ function trustCodexHooks(toml, hooksJson, hooksPath) {
 			(group.hooks ?? []).forEach((handler, hi) => {
 				if (!HOOK_COMMAND.test(handler.command ?? '')) return;
 				const header = `[hooks.state.${JSON.stringify(`${hooksPath}:${label}:${gi}:${hi}`)}]`;
-				const existing = new RegExp(
-					// The header and its key lines, up to a blank line or the next table header (indented or not).
-					'\\n?' + header.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\n(?:(?![ \\t]*\\[)[^\\n]+\\n?)*',
-					'g',
-				);
 				toml =
-					toml.replace(existing, '').replace(/\s*$/, '\n') +
+					removeTables(toml, (line) => line.replace(/\s*(?:#.*)?$/, '') === header) +
 					`\n${header}\ntrusted_hash = "${codexHookHash(label, handler, group.matcher)}"\n`;
 			}),
 		);
@@ -254,18 +259,21 @@ export function probeHooks({ pluginRoot, prompt, env = process.env, timeoutMs = 
 		]) {
 			const result = run({ session_id: session, hook_event_name: hookEvent, source: 'startup', prompt, cwd: env.HOME });
 			let context = '';
+			let validOutput = true;
 			try {
 				const output = result.stdout.trim() ? JSON.parse(result.stdout).hookSpecificOutput : undefined;
 				if (output && output.hookEventName === hookEvent && typeof output.additionalContext === 'string') {
 					context = output.additionalContext;
-				}
-			} catch {}
+				} else if (output) validOutput = false;
+			} catch {
+				validOutput = false;
+			}
 			const count = (pattern) => (context.match(pattern) ?? []).length;
 			const record = readDiagnosticsFile(cacheDir).findLast((entry) => entry.event === event);
 			let outcome = record?.outcome ?? 'no_diagnostics';
 			if (result.error) outcome = result.error.code === 'ETIMEDOUT' ? 'hook_timeout' : 'hook_failed';
 			else if (result.status !== 0) outcome = 'hook_failed';
-			else if (outcome === 'injected' && !context) outcome = 'bad_output';
+			else if (!validOutput || (outcome === 'injected' && !context)) outcome = 'bad_output';
 			// Recall switched off is the user's choice, not a failure; a skipped recall verified nothing.
 			if (!ANSWERED.has(outcome) && !(event === 'recall' && outcome === 'disabled')) ok = false;
 			lines.push(
