@@ -29,6 +29,7 @@ const harperFor = {
 	invalid: null,
 	branch: 'export const databases = { memory: stub.databases.memory };',
 	unscoped: 'export const resources = undefined;',
+	unscopedReader: 'export const resources = undefined;',
 };
 const wrappers = {};
 for (const [name, override] of Object.entries(harperFor)) {
@@ -98,7 +99,7 @@ const isResourceShaped = (value) =>
 
 const warnings = [];
 const originalWarn = logger.warn;
-let copy, candidate, invalid, branch, unscoped, skewed;
+let copy, candidate, invalid, branch, unscoped, unscopedReader, skewed;
 let resolverCalls = 0;
 let earlyPrincipal;
 
@@ -109,6 +110,7 @@ before(async () => {
 	invalid = await loadCopy('invalid');
 	branch = await loadCopy('branch');
 	unscoped = await loadCopy('unscoped');
+	unscopedReader = await loadCopy('unscopedReader');
 	skewed = await loadCopy('skewed', '1.0.0');
 });
 
@@ -372,10 +374,16 @@ describe('a second copy of the package', () => {
 		assert.throws(() => copy.canReadLabels(viaBranch, ['global']), TypeError);
 	});
 
-	it('warns once from an unscoped copy that reads the lock scope or registers beside a running plugin', () => {
+	it('warns once from an unscoped copy that reads the lock scope beside a running plugin', () => {
 		const before = warnings.length;
-		assert.equal(unscoped.getLockScope(), undefined);
+		assert.equal(unscopedReader.getLockScope(), undefined);
+		assert.equal(unscopedReader.getLockScope(), undefined);
 		assert.equal(warnings.length, before + 1);
+		assert.match(warnings.at(-1), /loaded without its app's scope/);
+	});
+
+	it('warns once from an unscoped copy that registers beside a running plugin', () => {
+		const before = warnings.length;
 		unscoped.setPrincipalResolver(undefined);
 		unscoped.registerMemorySink({});
 		assert.equal(warnings.length, before + 1);

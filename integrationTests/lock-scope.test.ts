@@ -44,7 +44,6 @@ suite('@harperfast/agent-memory at lockScope: cluster without record locks', (ct
 	}
 
 	before(async () => {
-		// memory-consumer imports its own copy of the package, so it reads the lock scope across apps.
 		const dataRootDir = await mkdtemp(
 			join(process.env.HARPER_INTEGRATION_TEST_INSTALL_PARENT_DIR || tmpdir(), 'harper-integration-test-'),
 		);
@@ -145,7 +144,6 @@ suite('a component that requires lockScope: cluster, beside agent-memory at node
 	});
 
 	test('refuses to start, and agent-memory keeps serving', async () => {
-		// Harper answers a component that failed to load with its load error.
 		const guard = await get('LockScopeGuard');
 		strictEqual(guard.status, 500);
 		const failure = await guard.json();
