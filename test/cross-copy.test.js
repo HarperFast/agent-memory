@@ -29,6 +29,7 @@ const harperFor = {
 	invalid: null,
 	branch: 'export const databases = { memory: stub.databases.memory };',
 	unscoped: 'export const resources = undefined;',
+	unscopedReader: 'export const resources = undefined;',
 };
 const wrappers = {};
 for (const [name, override] of Object.entries(harperFor)) {
@@ -98,7 +99,7 @@ const isResourceShaped = (value) =>
 
 const warnings = [];
 const originalWarn = logger.warn;
-let copy, candidate, invalid, branch, unscoped, skewed;
+let copy, candidate, invalid, branch, unscoped, unscopedReader, skewed;
 let resolverCalls = 0;
 let earlyPrincipal;
 
@@ -109,6 +110,7 @@ before(async () => {
 	invalid = await loadCopy('invalid');
 	branch = await loadCopy('branch');
 	unscoped = await loadCopy('unscoped');
+	unscopedReader = await loadCopy('unscopedReader');
 	skewed = await loadCopy('skewed', '1.0.0');
 });
 
@@ -127,6 +129,11 @@ describe('a second copy of the package', () => {
 				assert.equal(isResourceShaped(value), false, `export ${name} looks like a Resource`);
 			}
 		}
+	});
+
+	it('reports no lock scope while no plugin runs', () => {
+		assert.equal(copy.getLockScope(), undefined);
+		assert.equal(plugin.getLockScope(), undefined);
 	});
 
 	it('resolves principals with its own code while no plugin runs', async () => {
@@ -188,6 +195,25 @@ describe('a second copy of the package', () => {
 			[warnings[0]],
 		);
 		assert.equal(warnings.length, 1);
+	});
+
+	it("reports the plugin's lock scope, read live, and none from a runtime without it", () => {
+		assert.equal(copy.getLockScope(), 'node');
+		assert.equal(plugin.getLockScope(), 'node');
+		const published = domain().runtime;
+		domain().runtime = { ...published, lockScope: () => 'cluster' };
+		try {
+			assert.equal(copy.getLockScope(), 'cluster');
+			const old = { ...published, version: '0.1.5', lockScope: undefined };
+			domain().runtime = old;
+			const before = warnings.length;
+			assert.equal(copy.getLockScope(), undefined);
+			assert.equal(copy.getLockScope(), undefined);
+			assert.equal(warnings.length, before + 1);
+			assert.match(warnings.at(-1), /running plugin is 0\.1\.5, which does not report its lockScope/);
+		} finally {
+			domain().runtime = published;
+		}
 	});
 
 	it('answers resolvePrincipal and canReadLabels with the plugin', async () => {
@@ -315,7 +341,8 @@ describe('a second copy of the package', () => {
 	it('publishes nothing from a deploy-validation load or a load whose options are invalid', async () => {
 		const compiledBy = async (name) =>
 			(await import(pathToFileURL(join(copyDir(name), 'dist', 'scopes.js')).href)).canReadLabels;
-		await candidate.handleApplication(fakeScope({}, { isTransientValidation: true }).scope);
+		await candidate.handleApplication(fakeScope({ lockScope: 'cluster' }, { isTransientValidation: true }).scope);
+		assert.equal(candidate.getLockScope(), undefined);
 		await assert.rejects(invalid.handleApplication(fakeScope({ supersession: { mode: 'auto' } }).scope), /judge/);
 		// Each resolves with its own code: had either published, the other would have delegated to it.
 		assert.equal((await compiledBy('invalid'))(await invalid.resolvePrincipal(member('alice')), ['global']), true);
@@ -345,6 +372,14 @@ describe('a second copy of the package', () => {
 		const viaBranch = await branch.resolvePrincipal(member('erin'));
 		assert.equal(viaBranch.id, 'intruder');
 		assert.throws(() => copy.canReadLabels(viaBranch, ['global']), TypeError);
+	});
+
+	it('warns once from an unscoped copy that reads the lock scope beside a running plugin', () => {
+		const before = warnings.length;
+		assert.equal(unscopedReader.getLockScope(), undefined);
+		assert.equal(unscopedReader.getLockScope(), undefined);
+		assert.equal(warnings.length, before + 1);
+		assert.match(warnings.at(-1), /loaded without its app's scope/);
 	});
 
 	it('warns once from an unscoped copy that registers beside a running plugin', () => {

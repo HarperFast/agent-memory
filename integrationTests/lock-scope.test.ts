@@ -1,12 +1,21 @@
 // Needs `npm run install:fixtures` first: the fixture app loads the packed plugin from its own node_modules.
 import { suite, test, before, after } from 'node:test';
 import { deepStrictEqual, ok, strictEqual } from 'node:assert/strict';
+import { cp, mkdtemp } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { createRequire } from 'node:module';
-import { setupHarperWithFixture, teardownHarper, type ContextWithHarper } from '@harperfast/integration-testing';
+import {
+	setupHarperWithFixture,
+	startHarper,
+	teardownHarper,
+	type ContextWithHarper,
+} from '@harperfast/integration-testing';
 
 const require = createRequire(import.meta.url);
-const fixturePath = join(import.meta.dirname, 'fixtures', 'memory-app-cluster-lock');
+const guardFixturePath = join(import.meta.dirname, 'fixtures', 'memory-app-lock-guard');
+const harperBinPath = () =>
+	process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT ?? join(dirname(require.resolve('harper')), 'bin', 'harper.js');
 
 suite('@harperfast/agent-memory at lockScope: cluster without record locks', (ctx: ContextWithHarper) => {
 	const authorization = () =>
@@ -35,10 +44,18 @@ suite('@harperfast/agent-memory at lockScope: cluster without record locks', (ct
 	}
 
 	before(async () => {
-		await setupHarperWithFixture(ctx, fixturePath, {
-			harperBinPath:
-				process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT ??
-				join(dirname(require.resolve('harper')), 'bin', 'harper.js'),
+		const dataRootDir = await mkdtemp(
+			join(process.env.HARPER_INTEGRATION_TEST_INSTALL_PARENT_DIR || tmpdir(), 'harper-integration-test-'),
+		);
+		(ctx as any).harper = { dataRootDir };
+		for (const app of ['memory-app-cluster-lock', 'memory-consumer']) {
+			await cp(join(import.meta.dirname, 'fixtures', app), join(dataRootDir, 'components', app), {
+				recursive: true,
+				dereference: true,
+			});
+		}
+		await startHarper(ctx, {
+			harperBinPath: harperBinPath(),
 			config: { logging: { stdStreams: true }, authentication: { authorizeLocal: false } },
 		});
 		const response = await fetch(`${ctx.harper.httpURL}/SeedMemory/`, {
@@ -81,6 +98,21 @@ suite('@harperfast/agent-memory at lockScope: cluster without record locks', (ct
 		strictEqual(read.body.memory.content, 'seeded beneath the plugin');
 	});
 
+	test('a component that requires cluster ordering starts, and a copy in another app reads the scope from the plugin', async () => {
+		const response = await fetch(`${ctx.harper.httpURL}/LockScopeGuard`, {
+			headers: { Accept: 'application/json', Authorization: authorization() },
+		});
+		strictEqual(response.status, 200);
+		deepStrictEqual(await response.json(), { lockScope: 'cluster' });
+		const probe = await fetch(`${ctx.harper.httpURL}/PrincipalProbe/`, {
+			headers: { Accept: 'application/json', Authorization: authorization() },
+		});
+		strictEqual(probe.status, 200);
+		const fromOtherApp = await probe.json();
+		ok(String(fromOtherApp.packagePath).includes('/memory-consumer/node_modules/'), fromOtherApp.packagePath);
+		strictEqual(fromOtherApp.lockScope, 'cluster');
+	});
+
 	test('reads, watch=true included, never take a cluster lock', async () => {
 		strictEqual((await call('GET', seeded)).status, 200);
 		const searched = await call('GET', '?watch=true');
@@ -91,5 +123,33 @@ suite('@harperfast/agent-memory at lockScope: cluster without record locks', (ct
 		const watched = await call('POST', 'watch', { ids: [seeded] });
 		strictEqual(watched.status, 200, JSON.stringify(watched.body));
 		deepStrictEqual(watched.body.watched, [seeded]);
+	});
+});
+
+suite('a component that requires lockScope: cluster, beside agent-memory at node', (ctx: ContextWithHarper) => {
+	const authorization = () =>
+		'Basic ' + Buffer.from(`${ctx.harper.admin.username}:${ctx.harper.admin.password}`).toString('base64');
+	const get = (path: string) =>
+		fetch(`${ctx.harper.httpURL}/${path}`, { headers: { Accept: 'application/json', Authorization: authorization() } });
+
+	before(async () => {
+		await setupHarperWithFixture(ctx, guardFixturePath, {
+			harperBinPath: harperBinPath(),
+			config: { logging: { stdStreams: true }, authentication: { authorizeLocal: false } },
+		});
+	});
+
+	after(async () => {
+		await teardownHarper(ctx);
+	});
+
+	test('refuses to start, and agent-memory keeps serving', async () => {
+		const guard = await get('LockScopeGuard');
+		strictEqual(guard.status, 500);
+		const failure = await guard.json();
+		strictEqual(failure.code, 'ResourceLoadError');
+		ok(failure.title.includes('needs agent-memory lockScope cluster; it reports node'), failure.title);
+		const listed = await get('Memory/');
+		strictEqual(listed.status, 200, await listed.text());
 	});
 });

@@ -1,0 +1,8 @@
+# Components in one app load in this order, so the plugin has started when guard.js loads.
+rest: true
+
+'@harperfast/agent-memory':
+  package: '@harperfast/agent-memory'
+
+jsResource:
+  files: 'guard.js'

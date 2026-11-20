@@ -2,7 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { models } from 'harper';
-import { handleApplication } from '../dist/index.js';
+import { getLockScope, handleApplication } from '../dist/index.js';
 import { embedTexts } from '../dist/lifecycle.js';
 import { MemoryMcpResource, MemoryResource } from '../dist/resource.js';
 import { applySettings, getSettings, parseSettings } from '../dist/settings.js';
@@ -125,6 +125,40 @@ describe('handleApplication', () => {
 		} finally {
 			if (stubDefineBackend === undefined) delete models.defineBackend;
 			else models.defineBackend = stubDefineBackend;
+			applySettings(parseSettings({}));
+		}
+	});
+});
+
+describe('getLockScope', () => {
+	it('reports each lockScope value to a plugin registering after agent-memory, and follows reloads', async () => {
+		const register = () => {
+			const lockScope = getLockScope();
+			if (lockScope !== 'cluster') throw new Error(`needs lockScope cluster, not ${lockScope}`);
+			return lockScope;
+		};
+		try {
+			for (const [options, expected] of [
+				[{}, 'node'],
+				[{ lockScope: 'node' }, 'node'],
+				[{ lockScope: 'cluster' }, 'cluster'],
+			]) {
+				await handleApplication(fakeScope(options).scope);
+				assert.equal(getLockScope(), expected);
+				if (expected === 'cluster') assert.equal(register(), 'cluster');
+				else assert.throws(register, /needs lockScope cluster, not node/);
+			}
+
+			const harness = fakeScope({ lockScope: 'cluster' });
+			await handleApplication(harness.scope);
+			harness.setOptions({ lockScope: 'node' });
+			assert.equal(getLockScope(), 'node');
+			harness.setOptions({ lockScope: 'global' });
+			assert.equal(getLockScope(), 'node');
+			assert.equal(harness.errors.length, 1);
+			harness.setOptions({ lockScope: 'cluster' });
+			assert.equal(getLockScope(), 'cluster');
+		} finally {
 			applySettings(parseSettings({}));
 		}
 	});

@@ -1,0 +1,6 @@
+{
+	"name": "agent-memory-lock-guard-fixture-app",
+	"private": true,
+	"type": "module",
+	"description": "Integration-test host app at lockScope: node with a component that requires cluster. scripts/install-fixtures.js installs the packed @harperfast/agent-memory into it."
+}

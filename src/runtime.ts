@@ -3,6 +3,7 @@ import type { BootstrapSection, SearchAnnotator } from './extensions.ts';
 import type { PrincipalResolver } from './principal.ts';
 import type { Principal } from './scopes.ts';
 import type { ScanOptions } from './search.ts';
+import type { LockScope } from './settings.ts';
 import type { MemorySink } from './sinks.ts';
 import { PACKAGE_VERSION } from './version.ts';
 
@@ -17,6 +18,8 @@ export interface MemoryRuntime {
 	// Absent from a runtime published by 0.1.4 or earlier, which also never renders sections or runs annotators.
 	scanMemories?(options?: ScanOptions): AsyncIterable<Record<string, unknown>>;
 	getMemories?(ids: readonly string[]): Promise<Record<string, unknown>[]>;
+	// Absent from a runtime published by 0.1.5 or earlier.
+	lockScope?(): LockScope;
 }
 
 export interface MemoryDomain {
@@ -37,13 +40,14 @@ interface Anchor {
 const ANCHOR_KEY = Symbol.for('@harperfast/agent-memory');
 
 const UNSCOPED_COPY =
-	"@harperfast/agent-memory: a copy of the package was loaded without its app's scope (applications.dependencyLoader: native?), so sinks and principal resolvers registered through it never reach the running plugin";
+	"@harperfast/agent-memory: a copy of the package was loaded without its app's scope (applications.dependencyLoader: native?), so sinks and principal resolvers registered through it never reach the running plugin, and getLockScope(), where it exists, reports undefined";
 
 let memo: MemoryDomain | undefined;
 let scoped = false;
 let warnedUnscoped = false;
 let warnedOldRuntime: MemoryRuntime | undefined;
 let checkedRuntime: MemoryRuntime | undefined;
+let warnedNoLockScope: MemoryRuntime | undefined;
 
 function isObject(value: unknown): value is object {
 	return (typeof value === 'object' || typeof value === 'function') && value !== null;
@@ -160,4 +164,23 @@ export function foreignRuntime(own: MemoryRuntime): MemoryRuntime | undefined {
 		}
 	}
 	return runtime;
+}
+
+/** No local fallback: this copy's settings are not the running plugin's (a transient-validation load applies its own). */
+export function runningLockScope(own: MemoryRuntime): LockScope | undefined {
+	const runtime = foreignRuntime(own) ?? domain().runtime;
+	if (runtime === undefined) {
+		if (!scoped && (process as unknown as Record<symbol, Anchor | undefined>)[ANCHOR_KEY]?.scopedRuntime) {
+			warnUnscopedOnce();
+		}
+		return undefined;
+	}
+	if (typeof runtime.lockScope === 'function') return runtime.lockScope();
+	if (runtime !== warnedNoLockScope) {
+		warnedNoLockScope = runtime;
+		warn(
+			`@harperfast/agent-memory: the running plugin is ${runtime.version}, which does not report its lockScope; getLockScope() returns undefined until it is upgraded`,
+		);
+	}
+	return undefined;
 }
