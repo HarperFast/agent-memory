@@ -55,7 +55,8 @@ AGENT_MEMORY_USER=<username>
 ```
 
 To revoke delegation, upsert `actsFor: null` on the agent user's `ScopeGrant` row. To issue a new password, rerun
-with `--rotate`.
+with `--rotate`, then rerun `install-codex.sh` on that machine: Codex keeps its own copy of the credential in
+`config.toml`. Claude profiles read the env file directly and need nothing.
 
 ## 2. Install into each Claude profile
 
@@ -73,7 +74,9 @@ For each profile, the script:
    block. The plugin's MCP server entry expands `${AGENT_MEMORY_URL}/mcp` from there.
 
 The token stays in the env file and is never written to `settings.json`. Rerunning the script is safe. A second
-argument replaces the marketplace source, for example a local checkout path or `HarperFast/agent-memory#<ref>`.
+argument sets the marketplace source, for example a local checkout path or `HarperFast/agent-memory#<ref>`. It is
+used only when the profile has no `agent-memory` marketplace yet: to switch an existing profile's source, remove
+the marketplace first ([Roll back](#6-roll-back-or-uninstall)).
 
 Start a new session afterwards: a running session keeps the plugin version it started with.
 
@@ -107,10 +110,12 @@ The script gives Codex the same memory as Claude Code:
 The hooks run a copy of the plugin in `<codex-home>/agent-memory/plugin`, taken from the plugin installed in
 `~/.claude` (or `$CLAUDE_CONFIG_DIR`), or from this checkout when no Claude install exists. They don't run
 Claude's cached copy because Claude Code deletes a replaced version's directory 14 days after an update. To use
-a particular hook, pass its path as the second argument.
+a particular hook, pass its path as the second argument. When `AGENT_MEMORY_ENV_FILE` is set, the hook commands
+carry it, so the hooks and the MCP entry use the same credential.
 
-The first run backs up `config.toml` and `hooks.json` to `*.pre-agent-memory`. Rerunning the script replaces its
-own entries and keeps every other server and hook.
+The first run backs up an existing `config.toml` and `hooks.json` to `*.pre-agent-memory`. No backup means the file
+did not exist yet, or already had agent-memory in it. Rerunning the script replaces its own entries where they
+stand and keeps every other server and hook.
 
 ## 4. Verify
 
@@ -120,7 +125,8 @@ scripts/onboarding/hook-test.sh ~/.claude-work   # another profile; a second arg
 ```
 
 The test runs the installed plugin's hooks for one synthetic session, with a temporary cache directory, and
-prints each hook's outcome and counts of what it would inject. It never prints memory content:
+prints each hook's outcome and counts of what it would inject. It never prints memory content. The hooks get the
+profile's `settings.json` `env`, as they do in a session:
 
 ```text
 /Users/you/.claude: agent-memory@agent-memory 5fdfffed67e7
@@ -128,15 +134,17 @@ SessionStart: injected, 3712 chars, orientation=5 memories=4 topics=0
 UserPromptSubmit: injected, 1650 chars, orientation=0 memories=2 topics=1
 ```
 
-It exits non-zero unless both hooks got a healthy answer:
+It exits non-zero unless both hooks got an answer from the server:
 
 | Outcome                                       | Meaning                                                                                   |
 | --------------------------------------------- | ----------------------------------------------------------------------------------------- |
 | `injected`, `empty`, `deduped`, `over_budget` | The server answered. `empty` is normal for a new server or a prompt that matches nothing. |
-| `skipped`, `disabled`                         | The hook chose not to ask, for example because recall is set to off.                      |
+| `disabled` (recall)                           | Recall is switched off (`AGENT_MEMORY_RECALL=off`). Accepted.                             |
+| `skipped`                                     | The hook did not ask; for recall, the test prompt had no distinctive term. Use another.   |
 | `unconfigured (<reason>)`                     | The env file is missing, or has no valid URL or token. Fix it, or provision again.        |
 | `http_401`, `http_403`                        | The server refused the credential. Ask the admin to rotate it or check the user's role.   |
 | `timeout`, `error`, `hook_timeout`            | The URL is wrong, or the server is unreachable from this machine.                         |
+| `hook_failed`                                 | The hook process itself failed: check that `node` is version 22 or later.                 |
 | `no_diagnostics`                              | The install predates the plugin's diagnostics log. Update it ([below](#5-update)).        |
 
 In a session, `/mcp` should list `agent-memory` as connected. Every real session start and recall is logged too;

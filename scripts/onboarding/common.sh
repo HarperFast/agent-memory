@@ -17,8 +17,11 @@ find_tools() {
 		command -v "$need" >/dev/null 2>&1 && continue
 		PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 		if ! command -v "$need" >/dev/null 2>&1 && [ -s "${NVM_DIR:-$HOME/.nvm}/nvm.sh" ]; then
+			# nvm.sh reads unset variables, which would end a `set -u` script.
+			set +u
 			# shellcheck disable=SC1091
 			. "${NVM_DIR:-$HOME/.nvm}/nvm.sh" >/dev/null 2>&1 || true
+			set -u
 		fi
 		command -v "$need" >/dev/null 2>&1 || die "$need not found on PATH"
 	done

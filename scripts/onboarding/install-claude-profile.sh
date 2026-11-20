@@ -3,8 +3,9 @@
 #
 # Usage: install-claude-profile.sh [claude-config-dir] [marketplace-source]
 #   claude-config-dir   the profile to install into (default: $CLAUDE_CONFIG_DIR, else ~/.claude)
-#   marketplace-source  what `claude plugin marketplace add` gets the first time (default: HarperFast/agent-memory;
-#                       a local checkout path or owner/repo#ref also work)
+#   marketplace-source  what `claude plugin marketplace add` gets when the profile has no agent-memory marketplace
+#                       yet (default: HarperFast/agent-memory; a local checkout path or owner/repo#ref also work).
+#                       To switch an existing profile's source, remove the marketplace first (docs/onboarding.md).
 #
 # Reads AGENT_MEMORY_URL from ~/.config/agent-memory/env (or $AGENT_MEMORY_ENV_FILE) and sets it in the profile's
 # settings.json `env` block, which the plugin's MCP server entry needs. The token stays in the env file: nothing
@@ -13,13 +14,14 @@ set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 use_claude_profile "${1:-}"
 SOURCE="${2:-HarperFast/agent-memory}"
-find_tools claude
-mkdir -p "$CLAUDE_DIR"
-
+find_tools
 # Before touching the profile: refuse to install a plugin that would have no endpoint or credential.
+node "$ONBOARDING_DIR/lib.mjs" check-credentials
+find_tools claude
 node "$ONBOARDING_DIR/lib.mjs" claude-settings "$CLAUDE_DIR/settings.json"
 
-if claude plugin marketplace list 2>/dev/null | grep -qw agent-memory; then
+if claude plugin marketplace list --json 2>/dev/null |
+	node -e 'process.exit(JSON.parse(require("fs").readFileSync(0, "utf8")).some((m) => m.name === "agent-memory") ? 0 : 1)'; then
 	claude plugin marketplace update agent-memory >/dev/null
 else
 	claude plugin marketplace add "$SOURCE"

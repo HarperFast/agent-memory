@@ -14,7 +14,7 @@ import {
 	writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { basename, dirname, join } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { isMainModule, resolveConfig } from '../../claude-plugin/lib/config.mjs';
 
 /** Replaces `path` with `text` in one rename, so an interrupted run leaves the old file or the new one. */
@@ -57,13 +57,18 @@ const CODEX_EVENTS = [
 	['SessionEnd', 'session_end', 3],
 ];
 
-/** Codex config.toml: replaces any earlier `[mcp_servers.agent-memory]` block with one for `mcpUrl`. */
+// `[mcp_servers.agent-memory]` (bare or quoted key) or one of its subtables, never `[mcp_servers.agent-memory-x]`.
+const MCP_TABLE = String.raw`\[mcp_servers\.(?:agent-memory|"agent-memory")`;
+const MCP_BLOCK = new RegExp(
+	String.raw`\n?${MCP_TABLE}(?:\.[^\]\n]*)?\][\s\S]*?(?=\n\[(?!${MCP_TABLE.slice(2)}\.)|$)`,
+	'g',
+);
+const OUR_MCP_TABLE = new RegExp(String.raw`${MCP_TABLE}[.\]]`);
+
+/** Codex config.toml: replaces any earlier agent-memory MCP server block with one for `mcpUrl`. */
 export function setCodexMcpServer(toml, mcpUrl, authorization) {
-	// Drop the earlier block: its header through the line before the next table header that is not one of its own.
-	const rest = toml.replace(
-		/\n?\[mcp_servers\.agent-memory(\.[^\]]*)?\][\s\S]*?(?=\n\[(?!mcp_servers\.agent-memory)|$)/g,
-		'',
-	);
+	// The earlier block runs from its header to the next table header that is not one of its subtables.
+	const rest = toml.replace(MCP_BLOCK, '').replace(/^\n+/, '');
 	const q = JSON.stringify;
 	return (
 		rest.replace(/\s*$/, '\n') +
@@ -71,18 +76,34 @@ export function setCodexMcpServer(toml, mcpUrl, authorization) {
 	);
 }
 
-/** Codex hooks.json: replaces earlier agent-memory hooks with one `command` per event, keeping every other hook. */
+/**
+ * Codex hooks.json: one agent-memory `command` per event, keeping every other hook. An earlier agent-memory handler
+ * is replaced where it stands, because Codex keys hook trust by position: moving other hooks would void theirs.
+ */
 export function setCodexHooks(hooksJson, command) {
 	const hooks = { ...(hooksJson.hooks ?? {}) };
-	const strip = (groups) =>
-		(groups ?? [])
-			.map((group) => ({ ...group, hooks: (group.hooks ?? []).filter((h) => !HOOK_COMMAND.test(h.command ?? '')) }))
-			.filter((group) => group.hooks.length);
 	for (const [event, , timeout] of CODEX_EVENTS) {
-		hooks[event] = [...strip(hooks[event]), { hooks: [{ type: 'command', command, timeout }] }];
+		const ours = { type: 'command', command, timeout };
+		let placed = false;
+		const groups = (hooks[event] ?? [])
+			.map((group) => ({
+				...group,
+				hooks: (group.hooks ?? []).flatMap((handler) => {
+					if (!HOOK_COMMAND.test(handler.command ?? '')) return [handler];
+					if (placed) return [];
+					placed = true;
+					return [ours];
+				}),
+			}))
+			.filter((group) => group.hooks.length);
+		if (!placed) groups.push({ hooks: [ours] });
+		hooks[event] = groups;
 	}
 	return { ...hooksJson, hooks };
 }
+
+/** Quotes one word for the shell Codex runs a hook command in. */
+export const shellQuote = (word) => `'${String(word).replace(/'/g, `'\\''`)}'`;
 
 const sortKeys = (v) =>
 	Array.isArray(v)
@@ -148,31 +169,50 @@ export function copyPluginRuntime(pluginRoot, target) {
 		if (existsSync(join(pluginRoot, part))) cpSync(join(pluginRoot, part), join(staging, part), { recursive: true });
 	}
 	if (existsSync(target)) renameSync(target, previous);
-	renameSync(staging, target);
+	try {
+		renameSync(staging, target);
+	} catch (error) {
+		if (existsSync(previous)) renameSync(previous, target);
+		throw error;
+	}
 	rmSync(previous, { recursive: true, force: true });
 }
 
-export function configureCodex({ codexHome, pluginRoot, node, mcpUrl, authorization }) {
+// A file that already has agent-memory in it is not an original worth keeping: backing it up would save this
+// installer's own output (and the token) as the "before" state.
+function backUpOriginal(path, isOurs) {
+	const backup = `${path}.pre-agent-memory`;
+	if (!existsSync(path) || existsSync(backup)) return;
+	const text = readFileSync(path, 'utf8');
+	if (!isOurs(text)) writeFileAtomic(backup, text, statSync(path).mode & 0o777);
+}
+
+export function configureCodex({ codexHome, pluginRoot, node, mcpUrl, authorization, envFile }) {
+	codexHome = resolve(codexHome);
 	const configPath = join(codexHome, 'config.toml');
 	const hooksPath = join(codexHome, 'hooks.json');
 	mkdirSync(codexHome, { recursive: true });
-	for (const path of [configPath, hooksPath]) {
-		if (existsSync(path) && !existsSync(`${path}.pre-agent-memory`)) cpSync(path, `${path}.pre-agent-memory`);
-	}
 	const existingHooks = readJsonObject(hooksPath);
 	const toml = existsSync(configPath) ? readFileSync(configPath, 'utf8') : '';
+	backUpOriginal(configPath, (text) => OUR_MCP_TABLE.test(text));
+	backUpOriginal(hooksPath, (text) => HOOK_COMMAND.test(text));
 	const runtime = join(codexHome, 'agent-memory', 'plugin');
 	copyPluginRuntime(pluginRoot, runtime);
-	const command = `${JSON.stringify(node)} ${JSON.stringify(join(runtime, 'hooks', 'hook.mjs'))}`;
+	// The env file the MCP entry's credential came from; without it the hooks would read the default one.
+	const envPrefix = envFile ? `env AGENT_MEMORY_ENV_FILE=${shellQuote(resolve(envFile))} ` : '';
+	const command = `${envPrefix}${shellQuote(node)} ${shellQuote(join(runtime, 'hooks', 'hook.mjs'))}`;
 	const hooksJson = setCodexHooks(existingHooks, command);
 	const nextToml = trustCodexHooks(setCodexMcpServer(toml, mcpUrl, authorization), hooksJson, hooksPath);
+	// Handlers before their trust records: an interruption between the two leaves hooks Codex asks about, never
+	// trust records for handlers that are not there.
+	writeFileAtomic(hooksPath, JSON.stringify(hooksJson, null, 2) + '\n');
 	// config.toml carries the Authorization header: owner-only, whatever mode it had.
 	writeFileAtomic(configPath, nextToml, 0o600);
-	writeFileAtomic(hooksPath, JSON.stringify(hooksJson, null, 2) + '\n');
 	return { runtime, configPath, hooksPath };
 }
 
-const OK_OUTCOMES = new Set(['injected', 'empty', 'deduped', 'over_budget', 'skipped', 'disabled']);
+// Outcomes that mean the hook asked the server and got an answer.
+const ANSWERED = new Set(['injected', 'empty', 'deduped', 'over_budget']);
 
 /**
  * Runs the installed hook as Claude Code would for one synthetic session, with its own cache dir so no real
@@ -204,8 +244,11 @@ export function probeHooks({ pluginRoot, prompt, env = process.env, timeoutMs = 
 			} catch {}
 			const count = (pattern) => (context.match(pattern) ?? []).length;
 			const record = readDiagnosticsFile(cacheDir).findLast((entry) => entry.event === event);
-			const outcome = result.error?.code === 'ETIMEDOUT' ? 'hook_timeout' : (record?.outcome ?? 'no_diagnostics');
-			if (!OK_OUTCOMES.has(outcome)) ok = false;
+			let outcome = record?.outcome ?? 'no_diagnostics';
+			if (result.error) outcome = result.error.code === 'ETIMEDOUT' ? 'hook_timeout' : 'hook_failed';
+			else if (result.status !== 0) outcome = 'hook_failed';
+			// Recall switched off is the user's choice, not a failure; a skipped recall verified nothing.
+			if (!ANSWERED.has(outcome) && !(event === 'recall' && outcome === 'disabled')) ok = false;
 			lines.push(
 				`${hookEvent}: ${outcome}${record?.reason ? ` (${record.reason})` : ''}, ${context.length} chars, ` +
 					`orientation=${count(/section=\\?"orientation/g)} memories=${count(/\[memory-[0-9a-f]+ /g)} topics=${count(/\[topic-[0-9a-f]+ /g)}`,
@@ -245,11 +288,14 @@ export function resolveCredentials(env = process.env) {
 if (isMainModule(import.meta.url)) {
 	const [command, ...args] = process.argv.slice(2);
 	try {
-		if (command === 'claude-settings') {
+		if (command === 'check-credentials') {
+			resolveCredentials();
+		} else if (command === 'claude-settings') {
 			const { baseUrl } = resolveCredentials();
 			const env = { AGENT_MEMORY_URL: baseUrl };
 			// A non-default env file must reach the hooks too, or they find no token.
-			if (process.env.AGENT_MEMORY_ENV_FILE) env.AGENT_MEMORY_ENV_FILE = process.env.AGENT_MEMORY_ENV_FILE;
+			if (process.env.AGENT_MEMORY_ENV_FILE) env.AGENT_MEMORY_ENV_FILE = resolve(process.env.AGENT_MEMORY_ENV_FILE);
+			mkdirSync(dirname(args[0]), { recursive: true });
 			setSettingsEnv(args[0], env);
 		} else if (command === 'configure-codex') {
 			const { baseUrl, authorization, userId } = resolveCredentials();
@@ -261,16 +307,19 @@ if (isMainModule(import.meta.url)) {
 				node: process.env.NODE_BIN || process.execPath,
 				mcpUrl: `${baseUrl}/mcp`,
 				authorization,
+				envFile: process.env.AGENT_MEMORY_ENV_FILE,
 			});
 			console.log(
 				`${codexHome}: agent-memory MCP server and hooks configured${userId ? ` for ${userId}` : ''}; hooks run ${runtime}`,
 			);
 		} else if (command === 'probe-hooks') {
-			const [pluginRoot, prompt] = args;
-			const { ok, lines } = probeHooks({ pluginRoot, prompt });
+			const [pluginRoot, prompt, settingsPath] = args;
+			// Claude Code gives hooks the profile's settings.json env; so does the probe.
+			const settingsEnv = settingsPath ? (readJsonObject(settingsPath).env ?? {}) : {};
+			const { ok, lines } = probeHooks({ pluginRoot, prompt, env: { ...process.env, ...settingsEnv } });
 			for (const line of lines) console.log(line);
 			if (!ok) {
-				console.error('a hook did not get a healthy answer from the server; see docs/onboarding.md › Verify');
+				console.error('a hook did not get an answer from the server; see docs/onboarding.md › Verify');
 				process.exitCode = 1;
 			}
 		} else {

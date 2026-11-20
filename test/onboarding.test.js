@@ -13,6 +13,7 @@ import {
 	setCodexHooks,
 	setCodexMcpServer,
 	setSettingsEnv,
+	shellQuote,
 } from '../scripts/onboarding/lib.mjs';
 
 const onboardingDir = new URL('../scripts/onboarding/', import.meta.url).pathname;
@@ -83,18 +84,32 @@ describe('onboarding scripts', () => {
 			assert.equal(setCodexMcpServer(after, 'https://memory.example.com/mcp', 'Basic dTpw'), after);
 		});
 
-		it('replaces earlier agent-memory hooks and keeps the others', () => {
+		it('keeps a server whose name only starts with agent-memory, and drops a quoted-key block', () => {
+			const before =
+				'[mcp_servers.agent-memory]\nurl = "old"\n\n[mcp_servers.agent-memory-tools]\nurl = "keep"\n\n[mcp_servers."agent-memory"]\nurl = "quoted"\n';
+			const after = setCodexMcpServer(before, 'https://memory.example.com/mcp', 'Basic dTpw');
+			assert.match(after, /\[mcp_servers\.agent-memory-tools\]\nurl = "keep"/);
+			assert.doesNotMatch(after, /old|quoted/);
+			assert.equal(after.match(/\[mcp_servers\.agent-memory\]/g).length, 1);
+		});
+
+		it('replaces an earlier agent-memory hook where it stands, so other hooks keep their positions', () => {
 			const other = { type: 'command', command: 'other-hook', timeout: 1 };
 			const old = { type: 'command', command: 'node "/old/agent-memory/0.1.0/hooks/hook.mjs"', timeout: 5 };
+			const ours = { type: 'command', command: "'/x/agent-memory/plugin/hooks/hook.mjs'", timeout: 5 };
 			const result = setCodexHooks(
-				{ hooks: { SessionStart: [{ hooks: [other, old] }] } },
-				'node "/x/agent-memory/plugin/hooks/hook.mjs"',
+				{ hooks: { SessionStart: [{ matcher: 'startup', hooks: [old] }, { hooks: [other] }] } },
+				ours.command,
 			);
-			assert.deepEqual(result.hooks.SessionStart, [
-				{ hooks: [other] },
-				{ hooks: [{ type: 'command', command: 'node "/x/agent-memory/plugin/hooks/hook.mjs"', timeout: 5 }] },
-			]);
+			assert.deepEqual(result.hooks.SessionStart, [{ matcher: 'startup', hooks: [ours] }, { hooks: [other] }]);
+			assert.deepEqual(result.hooks.SessionEnd, [{ hooks: [{ ...ours, timeout: 3 }] }]);
 			assert.deepEqual(Object.keys(result.hooks), ['SessionStart', 'UserPromptSubmit', 'SessionEnd']);
+		});
+
+		it('quotes hook command words so the shell runs the path literally', () => {
+			assert.equal(shellQuote("/a b/$HOME/it's"), `'/a b/$HOME/it'\\''s'`);
+			const echoed = spawnSync('sh', ['-c', `printf %s ${shellQuote("/a b/$HOME/it's")}`], { encoding: 'utf8' });
+			assert.equal(echoed.stdout, "/a b/$HOME/it's");
 		});
 
 		it('hashes the handler identity the way Codex does', () => {
@@ -134,12 +149,33 @@ describe('onboarding scripts', () => {
 			assert.equal(readFileSync(join(codexHome, 'config.toml.pre-agent-memory'), 'utf8'), '[model]\nname = "x"\n');
 			assert.ok(existsSync(join(codexHome, 'agent-memory/plugin/lib/hooks.mjs')));
 			const hooks = JSON.parse(readFileSync(join(codexHome, 'hooks.json'), 'utf8')).hooks;
-			const command = `"/usr/bin/node" ${JSON.stringify(join(codexHome, 'agent-memory/plugin/hooks/hook.mjs'))}`;
+			const command = `'/usr/bin/node' '${join(codexHome, 'agent-memory/plugin/hooks/hook.mjs')}'`;
 			assert.equal(hooks.SessionStart[0].hooks[0].command, command);
 			assert.equal(first.match(/trusted_hash/g).length, 3);
 			const key = `${join(codexHome, 'hooks.json')}:session_start:0:0`;
 			const hash = codexHookHash('session_start', hooks.SessionStart[0].hooks[0]);
 			assert.ok(first.includes(`[hooks.state.${JSON.stringify(key)}]\ntrusted_hash = "${hash}"`));
+		});
+
+		it('on a fresh Codex home, takes no backup of its own output and points the hooks at the env file it used', () => {
+			const codexHome = join(dir, 'fresh-codex');
+			const options = {
+				codexHome,
+				pluginRoot: pluginDir,
+				node: '/usr/bin/node',
+				mcpUrl: 'https://memory.example.com/mcp',
+				authorization: 'Basic dTpw',
+				envFile: '/etc/team b/env',
+			};
+			configureCodex(options);
+			configureCodex(options);
+			assert.equal(existsSync(join(codexHome, 'config.toml.pre-agent-memory')), false);
+			assert.equal(existsSync(join(codexHome, 'hooks.json.pre-agent-memory')), false);
+			const hooks = JSON.parse(readFileSync(join(codexHome, 'hooks.json'), 'utf8')).hooks;
+			assert.match(
+				hooks.UserPromptSubmit[0].hooks[0].command,
+				/^env AGENT_MEMORY_ENV_FILE='\/etc\/team b\/env' '\/usr\/bin\/node' /,
+			);
 		});
 	});
 
@@ -170,6 +206,21 @@ describe('onboarding scripts', () => {
 			assert.match(result.lines[0], /^SessionStart: http_401,/);
 			assert.match(result.lines[1], /^UserPromptSubmit: http_401,/);
 			assert.equal(existsSync(join(home, '.cache')), false);
+		});
+
+		it('fails on a skipped recall, which verified nothing, and accepts recall switched off', () => {
+			const env = {
+				PATH: process.env.PATH,
+				HOME: join(dir, 'probe-home'),
+				AGENT_MEMORY_ENV_FILE: envFile('probe', url),
+			};
+			const skipped = probeHooks({ pluginRoot: pluginDir, prompt: 'yes', env });
+			assert.match(skipped.lines[1], /^UserPromptSubmit: skipped/);
+			const off = probeHooks({ pluginRoot: pluginDir, prompt: 'yes', env: { ...env, AGENT_MEMORY_RECALL: 'off' } });
+			assert.match(off.lines[1], /^UserPromptSubmit: disabled/);
+			// Both still fail here, on the bootstrap's 401.
+			assert.equal(skipped.ok, false);
+			assert.equal(off.ok, false);
 		});
 
 		it('reports an unconfigured install', () => {
@@ -206,7 +257,7 @@ fi
 			});
 			assert.equal(result.status, 0, result.stderr);
 			assert.deepEqual(readFileSync(join(dir, 'claude.log'), 'utf8').trim().split('\n'), [
-				`${profile} plugin marketplace list`,
+				`${profile} plugin marketplace list --json`,
 				`${profile} plugin marketplace add HarperFast/agent-memory`,
 				`${profile} plugin install agent-memory@agent-memory --scope user`,
 			]);
