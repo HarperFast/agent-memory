@@ -47,6 +47,7 @@ let scoped = false;
 let warnedUnscoped = false;
 let warnedOldRuntime: MemoryRuntime | undefined;
 let checkedRuntime: MemoryRuntime | undefined;
+let warnedNoLockScope: MemoryRuntime | undefined;
 
 function isObject(value: unknown): value is object {
 	return (typeof value === 'object' || typeof value === 'function') && value !== null;
@@ -163,4 +164,18 @@ export function foreignRuntime(own: MemoryRuntime): MemoryRuntime | undefined {
 		}
 	}
 	return runtime;
+}
+
+/** No local fallback: this copy's settings are not the running plugin's (a transient-validation load applies its own). */
+export function runningLockScope(own: MemoryRuntime): LockScope | undefined {
+	const runtime = foreignRuntime(own) ?? domain().runtime;
+	if (runtime === undefined) return undefined;
+	if (typeof runtime.lockScope === 'function') return runtime.lockScope();
+	if (runtime !== warnedNoLockScope) {
+		warnedNoLockScope = runtime;
+		warn(
+			`@harperfast/agent-memory: the running plugin is ${runtime.version}, which does not report its lockScope; getLockScope() returns undefined until it is upgraded`,
+		);
+	}
+	return undefined;
 }

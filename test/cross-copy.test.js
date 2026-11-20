@@ -202,8 +202,13 @@ describe('a second copy of the package', () => {
 		domain().runtime = { ...published, lockScope: () => 'cluster' };
 		try {
 			assert.equal(copy.getLockScope(), 'cluster');
-			domain().runtime = { ...published, lockScope: undefined };
+			const old = { ...published, version: '0.1.5', lockScope: undefined };
+			domain().runtime = old;
+			const before = warnings.length;
 			assert.equal(copy.getLockScope(), undefined);
+			assert.equal(copy.getLockScope(), undefined);
+			assert.equal(warnings.length, before + 1);
+			assert.match(warnings.at(-1), /running plugin is 0\.1\.5, which does not report its lockScope/);
 		} finally {
 			domain().runtime = published;
 		}

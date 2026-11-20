@@ -2,7 +2,7 @@ import type { Scope } from 'harper';
 import { probeCoreTruncate } from './lifecycle.ts';
 import { resolvePrincipal as resolveHere } from './principal.ts';
 import { MEMORY_RESOURCES, MemoryMcpResource } from './resource.ts';
-import { domain, foreignRuntime, publishRuntime, type MemoryRuntime } from './runtime.ts';
+import { domain, foreignRuntime, publishRuntime, runningLockScope, type MemoryRuntime } from './runtime.ts';
 import { canReadLabels as canReadLabelsHere, compiledHere, type Principal } from './scopes.ts';
 import { getMemories as getHere, scanMemories as scanHere, type ScanOptions } from './search.ts';
 import { applySettings, getSettings, parseSettings, type LockScope } from './settings.ts';
@@ -90,12 +90,12 @@ export function getMemories(ids: readonly string[]): Promise<Record<string, unkn
 
 /**
  * The `lockScope` the running plugin in this domain applies now, read on every call. `undefined` when no plugin has
- * started in the domain yet (it may be loading in another app) or the running one does not report it. `cluster` is
- * this node's setting: it does not show that record locks exist or that other nodes match (DESIGN.md, Extension
- * points).
+ * started in the domain yet (it may be loading in another app) or the running one does not report it (0.1.5 or
+ * earlier; warned once). `cluster` is this node's setting: it does not show that record locks exist or that other
+ * nodes match (DESIGN.md, Extension points).
  */
 export function getLockScope(): LockScope | undefined {
-	return domain().runtime?.lockScope?.();
+	return runningLockScope(RUNTIME);
 }
 
 function routePathFor(basePath: string, resource: { path: string }): string {

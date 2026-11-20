@@ -1,6 +1,6 @@
 import { getLockScope } from '@harperfast/agent-memory';
 
-// The startup check a component that depends on cluster-serialized writes makes (README, Extension points).
+// README, Depending on cluster-wide write ordering.
 const lockScope = getLockScope();
 if (lockScope !== 'cluster') {
 	throw new Error(`lock-scope guard: needs agent-memory lockScope cluster; it reports ${lockScope}`);

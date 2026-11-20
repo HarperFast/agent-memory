@@ -248,20 +248,22 @@ export function handleApplication(scope) {
 	if (lockScope !== 'cluster') {
 		throw new Error(`my-plugin needs agent-memory lockScope: cluster (it reports ${lockScope})`);
 	}
-	registerMemorySink({
-		async write(memory, context) {
-			// Read on every call: a config reload can change lockScope on a running node. Throwing aborts the write.
-			if (getLockScope() !== 'cluster') throw new Error('my-plugin: agent-memory lockScope is no longer cluster');
-			await record(memory, context);
-		},
-	});
+	// Read on every call: a config reload can change lockScope on a running node. Throwing aborts the write.
+	const guarded = async (memory, context) => {
+		if (getLockScope() !== 'cluster') throw new Error('my-plugin: agent-memory lockScope is no longer cluster');
+		await record(memory, context);
+	};
+	registerMemorySink({ write: guarded, withdraw: guarded });
 }
 ```
 
 - Check before registering the sink: a registration outlives a failed load.
 - List your plugin after agent-memory in the same app's `config.yaml`. Plugins in one app start in order, so
   agent-memory has started when yours does. Apps start concurrently, so in another app `getLockScope()` can still
-  read `undefined` at startup; check it in the sink, where it is always defined, or wait for it with a deadline.
+  read `undefined` at startup; check it in the sink, where it is defined unless the running plugin is 0.1.5 or
+  earlier, or wait for it with a deadline.
+- The sink check catches a change to `node`. It reads the current setting, not the lock the write took, so a write
+  that locked at `node` before a reload to `cluster` passes it: change `lockScope` while no lifecycle write runs.
 - `cluster` is this node's setting. It does not show that record locks exist (without them every lifecycle write
   answers 503, so no sink runs) or that other nodes match: set it on every node.
 - A single-node deployment needs no cluster lock; a plugin may accept `node` there.
