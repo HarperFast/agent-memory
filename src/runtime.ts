@@ -169,7 +169,12 @@ export function foreignRuntime(own: MemoryRuntime): MemoryRuntime | undefined {
 /** No local fallback: this copy's settings are not the running plugin's (a transient-validation load applies its own). */
 export function runningLockScope(own: MemoryRuntime): LockScope | undefined {
 	const runtime = foreignRuntime(own) ?? domain().runtime;
-	if (runtime === undefined) return undefined;
+	if (runtime === undefined) {
+		if (!scoped && (process as unknown as Record<symbol, Anchor | undefined>)[ANCHOR_KEY]?.scopedRuntime) {
+			warnUnscopedOnce();
+		}
+		return undefined;
+	}
 	if (typeof runtime.lockScope === 'function') return runtime.lockScope();
 	if (runtime !== warnedNoLockScope) {
 		warnedNoLockScope = runtime;

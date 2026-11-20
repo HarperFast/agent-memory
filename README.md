@@ -243,7 +243,7 @@ import { getLockScope, registerMemorySink } from '@harperfast/agent-memory';
 
 export function handleApplication(scope) {
 	if (scope.isTransientValidation) return;
-	// 'node' | 'cluster', or undefined while no agent-memory plugin runs in this worker's apps.
+	// undefined while no agent-memory plugin runs in this worker's apps, or the running one is 0.1.5 or earlier.
 	const lockScope = getLockScope();
 	if (lockScope !== 'cluster') {
 		throw new Error(`my-plugin needs agent-memory lockScope: cluster (it reports ${lockScope})`);
@@ -260,12 +260,15 @@ export function handleApplication(scope) {
 - Check before registering the sink: a registration outlives a failed load.
 - List your plugin after agent-memory in the same app's `config.yaml`. Plugins in one app start in order, so
   agent-memory has started when yours does. Apps start concurrently, so in another app `getLockScope()` can still
-  read `undefined` at startup; check it in the sink, where it is defined unless the running plugin is 0.1.5 or
-  earlier, or wait for it with a deadline.
+  read `undefined` at startup: poll it with a deadline before refusing. Do not rely on the sink check alone there:
+  a sink that throws aborts every memory write, where a startup check only keeps your plugin from starting.
 - The sink check catches a change to `node`. It reads the current setting, not the lock the write took, so a write
   that locked at `node` before a reload to `cluster` passes it: change `lockScope` while no lifecycle write runs.
 - `cluster` is this node's setting. It does not show that record locks exist (without them every lifecycle write
   answers 503, so no sink runs) or that other nodes match: set it on every node.
+- Even at `cluster`, after a lock holder crashes or overruns its lease, two revisions of one memory can both commit
+  ([DESIGN.md, Lifecycle](DESIGN.md#lifecycle)). Keep sink effects idempotent per `(id, revision)`, and keep any
+  repair pass that catches a missed change.
 - A single-node deployment needs no cluster lock; a plugin may accept `node` there.
 - A running agent-memory of 0.1.5 or earlier reports `undefined`.
 

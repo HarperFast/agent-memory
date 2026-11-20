@@ -1,6 +1,5 @@
 import { getLockScope } from '@harperfast/agent-memory';
 
-// README, Depending on cluster-wide write ordering.
 const lockScope = getLockScope();
 if (lockScope !== 'cluster') {
 	throw new Error(`lock-scope guard: needs agent-memory lockScope cluster; it reports ${lockScope}`);

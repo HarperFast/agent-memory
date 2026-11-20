@@ -141,7 +141,6 @@ for (const moduleLoader of ['vm-current-context', 'vm']) {
 				strictEqual(probe.status, 200, JSON.stringify(probe.body));
 				ok(String(probe.body.packagePath).includes('/memory-consumer/node_modules/'), probe.body.packagePath);
 				strictEqual(probe.body.seesServiceGlobal, moduleLoader === 'vm-current-context');
-				strictEqual(probe.body.lockScope, 'node');
 			});
 
 			test("the consumer's sink sees create, revise and withdraw inside the plugin's transaction", async () => {

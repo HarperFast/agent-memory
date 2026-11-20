@@ -372,8 +372,10 @@ describe('a second copy of the package', () => {
 		assert.throws(() => copy.canReadLabels(viaBranch, ['global']), TypeError);
 	});
 
-	it('warns once from an unscoped copy that registers beside a running plugin', () => {
+	it('warns once from an unscoped copy that reads the lock scope or registers beside a running plugin', () => {
 		const before = warnings.length;
+		assert.equal(unscoped.getLockScope(), undefined);
+		assert.equal(warnings.length, before + 1);
 		unscoped.setPrincipalResolver(undefined);
 		unscoped.registerMemorySink({});
 		assert.equal(warnings.length, before + 1);

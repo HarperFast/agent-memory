@@ -48,13 +48,13 @@ suite('@harperfast/agent-memory at lockScope: cluster without record locks', (ct
 		const dataRootDir = await mkdtemp(
 			join(process.env.HARPER_INTEGRATION_TEST_INSTALL_PARENT_DIR || tmpdir(), 'harper-integration-test-'),
 		);
+		(ctx as any).harper = { dataRootDir };
 		for (const app of ['memory-app-cluster-lock', 'memory-consumer']) {
 			await cp(join(import.meta.dirname, 'fixtures', app), join(dataRootDir, 'components', app), {
 				recursive: true,
 				dereference: true,
 			});
 		}
-		(ctx as any).harper = { dataRootDir };
 		await startHarper(ctx, {
 			harperBinPath: harperBinPath(),
 			config: { logging: { stdStreams: true }, authentication: { authorizeLocal: false } },
