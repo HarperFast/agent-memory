@@ -4,8 +4,8 @@
 #
 # Usage: install-codex.sh [codex-home] [hook.mjs]
 #   codex-home  default: $CODEX_HOME, else ~/.codex
-#   hook.mjs    the plugin hook to install (default: the plugin installed in $CLAUDE_CONFIG_DIR or ~/.claude, else
-#               this checkout's claude-plugin/hooks/hook.mjs)
+#   hook.mjs    a plugin's hooks/hook.mjs; that plugin directory is what gets copied (default: the plugin installed
+#               in $CLAUDE_CONFIG_DIR or ~/.claude, else this checkout's claude-plugin/hooks/hook.mjs)
 #
 # The plugin's runtime is copied to <codex-home>/agent-memory/plugin and the hooks run that copy: Claude Code
 # deletes a replaced plugin version's directory 14 days after an update, so hooks pointing into its cache would

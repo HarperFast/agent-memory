@@ -262,7 +262,9 @@ export function probeHooks({ pluginRoot, prompt, env = process.env, timeoutMs = 
 			let context = '';
 			let validOutput = true;
 			try {
-				const output = result.stdout.trim() ? JSON.parse(result.stdout).hookSpecificOutput : undefined;
+				const parsed = result.stdout.trim() ? JSON.parse(result.stdout) : {};
+				if (!parsed || typeof parsed !== 'object') throw new Error('not a hook result');
+				const output = parsed.hookSpecificOutput;
 				if (output && output.hookEventName === hookEvent && typeof output.additionalContext === 'string') {
 					context = output.additionalContext;
 				} else if (output) validOutput = false;

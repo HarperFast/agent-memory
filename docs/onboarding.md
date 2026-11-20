@@ -110,7 +110,7 @@ The script gives Codex the same memory as Claude Code:
 The hooks run a copy of the plugin in `<codex-home>/agent-memory/plugin`, taken from the plugin installed in
 `~/.claude` (or `$CLAUDE_CONFIG_DIR`), or from this checkout when no Claude install exists. They don't run
 Claude's cached copy because Claude Code deletes a replaced version's directory 14 days after an update. To use
-a particular hook, pass its path as the second argument. The hook commands name the env file the MCP entry's
+another copy of the plugin, pass its `hooks/hook.mjs` path as the second argument. The hook commands name the env file the MCP entry's
 credential came from, so the hooks and the MCP entry use the same credential. After a password rotation, rerun
 the script: the hooks read the new password from the file, but the MCP entry keeps the old one until then.
 
