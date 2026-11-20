@@ -243,7 +243,6 @@ import { getLockScope, registerMemorySink } from '@harperfast/agent-memory';
 
 export function handleApplication(scope) {
 	if (scope.isTransientValidation) return;
-	// undefined while no agent-memory plugin runs in this worker's apps, or the running one is 0.1.5 or earlier.
 	const lockScope = getLockScope();
 	if (lockScope !== 'cluster') {
 		throw new Error(`my-plugin needs agent-memory lockScope: cluster (it reports ${lockScope})`);
@@ -266,9 +265,9 @@ export function handleApplication(scope) {
   that locked at `node` before a reload to `cluster` passes it: change `lockScope` while no lifecycle write runs.
 - `cluster` is this node's setting. It does not show that record locks exist (without them every lifecycle write
   answers 503, so no sink runs) or that other nodes match: set it on every node.
-- Even at `cluster`, after a lock holder crashes or overruns its lease, two revisions of one memory can both commit
-  ([DESIGN.md, Lifecycle](DESIGN.md#lifecycle)). Keep sink effects idempotent per `(id, revision)`, and keep any
-  repair pass that catches a missed change.
+- Even at `cluster`, after a lock holder crashes or overruns its lease, two writes of one memory at the same revision
+  can both commit ([DESIGN.md, Lifecycle](DESIGN.md#lifecycle)), and replication keeps one. Do not skip a call as a
+  repeat of an `(id, revision)` already seen; keep any repair pass that re-derives from the stored rows.
 - A single-node deployment needs no cluster lock; a plugin may accept `node` there.
 - A running agent-memory of 0.1.5 or earlier reports `undefined`.
 
@@ -284,7 +283,7 @@ differ. This needs:
 - Harper's default module loading: `applications.moduleLoader` `vm-current-context` (the default) or `vm`, and
   `applications.dependencyLoader` unset or `app`. Under the `native` or `compartment` loader each copy keeps its
   own state, as before, so this does not work there, and nothing warns. With `dependencyLoader: native`, a copy
-  that registers beside a running plugin logs a warning.
+  that registers or calls `getLockScope()` beside a running plugin logs a warning.
 - Exactly one app listing the plugin in its `config.yaml`. A second one fails to load. Which of the two loads
   first can differ from worker to worker, so remove one.
 - A version of this package newer than 0.1.3 in the importing app. 0.1.3 and earlier keep registrations to

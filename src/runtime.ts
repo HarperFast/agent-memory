@@ -40,7 +40,7 @@ interface Anchor {
 const ANCHOR_KEY = Symbol.for('@harperfast/agent-memory');
 
 const UNSCOPED_COPY =
-	"@harperfast/agent-memory: a copy of the package was loaded without its app's scope (applications.dependencyLoader: native?), so sinks and principal resolvers registered through it never reach the running plugin";
+	"@harperfast/agent-memory: a copy of the package was loaded without its app's scope (applications.dependencyLoader: native?), so sinks and principal resolvers registered through it never reach the running plugin, and getLockScope() through it reports undefined";
 
 let memo: MemoryDomain | undefined;
 let scoped = false;
