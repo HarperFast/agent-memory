@@ -1,9 +1,10 @@
 rest: true
 
-jsResource:
-  files: 'resources.js'
-
 # A single core Harper node registers no record-lock transport, so every cluster-scoped lock fails closed.
 '@harperfast/agent-memory':
   package: '@harperfast/agent-memory'
   lockScope: cluster
+
+# After the plugin, so resources.js can check its lock scope as it loads.
+jsResource:
+  files: 'resources.js'

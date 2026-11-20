@@ -5,7 +5,7 @@ import { MEMORY_RESOURCES, MemoryMcpResource } from './resource.ts';
 import { domain, foreignRuntime, publishRuntime, type MemoryRuntime } from './runtime.ts';
 import { canReadLabels as canReadLabelsHere, compiledHere, type Principal } from './scopes.ts';
 import { getMemories as getHere, scanMemories as scanHere, type ScanOptions } from './search.ts';
-import { applySettings, parseSettings } from './settings.ts';
+import { applySettings, getSettings, parseSettings, type LockScope } from './settings.ts';
 import { PACKAGE_VERSION } from './version.ts';
 
 export { registerMemorySink, type MemorySink } from './sinks.ts';
@@ -23,6 +23,7 @@ export {
 export type { ScanOptions } from './search.ts';
 export { setPrincipalResolver, type PrincipalResolver, type PrincipalResolution } from './principal.ts';
 export type { Principal } from './scopes.ts';
+export type { LockScope } from './settings.ts';
 
 const RUNTIME: MemoryRuntime = Object.freeze({
 	version: PACKAGE_VERSION,
@@ -30,6 +31,7 @@ const RUNTIME: MemoryRuntime = Object.freeze({
 	canReadLabels: canReadLabelsHere,
 	scanMemories: scanHere,
 	getMemories: getHere,
+	lockScope: () => getSettings().lockScope,
 });
 
 /**
@@ -84,6 +86,16 @@ export function getMemories(ids: readonly string[]): Promise<Record<string, unkn
 		return Promise.reject(error);
 	}
 	return runtime?.getMemories ? runtime.getMemories(ids) : getHere(ids);
+}
+
+/**
+ * The `lockScope` the running plugin in this domain applies now, read on every call. `undefined` when no plugin has
+ * started in the domain yet (it may be loading in another app) or the running one does not report it. `cluster` is
+ * this node's setting: it does not show that record locks exist or that other nodes match (DESIGN.md, Extension
+ * points).
+ */
+export function getLockScope(): LockScope | undefined {
+	return domain().runtime?.lockScope?.();
 }
 
 function routePathFor(basePath: string, resource: { path: string }): string {

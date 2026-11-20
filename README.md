@@ -10,7 +10,7 @@ Shared, permissioned, live memory for agents and people, as a Harper plugin.
 - Customer-content flag: a `global` write that names a configured customer, or matches a configured host pattern, is committed but readable only by its owner and `customer:*` readers until a reviewer rescopes or confirms it; an optional model check runs after commit
 - Live updates: Level 1 real-time subscriptions on `/Memory` and `/Memory/<id>` (SSE, WebSocket) with delivery-time read checks, and Level 2 watches (`POST /Memory/watch`, `watch=true` on search/bootstrap) delivered with own `needsReview` flags on `/MemoryEvents`
 - MCP surface (`mcp: true`): `remember`, `revise`, `recall`, `get`, `withdraw`, `pin`, `unpin`, `confirm`, `confirm-scope`, `watch` tools and `memory:///{id}` resource
-- Extension points: `registerMemorySink` runs inside the lifecycle transaction for apps that mirror memories elsewhere, `setPrincipalResolver` maps app-defined identities, `resolvePrincipal` / `canReadLabels` let other components authorize with the same identity and grants, and `scanMemories`, `getMemories`, `registerBootstrapSection` and `registerSearchAnnotator` let a plugin build derived data over memories and add it to bootstrap and search results
+- Extension points: `registerMemorySink` runs inside the lifecycle transaction for apps that mirror memories elsewhere, `getLockScope` lets such a plugin require cluster-serialized writes, `setPrincipalResolver` maps app-defined identities, `resolvePrincipal` / `canReadLabels` let other components authorize with the same identity and grants, and `scanMemories`, `getMemories`, `registerBootstrapSection` and `registerSearchAnnotator` let a plugin build derived data over memories and add it to bootstrap and search results
 
 Status: v0 (0.x releases may change contracts; see [CHANGELOG.md](CHANGELOG.md)). Design and contracts:
 [DESIGN.md](DESIGN.md).
@@ -230,6 +230,42 @@ throws is left out and logged; the request still succeeds. Contract: [DESIGN.md]
 another, named by `actsFor`), exact labels and namespace wildcards, with role and user grants merged and patterns that grant nothing dropped. A super_user's lists do not enumerate its
 access; check `superUser`, or let `canReadLabels` do it. `canReadLabels` is the label rule only (any label
 matches), and accepts only a principal `resolvePrincipal` returned. Contract: [DESIGN.md](DESIGN.md#extension-points).
+
+### Depending on cluster-wide write ordering
+
+A sink runs only on the node that takes the write. At the default `lockScope: node`, two nodes can change one memory
+at once, and each node's sink sees only its own write. A plugin whose derived state is correct only when writes to a
+memory are serialized across nodes reads the running plugin's setting with `getLockScope()` and refuses to start
+without `cluster`:
+
+```js
+import { getLockScope, registerMemorySink } from '@harperfast/agent-memory';
+
+export function handleApplication(scope) {
+	if (scope.isTransientValidation) return;
+	// 'node' | 'cluster', or undefined while no agent-memory plugin runs in this worker's apps.
+	const lockScope = getLockScope();
+	if (lockScope !== 'cluster') {
+		throw new Error(`my-plugin needs agent-memory lockScope: cluster (it reports ${lockScope})`);
+	}
+	registerMemorySink({
+		async write(memory, context) {
+			// Read on every call: a config reload can change lockScope on a running node. Throwing aborts the write.
+			if (getLockScope() !== 'cluster') throw new Error('my-plugin: agent-memory lockScope is no longer cluster');
+			await record(memory, context);
+		},
+	});
+}
+```
+
+- Check before registering the sink: a registration outlives a failed load.
+- List your plugin after agent-memory in the same app's `config.yaml`. Plugins in one app start in order, so
+  agent-memory has started when yours does. Apps start concurrently, so in another app `getLockScope()` can still
+  read `undefined` at startup; check it in the sink, where it is always defined, or wait for it with a deadline.
+- `cluster` is this node's setting. It does not show that record locks exist (without them every lifecycle write
+  answers 503, so no sink runs) or that other nodes match: set it on every node.
+- A single-node deployment needs no cluster lock; a plugin may accept `node` there.
+- A running agent-memory of 0.1.5 or earlier reports `undefined`.
 
 ### From another app
 

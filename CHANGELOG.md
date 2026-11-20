@@ -31,6 +31,11 @@ All notable changes to `@harperfast/agent-memory` are documented here. The forma
 
 ### Added
 
+- `getLockScope()` returns the `lockScope` (`node` or `cluster`) the running plugin applies, read live, or `undefined`
+  while none runs in the worker's apps. A plugin whose sink-derived state needs writes to one memory serialized across
+  nodes (summary-tree, [HarperFast/summary-tree#3](https://github.com/HarperFast/summary-tree/pull/3)) can refuse to
+  start without `cluster` instead of only documenting it (README, Depending on cluster-wide write ordering). A running
+  plugin of 0.1.5 or earlier reports `undefined`.
 - Claude Code plugin: every session start and prompt-time recall records its outcome (`injected`, `empty`, `deduped`,
   `http_<status>`, `timeout`, `error`, `skipped`, `unconfigured`, …), latency and hit count in a size-capped
   `diagnostics.jsonl` under `AGENT_MEMORY_CACHE_DIR`, with no prompt text, memory content or credentials;

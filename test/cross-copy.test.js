@@ -129,6 +129,11 @@ describe('a second copy of the package', () => {
 		}
 	});
 
+	it('reports no lock scope while no plugin runs', () => {
+		assert.equal(copy.getLockScope(), undefined);
+		assert.equal(plugin.getLockScope(), undefined);
+	});
+
 	it('resolves principals with its own code while no plugin runs', async () => {
 		await databases.memory.ScopeGrant.put({ id: 'role:agents', read: ['global'], write: ['global'] });
 		earlyPrincipal = await copy.resolvePrincipal(member('alice'));
@@ -188,6 +193,20 @@ describe('a second copy of the package', () => {
 			[warnings[0]],
 		);
 		assert.equal(warnings.length, 1);
+	});
+
+	it("reports the plugin's lock scope, read live, and none from a runtime without it", () => {
+		assert.equal(copy.getLockScope(), 'node');
+		assert.equal(plugin.getLockScope(), 'node');
+		const published = domain().runtime;
+		domain().runtime = { ...published, lockScope: () => 'cluster' };
+		try {
+			assert.equal(copy.getLockScope(), 'cluster');
+			domain().runtime = { ...published, lockScope: undefined };
+			assert.equal(copy.getLockScope(), undefined);
+		} finally {
+			domain().runtime = published;
+		}
 	});
 
 	it('answers resolvePrincipal and canReadLabels with the plugin', async () => {
@@ -315,7 +334,8 @@ describe('a second copy of the package', () => {
 	it('publishes nothing from a deploy-validation load or a load whose options are invalid', async () => {
 		const compiledBy = async (name) =>
 			(await import(pathToFileURL(join(copyDir(name), 'dist', 'scopes.js')).href)).canReadLabels;
-		await candidate.handleApplication(fakeScope({}, { isTransientValidation: true }).scope);
+		await candidate.handleApplication(fakeScope({ lockScope: 'cluster' }, { isTransientValidation: true }).scope);
+		assert.equal(candidate.getLockScope(), undefined);
 		await assert.rejects(invalid.handleApplication(fakeScope({ supersession: { mode: 'auto' } }).scope), /judge/);
 		// Each resolves with its own code: had either published, the other would have delegated to it.
 		assert.equal((await compiledBy('invalid'))(await invalid.resolvePrincipal(member('alice')), ['global']), true);

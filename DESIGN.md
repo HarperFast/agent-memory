@@ -731,6 +731,18 @@ as REST:
   ids, not a whole walk's. A failed read rejects the whole call, never a partial list. It reads each row as it
   is when its query runs: rows are not a snapshot of one moment, so a plugin building output from several rows fences
   its publication against sink invalidations and rechecks eligibility.
+- `getLockScope()` — the `lockScope` (`node` | `cluster`) the running plugin in this domain applies, read on every
+  call through the published runtime's `lockScope()`, so the next call after a reload sees the new value. It never
+  falls back to the calling copy's own settings, which a transient-validation or rejected load also applies without
+  publishing: with no running plugin in the domain, or one whose runtime has no `lockScope` (0.1.5 or earlier), it is
+  `undefined`. It is for a plugin whose sink-derived state is correct only when lifecycle writes to one memory are
+  serialized across nodes: under `node`, writers on two nodes each run their sinks against what they read
+  (Lifecycle). Such a plugin checks it before registering its sink, refusing to start unless `cluster`, and again in
+  the sink, where it is always defined (only the running plugin dispatches sinks) and a reload to `node` shows.
+  `cluster` is this node's setting: it does not prove record locks exist (without them every lifecycle write answers
+  503, so no sink runs under a weaker lock) or that other nodes match. Apps load concurrently, so a plugin in another
+  app can run before agent-memory publishes and read `undefined`; one listed after agent-memory in the same app's
+  `config.yaml` loads after it.
 - `registerBootstrapSection({ name, render })` returns an unregister function. `render({ principal, q, budgetChars,
 itemOverheadChars, context })` (sync or async) returns `{ text }`, an array of `{ title?, content }` items in
   priority order, or nothing. Sections render after `pinned` and `needsReview` have packed, so `budgetChars` is the
@@ -799,7 +811,7 @@ context })` (sync or async) returns a `Map` from memory id to a JSON value, or n
     registers where the plugin dispatches, whatever order the apps load in. The last `setPrincipalResolver` from
     any app wins. The section and annotator lists are added on first use (`??=`), since an older copy may have
     created the domain object without them.
-  - `handleApplication` publishes `{ version, resolvePrincipal, canReadLabels, scanMemories, getMemories }` (the plugin's own
+  - `handleApplication` publishes `{ version, resolvePrincipal, canReadLabels, scanMemories, getMemories, lockScope }` (the plugin's own
     functions) once `configure()` succeeds, and never for an `isTransientValidation` scope. The exported
     `resolvePrincipal`, `scanMemories` and `getMemories` call it when present, else run locally. A runtime without `scanMemories`
     is 0.1.4 or earlier, which never renders sections or runs annotators: registering one beside it warns once

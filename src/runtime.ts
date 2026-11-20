@@ -3,6 +3,7 @@ import type { BootstrapSection, SearchAnnotator } from './extensions.ts';
 import type { PrincipalResolver } from './principal.ts';
 import type { Principal } from './scopes.ts';
 import type { ScanOptions } from './search.ts';
+import type { LockScope } from './settings.ts';
 import type { MemorySink } from './sinks.ts';
 import { PACKAGE_VERSION } from './version.ts';
 
@@ -17,6 +18,8 @@ export interface MemoryRuntime {
 	// Absent from a runtime published by 0.1.4 or earlier, which also never renders sections or runs annotators.
 	scanMemories?(options?: ScanOptions): AsyncIterable<Record<string, unknown>>;
 	getMemories?(ids: readonly string[]): Promise<Record<string, unknown>[]>;
+	// Absent from a runtime published by 0.1.5 or earlier.
+	lockScope?(): LockScope;
 }
 
 export interface MemoryDomain {

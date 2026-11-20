@@ -1,5 +1,6 @@
 import {
 	canReadLabels,
+	getLockScope,
 	getMemories,
 	registerBootstrapSection,
 	registerMemorySink,
@@ -92,6 +93,7 @@ export class PrincipalProbe extends Resource {
 			canRead: canReadLabels(principal, labels),
 			packagePath: import.meta.resolve('@harperfast/agent-memory'),
 			seesServiceGlobal: globalThis[Symbol.for('agent-memory-fixture/service-global')] === true,
+			lockScope: getLockScope(),
 		};
 	}
 }
