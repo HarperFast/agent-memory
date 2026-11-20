@@ -1039,6 +1039,17 @@ detection into a one-off, reviewed cleanup of history that arrived without its l
 `claude-plugin/` (published at the repository root via `.claude-plugin/marketplace.json`) integrates
 `agent-memory` into Claude Code without adding harness-specific routes to the Harper server:
 
+- **Distribution: versioned by commit, not by a manifest string.** Claude Code replaces an installed plugin
+  (`plugins/cache/agent-memory/agent-memory/<version>/`) only when the version it computes changes: `plugin.json`'s
+  `version`, else the marketplace entry's, else the marketplace's git commit. Neither manifest carries a `version`,
+  so every commit to `main` is a plugin release that `claude plugin update` delivers, and one version never names
+  two different plugin trees. A fixed string kept every install on the 0.1.0 code through #50 and #57; an
+  independent semver with a CI bump check was rejected because two PRs can bump to the same number and both merge.
+  The cost is that a server-only commit also gives installs a new (identical) copy. `test/plugin-manifest.test.js`
+  fails if either manifest gains a `version`. Onboarding scripts live in `scripts/onboarding/`, outside the plugin
+  payload; the Codex installer copies the plugin runtime into the Codex home rather than pointing at Claude's
+  cache, whose replaced versions Claude Code deletes 14 days after an update.
+
 - **Remote HTTP MCP (`claude-plugin/.mcp.json`, `claude-plugin/bin/headers.mjs`)**: `.mcp.json` declares
   Harper's native Streamable HTTP endpoint directly (`"type": "http"`, `"url": "${AGENT_MEMORY_URL}/mcp"`,
   `"headersHelper": "node \"${CLAUDE_PLUGIN_ROOT}/bin/headers.mjs\""`) rather than wrapping REST calls in a

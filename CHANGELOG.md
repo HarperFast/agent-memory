@@ -6,6 +6,19 @@ All notable changes to `@harperfast/agent-memory` are documented here. The forma
 
 ## [Unreleased]
 
+### Fixed
+
+- Claude Code plugin: updates now reach installed copies. The plugin's manifests no longer pin `version` `0.1.0`,
+  which kept `claude plugin update` from ever replacing an install; Claude Code now versions the plugin by this
+  repository's commit, so `claude plugin marketplace update agent-memory && claude plugin update
+agent-memory@agent-memory` brings an install to the current `main`. A unit test fails if a `version` comes back.
+
+### Added
+
+- Onboarding: [docs/onboarding.md](docs/onboarding.md) and `scripts/onboarding/` take an engineer from a provisioned
+  user to a verified install in each Claude profile (`install-claude-profile.sh`) and Codex (`install-codex.sh`),
+  checked with `hook-test.sh`, plus update, rollback and uninstall steps.
+
 ## [0.2.0] - 2026-11-19
 
 ### Fixed

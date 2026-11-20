@@ -10,7 +10,6 @@
 		{
 			"name": "agent-memory",
 			"description": "Bootstrap, per-prompt recall, live change notifications, and remote HTTP MCP integration for Harper agent-memory",
-			"version": "0.1.0",
 			"author": {
 				"name": "Harper",
 				"url": "https://github.com/HarperFast"

@@ -1,6 +1,5 @@
 {
 	"name": "agent-memory",
-	"version": "0.1.0",
 	"description": "Shared, permissioned, live memory for Claude Code backed by Harper agent-memory",
 	"author": {
 		"name": "Harper",
