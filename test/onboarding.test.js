@@ -194,7 +194,7 @@ describe('onboarding scripts', () => {
 		});
 
 		it('replaces its own trust records whole, ignoring a commented copy and keeping the table after them', () => {
-			const codexHome = join(dir, 'trust-codex');
+			const codexHome = join(dir, 'trust #codex');
 			mkdirSync(codexHome);
 			const key = JSON.stringify(`${join(codexHome, 'hooks.json')}:session_start:0:0`);
 			writeFileSync(

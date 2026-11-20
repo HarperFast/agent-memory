@@ -156,7 +156,8 @@ function trustCodexHooks(toml, hooksJson, hooksPath) {
 				if (!HOOK_COMMAND.test(handler.command ?? '')) return;
 				const header = `[hooks.state.${JSON.stringify(`${hooksPath}:${label}:${gi}:${hi}`)}]`;
 				toml =
-					removeTables(toml, (line) => line.replace(/\s*(?:#.*)?$/, '') === header) +
+					// The header itself may contain `#` (in the path): only what follows it can be a comment.
+					removeTables(toml, (line) => line.startsWith(header) && /^\s*(?:#.*)?$/.test(line.slice(header.length))) +
 					`\n${header}\ntrusted_hash = "${codexHookHash(label, handler, group.matcher)}"\n`;
 			}),
 		);
@@ -306,7 +307,7 @@ export function resolveCredentials(env = process.env) {
 	const config = resolveConfig(rest);
 	if (!config.configured) {
 		throw new Error(
-			`${config.unconfiguredReason} in ${config.envFilePath} or the environment: provision a user first (docs/onboarding.md)`,
+			`${config.unconfiguredReason} in ${config.envFilePath}: provision a user first (docs/onboarding.md)`,
 		);
 	}
 	return config;
