@@ -146,7 +146,8 @@ function trustCodexHooks(toml, hooksJson, hooksPath) {
 				if (!HOOK_COMMAND.test(handler.command ?? '')) return;
 				const header = `[hooks.state.${JSON.stringify(`${hooksPath}:${label}:${gi}:${hi}`)}]`;
 				const existing = new RegExp(
-					'\\n?' + header.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\n(?:[^\\[\\n][^\\n]*\\n?)*',
+					// The header and its key lines, up to a blank line or the next table header (indented or not).
+					'\\n?' + header.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\n(?:(?![ \\t]*\\[)[^\\n]+\\n?)*',
 					'g',
 				);
 				toml =
@@ -165,17 +166,21 @@ function copyPluginRuntime(pluginRoot, target) {
 	const staging = `${target}.new-${process.pid}`;
 	const previous = `${target}.old-${process.pid}`;
 	for (const stale of [staging, previous]) rmSync(stale, { recursive: true, force: true });
-	for (const part of ['hooks', 'lib', 'bin', '.claude-plugin']) {
-		if (existsSync(join(pluginRoot, part))) cpSync(join(pluginRoot, part), join(staging, part), { recursive: true });
-	}
-	if (existsSync(target)) renameSync(target, previous);
 	try {
-		renameSync(staging, target);
-	} catch (error) {
-		if (existsSync(previous)) renameSync(previous, target);
-		throw error;
+		for (const part of ['hooks', 'lib', 'bin', '.claude-plugin']) {
+			if (existsSync(join(pluginRoot, part))) cpSync(join(pluginRoot, part), join(staging, part), { recursive: true });
+		}
+		if (existsSync(target)) renameSync(target, previous);
+		try {
+			renameSync(staging, target);
+		} catch (error) {
+			if (existsSync(previous)) renameSync(previous, target);
+			throw error;
+		}
+		rmSync(previous, { recursive: true, force: true });
+	} finally {
+		rmSync(staging, { recursive: true, force: true });
 	}
-	rmSync(previous, { recursive: true, force: true });
 }
 
 // A file that already has agent-memory in it is not an original worth keeping: backing it up would save this
@@ -250,7 +255,10 @@ export function probeHooks({ pluginRoot, prompt, env = process.env, timeoutMs = 
 			const result = run({ session_id: session, hook_event_name: hookEvent, source: 'startup', prompt, cwd: env.HOME });
 			let context = '';
 			try {
-				context = JSON.parse(result.stdout.trim().split('\n').pop()).hookSpecificOutput?.additionalContext ?? '';
+				const output = result.stdout.trim() ? JSON.parse(result.stdout).hookSpecificOutput : undefined;
+				if (output && output.hookEventName === hookEvent && typeof output.additionalContext === 'string') {
+					context = output.additionalContext;
+				}
 			} catch {}
 			const count = (pattern) => (context.match(pattern) ?? []).length;
 			const record = readDiagnosticsFile(cacheDir).findLast((entry) => entry.event === event);
@@ -311,7 +319,7 @@ if (isMainModule(import.meta.url)) {
 			mkdirSync(dirname(args[0]), { recursive: true });
 			setSettingsEnv(args[0], env);
 		} else if (command === 'configure-codex') {
-			const { baseUrl, authorization, userId } = resolveCredentials();
+			const { baseUrl, authorization, userId, envFilePath } = resolveCredentials();
 			const [codexHome, pluginRoot] = args;
 			const { runtime } = configureCodex({
 				codexHome,
@@ -320,7 +328,8 @@ if (isMainModule(import.meta.url)) {
 				node: process.env.NODE_BIN || process.execPath,
 				mcpUrl: `${baseUrl}/mcp`,
 				authorization,
-				envFile: process.env.AGENT_MEMORY_ENV_FILE,
+				// Pinned even when it is the default, so a later override in Codex's environment cannot split them.
+				envFile: envFilePath,
 			});
 			console.log(
 				`${codexHome}: agent-memory MCP server and hooks configured${userId ? ` for ${userId}` : ''}; hooks run ${runtime}`,

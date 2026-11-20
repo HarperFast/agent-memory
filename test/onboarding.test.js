@@ -192,6 +192,26 @@ describe('onboarding scripts', () => {
 				/^env -u AGENT_MEMORY_URL -u AGENT_MEMORY_TOKEN AGENT_MEMORY_ENV_FILE='\/etc\/team b\/env' '\/usr\/bin\/node' /,
 			);
 		});
+
+		it('replaces its own trust records without taking an indented table that follows them', () => {
+			const codexHome = join(dir, 'trust-codex');
+			mkdirSync(codexHome);
+			const key = JSON.stringify(`${join(codexHome, 'hooks.json')}:session_start:0:0`);
+			writeFileSync(
+				join(codexHome, 'config.toml'),
+				`[hooks.state.${key}]\ntrusted_hash = "sha256:old"\n  [keep]\nx = 1\n`,
+			);
+			configureCodex({
+				codexHome,
+				pluginRoot: pluginDir,
+				node: '/usr/bin/node',
+				mcpUrl: 'https://memory.example.com/mcp',
+				authorization: 'Basic dTpw',
+			});
+			const toml = readFileSync(join(codexHome, 'config.toml'), 'utf8');
+			assert.match(toml, /^ {2}\[keep\]\nx = 1\n/);
+			assert.doesNotMatch(toml, /sha256:old/);
+		});
 	});
 
 	describe('probeHooks', () => {

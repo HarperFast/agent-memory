@@ -15,7 +15,7 @@ find_tools() {
 	local need
 	for need in node "$@"; do
 		command -v "$need" >/dev/null 2>&1 && continue
-		PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+		PATH="$PATH:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin"
 		if ! command -v "$need" >/dev/null 2>&1 && [ -s "${NVM_DIR:-$HOME/.nvm}/nvm.sh" ]; then
 			# nvm.sh reads unset variables, which would end a `set -u` script.
 			set +u
