@@ -1,12 +1,18 @@
 // Needs `npm run install:fixtures` first: the fixture app loads the packed plugin from its own node_modules.
 import { suite, test, before, after } from 'node:test';
 import { deepStrictEqual, ok, strictEqual } from 'node:assert/strict';
+import { cp, mkdtemp } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { createRequire } from 'node:module';
-import { setupHarperWithFixture, teardownHarper, type ContextWithHarper } from '@harperfast/integration-testing';
+import {
+	setupHarperWithFixture,
+	startHarper,
+	teardownHarper,
+	type ContextWithHarper,
+} from '@harperfast/integration-testing';
 
 const require = createRequire(import.meta.url);
-const fixturePath = join(import.meta.dirname, 'fixtures', 'memory-app-cluster-lock');
 const guardFixturePath = join(import.meta.dirname, 'fixtures', 'memory-app-lock-guard');
 const harperBinPath = () =>
 	process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT ?? join(dirname(require.resolve('harper')), 'bin', 'harper.js');
@@ -38,7 +44,18 @@ suite('@harperfast/agent-memory at lockScope: cluster without record locks', (ct
 	}
 
 	before(async () => {
-		await setupHarperWithFixture(ctx, fixturePath, {
+		// memory-consumer imports its own copy of the package, so it reads the lock scope across apps.
+		const dataRootDir = await mkdtemp(
+			join(process.env.HARPER_INTEGRATION_TEST_INSTALL_PARENT_DIR || tmpdir(), 'harper-integration-test-'),
+		);
+		for (const app of ['memory-app-cluster-lock', 'memory-consumer']) {
+			await cp(join(import.meta.dirname, 'fixtures', app), join(dataRootDir, 'components', app), {
+				recursive: true,
+				dereference: true,
+			});
+		}
+		(ctx as any).harper = { dataRootDir };
+		await startHarper(ctx, {
 			harperBinPath: harperBinPath(),
 			config: { logging: { stdStreams: true }, authentication: { authorizeLocal: false } },
 		});
@@ -82,12 +99,19 @@ suite('@harperfast/agent-memory at lockScope: cluster without record locks', (ct
 		strictEqual(read.body.memory.content, 'seeded beneath the plugin');
 	});
 
-	test('a component that requires cluster ordering starts, and reads the scope through the plugin', async () => {
+	test('a component that requires cluster ordering starts, and a copy in another app reads the scope from the plugin', async () => {
 		const response = await fetch(`${ctx.harper.httpURL}/LockScopeGuard`, {
 			headers: { Accept: 'application/json', Authorization: authorization() },
 		});
 		strictEqual(response.status, 200);
 		deepStrictEqual(await response.json(), { lockScope: 'cluster' });
+		const probe = await fetch(`${ctx.harper.httpURL}/PrincipalProbe/`, {
+			headers: { Accept: 'application/json', Authorization: authorization() },
+		});
+		strictEqual(probe.status, 200);
+		const fromOtherApp = await probe.json();
+		ok(String(fromOtherApp.packagePath).includes('/memory-consumer/node_modules/'), fromOtherApp.packagePath);
+		strictEqual(fromOtherApp.lockScope, 'cluster');
 	});
 
 	test('reads, watch=true included, never take a cluster lock', async () => {

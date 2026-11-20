@@ -23,7 +23,6 @@ export {
 export type { ScanOptions } from './search.ts';
 export { setPrincipalResolver, type PrincipalResolver, type PrincipalResolution } from './principal.ts';
 export type { Principal } from './scopes.ts';
-export type { LockScope } from './settings.ts';
 
 const RUNTIME: MemoryRuntime = Object.freeze({
 	version: PACKAGE_VERSION,

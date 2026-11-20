@@ -6,6 +6,8 @@ All notable changes to `@harperfast/agent-memory` are documented here. The forma
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-19
+
 ### Fixed
 
 - Claude Code plugin: a prompt with no distinctive term (`1, 2, 3`, `yes`, `please continue`) no longer recalls the
@@ -195,6 +197,7 @@ First npm release. Requires Harper 5.3.1 or later (`harper` peer dependency) on 
   `setPrincipalResolver` (map app-defined identities), and `resolvePrincipal` / `canReadLabels` (authorize
   other components with the same identity and grants).
 
+[0.2.0]: https://github.com/HarperFast/agent-memory/releases/tag/v0.2.0
 [0.1.5]: https://github.com/HarperFast/agent-memory/releases/tag/v0.1.5
 [0.1.4]: https://github.com/HarperFast/agent-memory/releases/tag/v0.1.4
 [0.1.3]: https://github.com/HarperFast/agent-memory/releases/tag/v0.1.3
