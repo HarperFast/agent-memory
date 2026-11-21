@@ -307,12 +307,16 @@ HTTP `/mcp` endpoint, automatic `SessionStart` bootstrap, budgeted `UserPromptSu
 
 ### Install & configure
 
+To onboard an engineer end to end (provision a user, install into each Claude profile and Codex, verify, update,
+roll back), follow [docs/onboarding.md](docs/onboarding.md); its scripts are in
+[`scripts/onboarding/`](scripts/onboarding/). By hand:
+
 1. Enable `mcp: true` under `@harperfast/agent-memory` in your Harper app's `config.yaml`.
 2. Add the marketplace and install the plugin in Claude Code:
 
    ```text
    /plugin marketplace add HarperFast/agent-memory
-   /plugin install agent-memory --marketplace HarperFast/agent-memory
+   /plugin install agent-memory@agent-memory
    ```
 
 3. Set `AGENT_MEMORY_URL` in your shell or Claude Code `settings.json` `env` block (so `.mcp.json` can
@@ -374,6 +378,13 @@ npm run test:integration    # boots Harper with the fixture and exercises the HT
    unit and integration tests, and publishes the tested tarball to npm with provenance through trusted
    publishing (no token). Prerelease versions (`0.2.0-beta.1`) publish to the `next` dist-tag; others to
    `latest`.
+
+The Claude Code plugin is not part of this release. Its manifests (`claude-plugin/.claude-plugin/plugin.json` and the
+entry in `.claude-plugin/marketplace.json`) carry no `version`, so Claude Code versions the plugin by this
+repository's commit: every commit to `main` is a plugin release, which `claude plugin update` delivers. Keep `main`'s
+plugin working. A `version` in either manifest would pin every install to it until the string changed, which is how
+installs stayed on 0.1.0 code through two releases; a unit test (`test/plugin-manifest.test.js`) fails if one is
+added.
 
 npm trusted publishing is configured per package on npmjs.com, so a package that does not exist yet cannot use
 it. Bootstrap:

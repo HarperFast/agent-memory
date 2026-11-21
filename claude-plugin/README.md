@@ -4,12 +4,22 @@ Integrates Harper `agent-memory` with Claude Code via remote HTTP MCP (`/mcp`), 
 
 ## Installation
 
-Add the `HarperFast/agent-memory` marketplace and install the plugin:
+For the whole path (provisioning a user, installing into each Claude profile and Codex, verifying, updating and
+rolling back), follow [docs/onboarding.md](../docs/onboarding.md). By hand, add the `HarperFast/agent-memory`
+marketplace and install the plugin:
 
 ```text
 /plugin marketplace add HarperFast/agent-memory
-/plugin install agent-memory --marketplace HarperFast/agent-memory
+/plugin install agent-memory@agent-memory
 ```
+
+## Updates
+
+The plugin has no fixed version: Claude Code versions it by the repository's commit, so every commit to `main` is a
+new version. Bring an install up to date with
+`claude plugin marketplace update agent-memory && claude plugin update agent-memory@agent-memory`, or turn on
+auto-update for the marketplace in `/plugin` (off by default for third-party marketplaces). New sessions load the
+update; a running session keeps the version it started with.
 
 ## Server Requirement
 
