@@ -129,7 +129,7 @@ function grantRowEmpty(row) {
  * - `delegatesOf(principal)` → async iterable of the principal's ProvisionedUser rows (committed)
  * - `hasInboundDelegation(username)` → whether any ScopeGrant user row acts for `username`
  * - `withNameLock(usernames, fn)`: runs `fn(tx)` in one transaction holding each name's lock; `tx` has `getRecord`,
- *   `putRecord`, `deleteRecord`, `getGrantRow`, `putGrantRow` and `deleteGrantRow`
+ *   `putRecord`, `deleteRecord`, `getGrantRow` and `putGrantRow`
  */
 function createProvisioning(store) {
 	async function requireManaged(username) {
@@ -275,7 +275,11 @@ function createProvisioning(store) {
 			const record = await store.getRecord(principal);
 			const delegates = [];
 			for await (const delegate of liveDelegates(principal)) delegates.push(delegate);
-			const managed = manageable(user, record) && !(await groupMixed(principal, user, record));
+			const mixed =
+				record?.machine == null
+					? delegates.some((delegate) => delegate.actsFor && delegate.role !== user.role)
+					: await groupMixed(principal, user, record);
+			const managed = manageable(user, record) && !mixed;
 			return { exists: true, managed, role: assignable(user.role), delegates };
 		},
 
@@ -448,7 +452,6 @@ function harperStore(user) {
 					deleteRecord: (id) => ProvisionedUser.delete(id, context),
 					getGrantRow: async (id) => (await ScopeGrant.get(grantId(id), context)) ?? undefined,
 					putGrantRow: ({ username: id, ...row }) => ScopeGrant.put({ ...row, id: grantId(id) }, context),
-					deleteGrantRow: (id) => ScopeGrant.delete(grantId(id), context),
 				});
 			});
 		},

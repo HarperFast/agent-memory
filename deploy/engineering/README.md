@@ -94,7 +94,8 @@ does not share or edit the person's private memories.
   at once can each answer, with only the later password live, so send them one at a time.
 - **Errors** are `{ error, code }`. Branch on `code`, since several share a status: `user_exists`, `in_progress`
   (another request is creating that name; retry after a minute), `grant_row_exists` and `inbound_delegation` (an
-  admin must clean up first), `user_changed` (an admin changed the user mid-request; nothing was issued),
+  admin must clean up first), `user_changed` (the user changed mid-request, or a competing rotation won: no
+  password is returned, though the user may now exist or its old password be dead; rotate again),
   `not_managed`, `user_inactive`, `role_not_assignable`, `too_many_delegates` (16 machines per person),
   `mixed_delegation` (an admin's role change left a machine user acting for a person of another role),
   `reserved_name`, plus 400s for malformed input. A 500 carries a `ref` that matches the server log line. A create

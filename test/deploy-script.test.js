@@ -133,7 +133,6 @@ const operationsLogged = (log) =>
 
 describe('deploy/engineering/provision-user.sh roles, targets and delegation', () => {
 	let stubs;
-	let work;
 	before(() => {
 		stubs = clusterStubs();
 	});
@@ -146,7 +145,7 @@ describe('deploy/engineering/provision-user.sh roles, targets and delegation', (
 		{ username: 'pat@example.com', role: { role: 'eng-public' } },
 	]);
 	function provision(args) {
-		work = mkdtempSync(join(tmpdir(), 'provision-run-'));
+		const work = mkdtempSync(join(tmpdir(), 'provision-run-'));
 		const log = join(work, 'ops.log');
 		const result = run('engineering/provision-user.sh', args, {
 			PATH: `${stubs}:${process.env.PATH}`,
@@ -156,7 +155,9 @@ describe('deploy/engineering/provision-user.sh roles, targets and delegation', (
 			STUB_LOG: log,
 			STUB_USERS: users,
 		});
-		return { ...result, operations: operationsLogged(log), work };
+		const operations = operationsLogged(log);
+		rmSync(work, { recursive: true, force: true });
+		return { ...result, operations };
 	}
 
 	it('accepts eng-public and provisioner, and still refuses other roles', () => {

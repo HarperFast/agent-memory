@@ -60,7 +60,8 @@ operation() {
     [ \"\$(printf '%s\\n' \"\$C\" | grep -c .)\" = 1 ] || { echo need exactly one running container matching $QMATCH, got: \$C >&2; exit 1; }; \
     docker exec -i \"\$C\" curl -sS --unix-socket /home/harperdb/harper/operations-server http://localhost -H content-type:application/json -d @-")"
   # The SSH session banner can precede the response; the operation's JSON is the last line.
-  RESULT="$result" node -e 'const r=JSON.parse(process.env.RESULT.trim().split("\n").pop()); if (r.error) { console.error("cluster refused:", JSON.stringify(r)); process.exit(1); } process.stdout.write(JSON.stringify(r));'
+  # On stdin, not in the environment: Linux caps one environment string at 128 KiB, and list_users can exceed it.
+  printf '%s' "$result" | node -e 'const r=JSON.parse(require("fs").readFileSync(0,"utf8").trim().split("\n").pop()); if (r.error) { console.error("cluster refused:", JSON.stringify(r)); process.exit(1); } process.stdout.write(JSON.stringify(r));'
 }
 
 # A delegation group shares one private scope, which is never content-checked, so both members need the same
@@ -68,8 +69,8 @@ operation() {
 clearance() { case "$1" in eng|eng-agents) echo cleared;; eng-public|dispatch-worker|provisioner) echo public;; *) echo "role:$1";; esac; }
 if [ -n "$ACTS_FOR" ]; then
   USERS="$(printf '%s' '{"operation":"list_users"}' | operation)"
-  PRINCIPAL_ROLE="$(USERS="$USERS" NAME="$ACTS_FOR" node -e '
-const u=JSON.parse(process.env.USERS).find((x)=>x.username===process.env.NAME); process.stdout.write(u ? String(u.role?.role ?? "") : "-");')"
+  PRINCIPAL_ROLE="$(printf '%s' "$USERS" | NAME="$ACTS_FOR" node -e '
+const u=JSON.parse(require("fs").readFileSync(0,"utf8")).find((x)=>x.username===process.env.NAME); process.stdout.write(u ? String(u.role?.role ?? "") : "-");')"
   [ "$PRINCIPAL_ROLE" != - ] || { echo "--acts-for user $ACTS_FOR does not exist" >&2; exit 1; }
   if [ "$(clearance "$ROLE")" != "$(clearance "$PRINCIPAL_ROLE")" ]; then
     echo "a $ROLE user cannot act for a ${PRINCIPAL_ROLE:-roleless} user: a delegation group never mixes customer clearance (leave --acts-for off for a standalone user)" >&2

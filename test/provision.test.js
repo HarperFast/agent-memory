@@ -70,7 +70,6 @@ function fakeStore({ users = {}, records = {}, grants = {} } = {}) {
 				deleteRecord: async (id) => records.delete(id),
 				getGrantRow: async (id) => grants.get(id),
 				putGrantRow: async ({ username, ...row }) => grants.set(username, row),
-				deleteGrantRow: async (id) => grants.delete(id),
 			});
 			state.records = records;
 			state.grants = grants;
