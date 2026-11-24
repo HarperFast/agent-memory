@@ -22,16 +22,16 @@ resource calls `server.operation` with authorization off, after its own checks.
   record lock (`getLockScope()`), then runs `add_user`, then writes a delegate's `actsFor` row under the principal's
   lock after re-reading the principal's role. A crash after `add_user` leaves a managed user its owner can rotate,
   at worst without `actsFor`, which grants less. A crash before leaves a reservation that a retry takes over after
-  `RESERVATION_TTL_MS`. A 409 from `add_user` releases a reservation still carrying this request's `createdAt`
-  unless it took over an earlier one (the user that exists is most likely that request's); a failed `add_user` that
-  made no user releases it too. Nothing deletes a user, which could delete one an admin made under the same name.
+  `RESERVATION_TTL_MS`. A failed `add_user` releases a fresh reservation still carrying this request's `createdAt`
+  when the failure is a 409 or no user exists; one it took over stays, since the earlier request may yet create, or
+  already created, its user. Nothing deletes a user, which could delete one an admin made under the same name.
   Left open, as admin-side (below): a crash before `add_user` followed by an admin creating that name leaves the
   admin's user managed, and a rotate writes by username, so it can overwrite an admin's concurrent reset.
 - **Machine users are admitted under the principal's lock.** addDelegate locks the principal and the machine name,
   re-reads the principal's role there, and counts machine users that exist or are still being created
   (`countMachines`) against `MAX_DELEGATES`, so concurrent requests cannot exceed it or act on a stale role.
-- **A new user inherits no grants.** `grantRowReusable` refuses a leftover `user:<name>` row with grants, or with an
-  `actsFor` other than the delegate's own principal. `hasInboundDelegation` refuses a name that some user
+- **A new user inherits no grants.** `grantRowEmpty` refuses a leftover `user:<name>` row with grants or an
+  `actsFor`, which would apply the moment the user exists. `hasInboundDelegation` refuses a name that some user
   still acts for.
 - **A delegation group never mixes clearance.** A delegate shares `user:<principal>`, and private memories are never
   content-checked (`src/quarantine.ts` `decideContentFlag`). So addDelegate sets `actsFor` only on a delegate of the

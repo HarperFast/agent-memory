@@ -98,7 +98,8 @@ does not share or edit the person's private memories.
   `not_managed`, `user_inactive`, `role_not_assignable`, `too_many_delegates` (16 machines per person),
   `mixed_delegation` (an admin's role change left a machine user acting for a person of another role),
   `reserved_name`, plus 400s for malformed input. A 500 carries a `ref` that matches the server log line. A create
-  or addDelegate that answered 500 after the user was made answers `user_exists` on retry; rotate recovers it.
+  or addDelegate that answered 500 after the user was made answers `user_exists` on retry; rotate recovers it. A
+  same-role machine user whose `actsFor` write failed that way stays standalone until an admin sets `actsFor`.
 - **Passwords** are 40 random characters, returned once, with `Cache-Control: no-store`, and never logged here.
   Nothing between Dispatch and this app may log response bodies. A rotate whose answer was lost is recovered by
   rotating again; the earlier password no longer works either way.

@@ -318,6 +318,19 @@ describe('create', () => {
 		assert.equal(state.records.has('kris@example.com'), false);
 	});
 
+	it('keeps a reservation it took over when its own add_user fails, since the earlier request may still create', async () => {
+		const staleAt = new Date(NOW - RESERVATION_TTL_MS - 1);
+		const { store, state } = fakeStore({
+			records: { 'kris@example.com': managed('kris@example.com', { createdAt: staleAt }) },
+		});
+		state.hooks.addUser = () => {
+			throw Object.assign(new Error('disk full'), { statusCode: 500 });
+		};
+		const response = await call(store, { body: { action: 'create', principal: 'kris@example.com', role: 'eng' } });
+		assert.equal(response.status, 500);
+		assert.equal(state.records.has('kris@example.com'), true);
+	});
+
 	it('keeps a reservation it took over when the earlier request creates the user first', async () => {
 		const staleAt = new Date(NOW - RESERVATION_TTL_MS - 1);
 		const { store, state } = fakeStore({
@@ -544,6 +557,7 @@ describe('addDelegate', () => {
 		}
 		assert.deepEqual(state.calls, []);
 		assert.equal((await call(store, { method: 'GET', path: `/${principal}` })).body.managed, false);
+		assert.equal((await call(store, { method: 'GET', path: `/${delegate}` })).body.managed, false);
 		state.grants.set(delegate, { actsFor: null });
 		assert.equal((await call(store, { body: { action: 'rotate', username: delegate } })).status, 200);
 	});
@@ -579,25 +593,29 @@ describe('addDelegate', () => {
 		assert.equal(response.body.code, 'invalid_machine');
 	});
 
-	it('reuses the grant row of its own interrupted attempt, and restores a row it overwrote on release', async () => {
+	it('refuses any leftover grant row on the machine name, even one naming the principal', async () => {
 		const delegate = `${principal}.laptop`;
-		const resumed = owned('eng', {
-			grants: { [delegate]: { actsFor: principal } },
-			records: { [principal]: managed(principal), [delegate]: managed(principal, { machine: 'laptop' }) },
-		});
 		const body = { action: 'addDelegate', principal, machine: 'laptop', role: 'eng' };
-		assert.equal((await call(resumed.store, { body })).status, 201);
+		for (const row of [{ actsFor: principal }, { actsFor: 'pat@example.com' }, { read: ['customer:*'] }]) {
+			const { store, state } = owned('eng', { grants: { [delegate]: row } });
+			const refused = await call(store, { body });
+			assert.equal(refused.status, 409, JSON.stringify(row));
+			assert.equal(refused.body.code, 'grant_row_exists');
+			assert.deepEqual(state.calls, []);
+		}
+	});
 
-		const raced = owned('eng', { grants: { [delegate]: { actsFor: principal } } });
-		raced.state.hooks.addUser = (name) => raced.state.users.set(name, { role: 'eng', active: true });
-		assert.equal((await call(raced.store, { body })).status, 409);
-		assert.equal(raced.state.records.has(delegate), false);
-		assert.deepEqual(raced.state.grants.get(delegate), { actsFor: principal });
-
-		const foreign = owned('eng', { grants: { [delegate]: { actsFor: 'pat@example.com' } } });
-		const refused = await call(foreign.store, { body });
-		assert.equal(refused.status, 409);
-		assert.equal(refused.body.code, 'grant_row_exists');
+	it('answers in_progress, not too_many_delegates, to a retry of a machine still being created', async () => {
+		const delegate = `${principal}.laptop`;
+		const { store, state } = owned('eng');
+		for (let i = 0; i < MAX_DELEGATES - 1; i++) {
+			state.users.set(`${principal}.m${i}`, { role: 'eng', active: true });
+			state.records.set(`${principal}.m${i}`, managed(principal, { username: `${principal}.m${i}`, machine: `m${i}` }));
+		}
+		state.records.set(delegate, managed(principal, { machine: 'laptop', createdAt: new Date(NOW - 1_000) }));
+		const response = await call(store, { body: { action: 'addDelegate', principal, machine: 'laptop', role: 'eng' } });
+		assert.equal(response.status, 409);
+		assert.equal(response.body.code, 'in_progress');
 	});
 });
 

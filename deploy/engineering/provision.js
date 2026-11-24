@@ -113,12 +113,9 @@ function parseBody(body) {
 const assignable = (role) => (ASSIGNABLE_ROLES.includes(role) ? role : null);
 const manageable = (user, record) => Boolean(record) && user.active && assignable(user.role) !== null;
 
-// Grants on a leftover row would pass to a new user of that name, and an actsFor naming anyone but the intended
-// principal would make it act for them.
-function grantRowReusable(row, actsFor) {
-	if (!row) return true;
-	if ((row.read?.length ?? 0) > 0 || (row.write?.length ?? 0) > 0) return false;
-	return row.actsFor == null || row.actsFor === actsFor;
+// Grants or an actsFor on a leftover row would pass to a new user of that name the moment it exists.
+function grantRowEmpty(row) {
+	return !row || ((row.read?.length ?? 0) === 0 && (row.write?.length ?? 0) === 0 && row.actsFor == null);
 }
 
 /**
@@ -162,11 +159,16 @@ function createProvisioning(store) {
 
 	// An admin role change can leave a delegate acting for a principal of another role; nothing more is issued in
 	// that group until an admin settles it (DESIGN.md).
-	const mixed = (delegates, principalRole) => delegates.some((d) => d.actsFor && d.role !== principalRole);
-	async function refuseMixedGroup(principal, principalRole) {
-		const delegates = [];
-		for await (const delegate of liveDelegates(principal)) delegates.push(delegate);
-		if (mixed(delegates, principalRole)) {
+	async function groupMixed(username, user, record) {
+		const principal = record?.machine == null ? username : record.principal;
+		const principalRole = principal === username ? user.role : (await store.getUser(principal))?.role;
+		for await (const delegate of liveDelegates(principal)) {
+			if (delegate.actsFor && delegate.role !== principalRole) return true;
+		}
+		return false;
+	}
+	async function refuseMixedGroup(username, user, record) {
+		if (await groupMixed(username, user, record)) {
 			throw fail(409, 'mixed_delegation', 'A machine user acts for a person of another role; an admin must settle it');
 		}
 	}
@@ -214,12 +216,6 @@ function createProvisioning(store) {
 		await stage('reserve', () =>
 			store.withNameLock(names, async (tx) => {
 				if (await store.getUser(username)) throw fail(409, 'user_exists', 'User already exists');
-				if (owner) {
-					await requirePrincipalRole(principal, owner.role);
-					if ((await countMachines(principal, time(createdAt))) >= MAX_DELEGATES) {
-						throw fail(409, 'too_many_delegates', `A person has at most ${MAX_DELEGATES} machine users`);
-					}
-				}
 				const reservation = await tx.getRecord(username);
 				if (reservation) {
 					if (time(createdAt) - time(reservation.createdAt) < RESERVATION_TTL_MS) {
@@ -227,7 +223,13 @@ function createProvisioning(store) {
 					}
 					tookOver = true;
 				}
-				if (!grantRowReusable(await tx.getGrantRow(username), actsFor)) {
+				if (owner) {
+					await requirePrincipalRole(principal, owner.role);
+					if ((await countMachines(principal, time(createdAt))) >= MAX_DELEGATES) {
+						throw fail(409, 'too_many_delegates', `A person has at most ${MAX_DELEGATES} machine users`);
+					}
+				}
+				if (!grantRowEmpty(await tx.getGrantRow(username))) {
 					throw fail(409, 'grant_row_exists', 'A ScopeGrant row for this name already exists; an admin must remove it');
 				}
 				if (await store.hasInboundDelegation(username)) {
@@ -240,10 +242,10 @@ function createProvisioning(store) {
 		try {
 			await stage('add_user', () => store.addUser(username, password, role));
 		} catch (error) {
-			// A 409 means another writer made the user: after a takeover most likely the earlier request, whose record
-			// stays. Any other failure may still have made this request's user, whose record stays too.
+			// A reservation taken over stays: the earlier request may yet create, or already created, its user. A fresh
+			// one goes unless a failed add_user may still have made this request's user.
 			const duplicate = error instanceof ProvisionError && error.code === 'user_exists';
-			if (duplicate ? !tookOver : !(await store.getUser(username))) {
+			if (!tookOver && (duplicate || !(await store.getUser(username)))) {
 				await stage('release', () =>
 					store.withNameLock([username], async (tx) => {
 						const reservation = await tx.getRecord(username);
@@ -273,7 +275,7 @@ function createProvisioning(store) {
 			const record = await store.getRecord(principal);
 			const delegates = [];
 			for await (const delegate of liveDelegates(principal)) delegates.push(delegate);
-			const managed = manageable(user, record) && !mixed(delegates, user.role);
+			const managed = manageable(user, record) && !(await groupMixed(principal, user, record));
 			return { exists: true, managed, role: assignable(user.role), delegates };
 		},
 
@@ -291,7 +293,7 @@ function createProvisioning(store) {
 			const username = delegateName(principal, machine);
 			const owner = await requireManaged(principal);
 			if (owner.record.machine != null) throw fail(400, 'not_a_principal', 'principal is itself a delegate');
-			await refuseMixedGroup(principal, owner.user.role);
+			await refuseMixedGroup(principal, owner.user, owner.record);
 			// A delegate shares the principal's private scope, which is never content-checked, so only a delegate of
 			// the principal's own role acts for it; any other is a standalone user (DESIGN.md).
 			const actsFor = role === owner.user.role ? principal : null;
@@ -302,9 +304,7 @@ function createProvisioning(store) {
 		async rotate(body) {
 			const username = parseUsername(body.username);
 			const { user, record } = await requireManaged(username);
-			const principal = record.machine == null ? username : record.principal;
-			const principalRole = principal === username ? user.role : (await store.getUser(principal))?.role;
-			await refuseMixedGroup(principal, principalRole);
+			await refuseMixedGroup(username, user, record);
 			const password = generatePassword();
 			await stage('set_password', () => store.setPassword(username, password));
 			await confirmIssued(username, password, user.role);
