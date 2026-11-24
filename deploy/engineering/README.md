@@ -85,7 +85,8 @@ does not share or edit the person's private memories.
 | `POST /Provision/` `{ "action": "rotate", "username": <managed user> }`           | `200 { username, password }`; every machine using the old password must take the new one        |
 
 - **Who may call.** Only role `provisioner` (or a `super_user`): 401 without credentials, 403 for every other role.
-  Other methods answer 405. The resource is hidden from MCP and OpenAPI.
+  `HEAD` is answered as `GET`, Harper answers `OPTIONS` itself, and every other method or stream gets 405. The
+  resource is hidden from MCP and OpenAPI.
 - **What it changes.** It assigns only `eng` and `eng-public`, and creates only names that do not exist. It rotates
   and adds machine users only for users it created, still active and still holding one of those roles; `managed`
   in the GET answer says exactly that. A rotate writes by username, so one that lands with an admin's reset of the
