@@ -99,7 +99,8 @@ authentication of its own and has no credential tables.
   [HarperFast/oauth#279](https://github.com/HarperFast/oauth/issues/279)). Until that lands, MCP clients
   against `/mcp` authenticate with Harper credentials or a host-app middleware / principal resolver.
 - Headless agents use Harper credentials bound to a user (operation tokens, or a host-app API key that
-  resolves to a user).
+  resolves to a user). The engineering deployment issues them itself, to a provisioner-only caller
+  ([deploy/engineering/DESIGN.md](deploy/engineering/DESIGN.md)); the plugin has no part in it.
 - An app with its own principal registry (harper-eye's `AgentPrincipal`) can install a resolver with
   `setPrincipalResolver((context, next) => …)` that returns `{ id, grants: { read, write }, superUser?,
 source? }`, or `undefined` for unauthenticated. `next()` is the default Harper-user resolution, so a

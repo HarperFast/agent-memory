@@ -1,0 +1,12 @@
+# Users the Provision resource created (provision.js). Rotate and addDelegate act only on users with a row here; an
+# admin adopts an existing user by upserting one. In the plugin's database so a delegate's ScopeGrant row commits
+# with its row and both replicate alike. Not exported: only provision.js reads and writes it.
+type ProvisionedUser @table(database: "memory") @sealed {
+	username: ID @primaryKey
+	# The person: the username itself for a principal, the person it acts for for a delegate.
+	principal: String @indexed
+	# A delegate's machine label; null for a principal.
+	machine: String
+	createdAt: Date
+	createdBy: String
+}

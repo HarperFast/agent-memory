@@ -1,7 +1,7 @@
 # Onboarding: agent-memory in Claude Code and Codex
 
 This guide takes an engineer from nothing to Claude Code (and optionally Codex) sessions that bootstrap from,
-recall from and write to a team's agent-memory server. It covers each step in order: provision a user, install
+recall from and write to a team's agent-memory server. It covers each step in order: get credentials, install
 into each Claude profile, add Codex, verify, then update, roll back or uninstall.
 
 You need Node.js 22 or later and the `claude` CLI on `PATH`, plus a clone of this repository, where the scripts
@@ -15,9 +15,44 @@ Every script reads the server's URL and your credential from `~/.config/agent-me
 `AGENT_MEMORY_ENV_FILE` to use another path. No script takes a host, URL or password as an argument, and none
 prints the token.
 
-## 1. Provision a user (admin)
+## 1. Get credentials
 
-An admin with SSH access to a cluster node creates the user with
+### Self-serve (Dispatch)
+
+Open Dispatch's **Connect agent-memory** page and sign in with GitHub. (If your Dispatch has no such page yet, use
+the admin route below.) Your username is your verified company email. Your role is one of two:
+
+- `eng` if your agents run on a company AI plan. Reads and writes `global` and `customer:*` memories.
+- `eng-public` if they run on an individual (non-company) AI plan. Public only: it never receives a `customer:*`
+  memory, nor a `global` one flagged as possible customer detail. Like every `global` reader, it still sees customer
+  detail that someone put in `global` and the check missed, so keep customer detail under `customer:` labels.
+
+The page shows your password once, as the contents of the credential file. Save it as `~/.config/agent-memory/env`,
+readable only by you (`chmod 600`):
+
+```sh
+AGENT_MEMORY_URL=https://memory.example.com
+AGENT_MEMORY_TOKEN=Basic <base64 user:password>
+AGENT_MEMORY_USER=<username>
+```
+
+Give each machine its own credential: **add a machine** with a label (lowercase letters, digits and `-`, up to 32).
+That creates `<email>.<label>`, which can be rotated without touching your other machines. A machine with your role
+acts for you: it can correct your memories and shares your private ones. A machine with the other role, such as an
+`eng-public` machine for an `eng` person, is a standalone user: it does not share or edit your private memories, so
+customer detail you keep there never reaches an individual-plan agent.
+
+**Rotate** issues a new password for your user or one machine. The old password stops working at once, so every
+machine using it is logged out (401) until it gets the new file. Then rerun `install-codex.sh` on any machine with
+Codex, which keeps its own copy of the credential. Claude profiles read the env file directly and need nothing.
+
+If the page says your user exists but self-serve does not manage it, an admin created it before. Ask an admin to
+adopt it ([`deploy/engineering/README.md`](../deploy/engineering/README.md#self-serve-provisioning)), or to rotate
+it for you with the admin route below.
+
+### Admin route (`provision-user.sh`)
+
+An admin with SSH access to a cluster node can create any user with
 [`deploy/engineering/provision-user.sh`](../deploy/engineering/provision-user.sh). The script generates a
 password, sends it to the cluster on stdin, and writes the credential file straight onto the target machine with
 mode 0600. The password is never printed. The cluster comes from the environment, never from the repository
@@ -28,11 +63,11 @@ export AGENT_MEMORY_DEPLOY_HOST=<ssh host of one node>
 export AGENT_MEMORY_CONTAINER_MATCH=<substring of the agent-memory container name>
 export AGENT_MEMORY_URL=<cluster base URL>
 
-# The person: role eng.
+# The person: role eng, or eng-public for agents on an individual AI plan.
 deploy/engineering/provision-user.sh <person> eng <target>
 
-# Their agents: role eng-agents, acting for the person, so the agents can correct the person's memories and
-# share user:<person>.
+# Their agents: role eng-agents (eng-public for an eng-public person), acting for the person, so the agents can
+# correct the person's memories and share user:<person>.
 deploy/engineering/provision-user.sh <person>-agents eng-agents <target> --acts-for <person>
 ```
 
@@ -40,23 +75,19 @@ deploy/engineering/provision-user.sh <person>-agents eng-agents <target> --acts-
 
 - `local` writes this machine's `~/.config/agent-memory/env`.
 - `ssh:<user@host>` writes the file on that machine.
+- `file:<path>` writes that file on this machine, for a credential that goes on to another system.
 - `none` creates the user without writing credentials anywhere. Rerun with `--rotate` later to issue some.
 
+`--acts-for` refuses a pair whose customer clearance differs (`eng` and `eng-agents` are cleared; `eng-public` and
+`dispatch-worker` are not): the pair would share one private scope, and private memories are never checked for
+customer detail. Leave `--acts-for` off to make such a machine user standalone.
+
 A machine has one env file, so its sessions act as whoever's credentials are in it. On a machine where Claude
-Code or Codex works on someone's behalf, write the `eng-agents` user's credentials there, and keep the person's
-own `eng` credentials for where they authenticate themselves.
-
-The file looks like this:
-
-```sh
-AGENT_MEMORY_URL=https://memory.example.com
-AGENT_MEMORY_TOKEN=Basic <base64 user:password>
-AGENT_MEMORY_USER=<username>
-```
+Code or Codex works on someone's behalf, write the agent user's credentials there, and keep the person's own
+credentials for where they authenticate themselves.
 
 To revoke delegation, upsert `actsFor: null` on the agent user's `ScopeGrant` row. To issue a new password, rerun
-with `--rotate`, then rerun `install-codex.sh` on that machine: Codex keeps its own copy of the credential in
-`config.toml`. Claude profiles read the env file directly and need nothing.
+with `--rotate`, then rerun `install-codex.sh` on that machine.
 
 ## 2. Install into each Claude profile
 
@@ -143,7 +174,7 @@ It exits non-zero unless session start got an answer from the server and recall 
 | `disabled` (recall)                           | Recall is switched off (`AGENT_MEMORY_RECALL=off`). Accepted.                             |
 | `skipped`                                     | The hook did not ask; for recall, the test prompt had no distinctive term. Use another.   |
 | `unconfigured (<reason>)`                     | The env file is missing, or has no valid URL or token. Fix it, or provision again.        |
-| `http_401`, `http_403`                        | The server refused the credential. Ask the admin to rotate it or check the user's role.   |
+| `http_401`, `http_403`                        | The server refused the credential. Rotate it on the Dispatch page, or ask an admin.       |
 | `timeout`, `error`, `hook_timeout`            | The URL is wrong, or the server is unreachable from this machine.                         |
 | `hook_failed`, `bad_output`                   | The hook process itself failed: check that `node` is version 22 or later.                 |
 | `no_diagnostics`                              | The install predates the plugin's diagnostics log. Update it ([below](#5-update)).        |

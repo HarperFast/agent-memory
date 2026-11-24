@@ -1,0 +1,10 @@
+rest: true
+
+graphqlSchema:
+  files: 'schema.graphql'
+
+jsResource:
+  files: 'resources.js'
+
+'@harperfast/agent-memory':
+  package: '@harperfast/agent-memory'

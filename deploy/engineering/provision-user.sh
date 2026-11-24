@@ -6,12 +6,16 @@
 # Usage:
 #   AGENT_MEMORY_DEPLOY_HOST=<ssh host> AGENT_MEMORY_CONTAINER_MATCH=<container name substring> \
 #   AGENT_MEMORY_URL=<cluster base URL> provision-user.sh <username> <role> <target> [--rotate] [--acts-for <user>]
-#     role    eng | eng-agents | dispatch-worker
+#     role    eng | eng-public | eng-agents | dispatch-worker | provisioner
 #     target  local            -> ~/.config/agent-memory/env on this machine
 #             ssh:<user@host>  -> ~/.config/agent-memory/env on that machine
+#             file:<path>      -> that file on this machine, replaced whole with mode 0600 (for a credential that
+#                                 goes on to another system, such as the provisioner's)
 #             none             -> create the user without writing credentials anywhere
 #     --acts-for  upsert actsFor onto the user's ScopeGrant row "user:<username>", so this agent user acts for
-#                 that user (DESIGN.md Identity › Delegation). The upsert keeps any read/write the row has.
+#                 that user (DESIGN.md Identity › Delegation). The upsert keeps any read/write the row has. That user
+#                 must exist and hold the same customer clearance (eng and eng-agents are cleared; eng-public,
+#                 dispatch-worker and provisioner are not).
 #   The cluster is never defaulted (this repo is public). AGENT_MEMORY_URL is the base URL written into the
 #   credentials file, so it is only needed when target is not none.
 set -euo pipefail
@@ -24,9 +28,9 @@ while [ $# -gt 0 ]; do
     *) echo "unknown option $1" >&2; exit 2;;
   esac
 done
-case "$ROLE" in eng|eng-agents|dispatch-worker) ;; *) echo "unknown role $ROLE" >&2; exit 2;; esac
+case "$ROLE" in eng|eng-public|eng-agents|dispatch-worker|provisioner) ;; *) echo "unknown role $ROLE" >&2; exit 2;; esac
 [[ "$USERNAME" =~ ^[A-Za-z0-9._@-]{1,122}$ ]] || { echo "invalid username" >&2; exit 2; }
-case "$TARGET" in local|none|ssh:?*) ;; *) echo "unknown target $TARGET" >&2; exit 2;; esac
+case "$TARGET" in local|none|ssh:?*|file:?*) ;; *) echo "unknown target $TARGET" >&2; exit 2;; esac
 [ -z "$ACTS_FOR" ] || [[ "$ACTS_FOR" =~ ^[A-Za-z0-9._@-]{1,122}$ && "$ACTS_FOR" != "$USERNAME" ]] || { echo "invalid --acts-for" >&2; exit 2; }
 HOST="${AGENT_MEMORY_DEPLOY_HOST:?set AGENT_MEMORY_DEPLOY_HOST to the SSH host of one cluster node}"
 MATCH="${AGENT_MEMORY_CONTAINER_MATCH:?set AGENT_MEMORY_CONTAINER_MATCH to a substring of the container name}"
@@ -34,7 +38,13 @@ MATCH="${AGENT_MEMORY_CONTAINER_MATCH:?set AGENT_MEMORY_CONTAINER_MATCH to a sub
 URL="${AGENT_MEMORY_URL:-}"
 
 # Checked before the cluster changes: a rotation whose credentials cannot be delivered loses the password.
-case "$TARGET" in ssh:*) ssh -o ProxyJump=none "${TARGET#ssh:}" true || { echo "cannot reach ${TARGET#ssh:}" >&2; exit 1; };; esac
+case "$TARGET" in
+  ssh:*) ssh -o ProxyJump=none "${TARGET#ssh:}" true || { echo "cannot reach ${TARGET#ssh:}" >&2; exit 1; };;
+  file:*) DEST="${TARGET#file:}"; DEST_DIR="$(dirname -- "$DEST")"
+    case "$DEST" in */) echo "$DEST names a directory; name the file to write" >&2; exit 1;; esac
+    [ ! -d "$DEST" ] || { echo "$DEST is a directory; name the file to write" >&2; exit 1; }
+    [ -d "$DEST_DIR" ] && [ -w "$DEST_DIR" ] || { echo "cannot write to $DEST_DIR" >&2; exit 1; };;
+esac
 
 PASS="$(openssl rand -base64 33 | tr -d '\n/+=' | cut -c1-40)"
 OP=add_user; [ "$MODE" = "--rotate" ] && OP=alter_user
@@ -50,9 +60,25 @@ operation() {
     [ \"\$(printf '%s\\n' \"\$C\" | grep -c .)\" = 1 ] || { echo need exactly one running container matching $QMATCH, got: \$C >&2; exit 1; }; \
     docker exec -i \"\$C\" curl -sS --unix-socket /home/harperdb/harper/operations-server http://localhost -H content-type:application/json -d @-")"
   # The SSH session banner can precede the response; the operation's JSON is the last line.
-  RESULT="$result" node -e 'const r=JSON.parse(process.env.RESULT.trim().split("\n").pop()); if (r.error) { console.error("cluster refused:", JSON.stringify(r)); process.exit(1); }'
+  # On stdin, not in the environment: Linux caps one environment string at 128 KiB, and list_users can exceed it.
+  printf '%s' "$result" | node -e 'const r=JSON.parse(require("fs").readFileSync(0,"utf8").trim().split("\n").pop()); if (r.error) { console.error("cluster refused:", JSON.stringify(r)); process.exit(1); } process.stdout.write(JSON.stringify(r));'
 }
-printf '%s' "$BODY" | operation
+
+# A delegation group shares one private scope, which is never content-checked, so both members need the same
+# clearance (deploy/engineering/DESIGN.md). A role outside these lists pairs only with itself.
+clearance() { case "$1" in eng|eng-agents) echo cleared;; eng-public|dispatch-worker|provisioner) echo public;; *) echo "role:$1";; esac; }
+if [ -n "$ACTS_FOR" ]; then
+  USERS="$(printf '%s' '{"operation":"list_users"}' | operation)"
+  PRINCIPAL_ROLE="$(printf '%s' "$USERS" | NAME="$ACTS_FOR" node -e '
+const u=JSON.parse(require("fs").readFileSync(0,"utf8")).find((x)=>x.username===process.env.NAME); process.stdout.write(u ? String(u.role?.role ?? "") : "-");')"
+  [ "$PRINCIPAL_ROLE" != - ] || { echo "--acts-for user $ACTS_FOR does not exist" >&2; exit 1; }
+  if [ "$(clearance "$ROLE")" != "$(clearance "$PRINCIPAL_ROLE")" ]; then
+    echo "a $ROLE user cannot act for a ${PRINCIPAL_ROLE:-roleless} user: a delegation group never mixes customer clearance (leave --acts-for off for a standalone user)" >&2
+    exit 1
+  fi
+fi
+
+printf '%s' "$BODY" | operation >/dev/null
 echo "user $USERNAME ($ROLE): ${OP} ok"
 
 if [ "$TARGET" != none ]; then
@@ -61,9 +87,18 @@ if [ "$TARGET" != none ]; then
 AGENT_MEMORY_TOKEN=$TOKEN
 AGENT_MEMORY_USER=$USERNAME"
   WRITE='umask 077; mkdir -p ~/.config/agent-memory; cat > ~/.config/agent-memory/env; chmod 600 ~/.config/agent-memory/env'
-  if [ "$TARGET" = local ]; then printf '%s\n' "$ENV_CONTENT" | bash -c "$WRITE"
-  else printf '%s\n' "$ENV_CONTENT" | ssh -o ProxyJump=none "${TARGET#ssh:}" "$WRITE"; fi
-  echo "credentials written to ~/.config/agent-memory/env on $TARGET"
+  case "$TARGET" in
+    local) printf '%s\n' "$ENV_CONTENT" | bash -c "$WRITE";;
+    ssh:*) printf '%s\n' "$ENV_CONTENT" | ssh -o ProxyJump=none "${TARGET#ssh:}" "$WRITE";;
+    # mktemp creates the file 0600, and the rename never leaves a readable partial file at the destination.
+    file:*) TMP="$(mktemp "$DEST_DIR/.agent-memory-env.XXXXXX")"; trap 'rm -f -- "$TMP"' EXIT
+      printf '%s\n' "$ENV_CONTENT" >"$TMP"; mv -f -- "$TMP" "$DEST"
+      [ ! -d "$DEST" ] || { echo "$DEST became a directory; the credentials are in $DEST/${TMP##*/}" >&2; exit 1; };;
+  esac
+  case "$TARGET" in
+    file:*) echo "credentials written to $DEST";;
+    *) echo "credentials written to ~/.config/agent-memory/env on $TARGET";;
+  esac
 fi
 
 # After the credentials are delivered: a failure here leaves a working user, never a lost password.
@@ -71,6 +106,6 @@ if [ -n "$ACTS_FOR" ]; then
   USERNAME="$USERNAME" ACTS_FOR="$ACTS_FOR" node -e '
 const e=process.env;
 process.stdout.write(JSON.stringify({operation:"upsert", database:"memory", table:"ScopeGrant",
-  records:[{id:"user:"+e.USERNAME, actsFor:e.ACTS_FOR}]}));' | operation
+  records:[{id:"user:"+e.USERNAME, actsFor:e.ACTS_FOR}]}));' | operation >/dev/null
   echo "user $USERNAME acts for $ACTS_FOR"
 fi

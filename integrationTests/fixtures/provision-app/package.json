@@ -1,0 +1,6 @@
+{
+	"name": "agent-memory-provision-fixture",
+	"private": true,
+	"type": "module",
+	"description": "Integration-test host app for deploy/engineering's Provision resource: provision.js and schema.graphql are symlinks to the shipped files."
+}
