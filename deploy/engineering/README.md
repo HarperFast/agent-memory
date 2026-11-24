@@ -61,8 +61,8 @@ content, so take care with them:
 - Changing a person's role, most often `eng-public` to `eng` when they move to a company plan: their machine users
   keep `actsFor`. Clear it (`actsFor: null`) on each machine user whose role now differs, or change those roles
   too. `GET /Provision/<email>` shows each machine user's role and `actsFor`.
-- Changing a user's role to `eng-public`: the user keeps reading what it owns, customer memories included. Create a
-  fresh user instead, or withdraw those memories first.
+- Changing a user's role to `eng-public`: the user keeps reading what it owns, customer memories included, and
+  withdrawing them does not stop an owner reading them. Create a fresh user instead.
 - Dropping a user: its memories and any `actsFor` naming it stay, and a later user of the same name inherits both.
   Drop its machine users with it (self-serve refuses to recreate a name that something still acts for), and delete
   its `memory.ProvisionedUser` rows, or self-serve could rotate a later user of that name.
@@ -90,19 +90,22 @@ does not share or edit the person's private memories.
 - **What it changes.** It assigns only `eng` and `eng-public`, and creates only names that do not exist. It rotates
   and adds machine users only for users it created, still active and still holding one of those roles; `managed`
   in the GET answer says exactly that. A rotate writes by username, so one that lands with an admin's reset of the
-  same user can overwrite it; nothing is returned for a user an admin changed mid-request.
+  same user can overwrite it; nothing is returned for a user an admin changed mid-request. Two rotations of one user
+  at once can each answer, with only the later password live, so send them one at a time.
 - **Errors** are `{ error, code }`. Branch on `code`, since several share a status: `user_exists`, `in_progress`
   (another request is creating that name; retry after a minute), `grant_row_exists` and `inbound_delegation` (an
   admin must clean up first), `user_changed` (an admin changed the user mid-request; nothing was issued),
   `not_managed`, `user_inactive`, `role_not_assignable`, `too_many_delegates` (16 machines per person),
-  `reserved_name`, plus 400s for malformed input. A 500 carries a `ref` that matches the server log line.
+  `reserved_name`, plus 400s for malformed input. A 500 carries a `ref` that matches the server log line. A create
+  or addDelegate that answered 500 after the user was made answers `user_exists` on retry; rotate recovers it.
 - **Passwords** are 40 random characters, returned once, with `Cache-Control: no-store`, and never logged here.
   Nothing between Dispatch and this app may log response bodies. A rotate whose answer was lost is recovered by
   rotating again; the earlier password no longer works either way.
 
 **Trust.** The provisioner can create a customer-cleared (`eng`) user for any new email. Dispatch decides who gets
 one: it must act only for a signed-in person (not a worker token), take the email from the identity provider's
-verified company address (lowercased; the resource refuses capitals), and choose the role server-side.
+verified company address (lowercased; the resource refuses capitals), choose the role server-side, and send every
+action only for that email or one of its `<email>.<machine>` names: the resource cannot tell whose request it is.
 
 ### Setup (admin, once, after the deploy)
 

@@ -78,8 +78,9 @@ deploy/engineering/provision-user.sh <person>-agents eng-agents <target> --acts-
 - `file:<path>` writes that file on this machine, for a credential that goes on to another system.
 - `none` creates the user without writing credentials anywhere. Rerun with `--rotate` later to issue some.
 
-`--acts-for` refuses to pair `eng-public` with any other role: the pair would share one private scope, and private
-memories are never checked for customer detail. Leave `--acts-for` off to make such a machine user standalone.
+`--acts-for` refuses a pair whose customer clearance differs (`eng` and `eng-agents` are cleared; `eng-public` and
+`dispatch-worker` are not): the pair would share one private scope, and private memories are never checked for
+customer detail. Leave `--acts-for` off to make such a machine user standalone.
 
 A machine has one env file, so its sessions act as whoever's credentials are in it. On a machine where Claude
 Code or Codex works on someone's behalf, write the agent user's credentials there, and keep the person's own

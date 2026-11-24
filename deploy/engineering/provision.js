@@ -182,15 +182,12 @@ function createProvisioning(store) {
 		}
 	}
 
-	// A password is returned only while it authenticates the user it was meant for. A user an admin changed
-	// mid-request gets a password nobody holds; one whose password a competing request replaced is left alone.
+	// A password is returned only while it authenticates the user it was meant for. One that does not is simply
+	// dropped: nobody else ever held it, so no further write (which could clobber an admin's reset) is needed.
 	async function confirmIssued(username, password, role) {
 		const current = await stage('confirm', () => store.authenticate(username, password));
-		if (!current) throw userChanged();
 		const record = await store.getRecord(username);
-		if (current.active && current.role === role && record) return;
-		await stage('scramble', () => store.setPassword(username, generatePassword()));
-		throw userChanged();
+		if (!current?.active || current.role !== role || !record) throw userChanged();
 	}
 
 	// Reserve, then create, so that every crash point leaves state the flow recovers (DESIGN.md). `owner` is the
@@ -228,24 +225,34 @@ function createProvisioning(store) {
 				if (actsFor) await tx.putGrantRow({ username, actsFor });
 			}),
 		);
+		// Undoes this request's writes while they are still its own. After a takeover the record stays: the user that
+		// exists is most likely the earlier request's, but the grant row is put back to what that request left.
+		const release = () =>
+			stage('release', () =>
+				store.withNameLock([username], async (tx) => {
+					const reservation = await tx.getRecord(username);
+					if (!reservation || time(reservation.createdAt) !== time(createdAt)) return;
+					if (!tookOver) await tx.deleteRecord(username);
+					if (!actsFor) return;
+					if (previousGrant) await tx.putGrantRow({ ...previousGrant, username });
+					else await tx.deleteGrantRow(username);
+				}),
+			);
 		const password = generatePassword();
 		try {
 			await stage('add_user', () => store.addUser(username, password, role));
 		} catch (error) {
-			// After a takeover, the user that now exists is most likely the earlier request's, so its row stays.
-			if (error instanceof ProvisionError && error.code === 'user_exists' && !tookOver) {
-				await stage('release', () =>
-					store.withNameLock([username], async (tx) => {
-						const reservation = await tx.getRecord(username);
-						if (!reservation || time(reservation.createdAt) !== time(createdAt)) return;
-						await tx.deleteRecord(username);
-						if (!actsFor) return;
-						if (previousGrant) await tx.putGrantRow({ ...previousGrant, username });
-						else await tx.deleteGrantRow(username);
-					}),
-				);
-			}
+			const duplicate = error instanceof ProvisionError && error.code === 'user_exists';
+			// An add_user that failed for another reason may still have created the user; keep the record if so.
+			if (duplicate || !(await store.getUser(username))) await release();
 			throw error;
+		}
+		if (owner && actsFor) {
+			const current = await store.getUser(principal);
+			if (!current?.active || current.role !== owner.role) {
+				await stage('release', () => store.withNameLock([username], (tx) => tx.deleteGrantRow(username)));
+				throw userChanged();
+			}
 		}
 		await confirmIssued(username, password, role);
 		return { username, password };
@@ -361,7 +368,6 @@ export async function handleProvisionRequest(method, target, data, user, openSto
 	}
 }
 
-// `user` is the caller, recorded as the writes' author.
 function harperStore(user) {
 	const system = databases.system;
 	const { ProvisionedUser, ScopeGrant } = databases.memory;
@@ -438,11 +444,11 @@ function harperStore(user) {
 }
 
 export class Provision extends Resource {
-	// Kept out of MCP and OpenAPI.
 	static hidden = true;
 
+	// Harper leaves a GET, DELETE or stream request's body on `context.data`.
 	static get(target, context) {
-		return handleProvisionRequest('GET', target, undefined, context?.user, () => harperStore(context?.user));
+		return handleProvisionRequest('GET', target, context?.data, context?.user, () => harperStore(context?.user));
 	}
 
 	static post(target, data, context) {
@@ -458,7 +464,7 @@ export class Provision extends Resource {
 	}
 
 	static delete(target, context) {
-		return handleProvisionRequest('DELETE', target, undefined, context?.user, () => harperStore(context?.user));
+		return handleProvisionRequest('DELETE', target, context?.data, context?.user, () => harperStore(context?.user));
 	}
 
 	static async subscribe(_target, context) {
@@ -468,7 +474,7 @@ export class Provision extends Resource {
 
 	static async connect(target, incomingMessages, context) {
 		if (incomingMessages == null) {
-			return handleProvisionRequest('CONNECT', target, undefined, context?.user, () => harperStore(context?.user));
+			return handleProvisionRequest('CONNECT', target, context?.data, context?.user, () => harperStore(context?.user));
 		}
 		return this.subscribe(target, context);
 	}

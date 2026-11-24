@@ -137,7 +137,9 @@ describe('deploy/engineering/provision-user.sh roles, targets and delegation', (
 	before(() => {
 		stubs = clusterStubs();
 	});
-	after(() => rmSync(stubs, { recursive: true, force: true }));
+	after(() => {
+		if (stubs) rmSync(stubs, { recursive: true, force: true });
+	});
 
 	const users = JSON.stringify([
 		{ username: 'kris@example.com', role: { role: 'eng' } },
@@ -207,6 +209,10 @@ describe('deploy/engineering/provision-user.sh roles, targets and delegation', (
 			assert.match(directory.stderr, /is a directory/);
 			assert.deepEqual(directory.operations, []);
 			assert.deepEqual(readdirSync(dir), []);
+			const slash = provision(['dispatch-provisioner', 'provisioner', `file:${dir}/missing/`]);
+			assert.equal(slash.status, 1);
+			assert.match(slash.stderr, /names a directory/);
+			assert.deepEqual(slash.operations, []);
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
 		}

@@ -15,16 +15,18 @@ resource calls `server.operation` with authorization off, after its own checks.
   assignable role. The row, not the role, is the test, because admin-made engineers already hold `eng` under email
   usernames. An admin adopts a user by writing its row.
 - **A credential is returned only while it authenticates the intended user.** `confirmIssued` authenticates with
-  the new password and re-reads role and row. A user an admin changed mid-request (promoted, deactivated) gets a
-  fresh unreturned password and `user_changed`. A competing rotation's password is left alone.
+  the new password and re-reads role and row. For a user an admin changed mid-request (promoted, deactivated), or
+  whose password a competing request replaced, it answers `user_changed` and drops the password; nobody else ever
+  held it, so nothing more is written. A delegate's `actsFor` is dropped the same way if its principal's role
+  changed while the user was being created.
 - **No orphaned users.** `issue` commits the reservation (row, and a delegate's `actsFor` row) under the name's
   record lock (`getLockScope()`) before `add_user`. A crash after `add_user` leaves a managed user its owner can
   rotate. A crash before leaves a reservation that a retry takes over after `RESERVATION_TTL_MS`. A 409 from
-  `add_user` releases only a reservation this request made fresh and still carrying its `createdAt`: after a
-  takeover, the user that exists is most likely the earlier request's, so its row stays. Nothing deletes a user,
-  which could delete one an admin made under the same name. Left open: a crash before `add_user` followed by an
-  admin creating that name leaves the admin's user managed, and a rotate writes by username, so it can overwrite an
-  admin's concurrent reset (no credential is returned for a changed user either way).
+  `add_user` (or a failed one that made no user) releases a reservation still carrying this request's `createdAt`;
+  after a takeover only the grant row is put back, since the user that exists is most likely the earlier request's.
+  Nothing deletes a user, which could delete one an admin made under the same name. Left open, for want of a
+  conditional user operation in Harper: a crash before `add_user` followed by an admin creating that name leaves the
+  admin's user managed, and a rotate writes by username, so it can overwrite an admin's concurrent reset.
 - **Machine users are admitted under the principal's lock.** addDelegate locks the principal and the machine name,
   re-reads the principal's role there, and counts machine users that exist or are still being created
   (`countMachines`) against `MAX_DELEGATES`, so concurrent requests cannot exceed it or act on a stale role.

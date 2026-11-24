@@ -41,6 +41,7 @@ URL="${AGENT_MEMORY_URL:-}"
 case "$TARGET" in
   ssh:*) ssh -o ProxyJump=none "${TARGET#ssh:}" true || { echo "cannot reach ${TARGET#ssh:}" >&2; exit 1; };;
   file:*) DEST="${TARGET#file:}"; DEST_DIR="$(dirname -- "$DEST")"
+    case "$DEST" in */) echo "$DEST names a directory; name the file to write" >&2; exit 1;; esac
     [ ! -d "$DEST" ] || { echo "$DEST is a directory; name the file to write" >&2; exit 1; }
     [ -d "$DEST_DIR" ] && [ -w "$DEST_DIR" ] || { echo "cannot write to $DEST_DIR" >&2; exit 1; };;
 esac

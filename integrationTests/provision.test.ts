@@ -190,6 +190,15 @@ suite('deploy/engineering self-serve provisioning over HTTP', (ctx: ContextWithH
 		strictEqual(again.body.code, 'user_exists');
 		const adminMade = await provision({ action: 'create', principal: 'admin-made@example.com', role: 'eng-public' });
 		strictEqual(adminMade.status, 409);
+		// The reservation release relies on Harper answering a duplicate add_user with 409.
+		const duplicate = await operationAs(basic(ctx.harper.admin.username, ctx.harper.admin.password), {
+			operation: 'add_user',
+			username: 'pub@example.com',
+			password: PASSWORD,
+			role: 'eng',
+			active: true,
+		});
+		strictEqual(duplicate.status, 409, JSON.stringify(duplicate.body));
 
 		strictEqual(
 			(

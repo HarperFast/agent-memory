@@ -333,19 +333,28 @@ describe('create', () => {
 		assert.equal(state.records.has('kris@example.com'), true);
 	});
 
-	it('keeps its reservation when add_user fails for another reason, so the user stays recoverable', async () => {
-		const { store, state } = fakeStore();
-		state.hooks.addUser = () => {
+	it('releases its reservation when add_user fails without creating the user, and keeps it if the user exists', async () => {
+		const body = { action: 'create', principal: 'kris@example.com', role: 'eng' };
+		const failed = fakeStore();
+		failed.state.hooks.addUser = () => {
 			throw Object.assign(new Error('disk full'), { statusCode: 500 });
 		};
-		const response = await call(store, { body: { action: 'create', principal: 'kris@example.com', role: 'eng' } });
+		const response = await call(failed.store, { body });
 		assert.equal(response.status, 500);
 		assert.equal(response.body.code, 'internal_error');
 		assert.match(response.body.ref, /^[0-9a-f]{8}$/);
-		assert.equal(state.records.has('kris@example.com'), true);
+		assert.equal(failed.state.records.has('kris@example.com'), false);
+
+		const created = fakeStore();
+		created.state.hooks.addUser = (name) => {
+			created.state.users.set(name, { role: 'eng', active: true });
+			throw Object.assign(new Error('reply lost'), { statusCode: 500 });
+		};
+		assert.equal((await call(created.store, { body })).status, 500);
+		assert.equal(created.state.records.has('kris@example.com'), true);
 	});
 
-	it('withholds and scrambles the password when the user changes before it is confirmed', async () => {
+	it('withholds the password, writing nothing more, when the user changes before it is confirmed', async () => {
 		const { store, state } = fakeStore();
 		state.hooks.authenticate = (name) => (state.users.get(name).role = 'super_user');
 		const response = await call(store, { body: { action: 'create', principal: 'kris@example.com', role: 'eng' } });
@@ -354,7 +363,7 @@ describe('create', () => {
 		assert.equal(response.body.password, undefined);
 		assert.deepEqual(
 			state.calls.map(([kind]) => kind),
-			['addUser', 'setPassword'],
+			['addUser'],
 		);
 	});
 });
@@ -492,6 +501,34 @@ describe('addDelegate', () => {
 		assert.equal((await call(abandoned.store, { body })).status, 201);
 	});
 
+	it('puts back the grant row after a takeover whose earlier request created the user', async () => {
+		const delegate = `${principal}.laptop`;
+		const staleAt = new Date(NOW - RESERVATION_TTL_MS - 1);
+		const { store, state } = owned('eng', {
+			records: {
+				[principal]: managed(principal),
+				[delegate]: managed(principal, { machine: 'laptop', createdAt: staleAt }),
+			},
+		});
+		state.hooks.addUser = (name) => state.users.set(name, { role: 'eng-public', active: true });
+		const response = await call(store, { body: { action: 'addDelegate', principal, machine: 'laptop', role: 'eng' } });
+		assert.equal(response.status, 409);
+		assert.equal(response.body.code, 'user_exists');
+		assert.equal(state.grants.has(delegate), false);
+		assert.equal(state.records.has(delegate), true);
+	});
+
+	it("drops the delegate's actsFor when the principal's role changes before the user is confirmed", async () => {
+		const { store, state } = owned('eng-public');
+		state.hooks.addUser = () => (state.users.get(principal).role = 'eng');
+		const response = await call(store, {
+			body: { action: 'addDelegate', principal, machine: 'laptop', role: 'eng-public' },
+		});
+		assert.equal(response.status, 409);
+		assert.equal(response.body.code, 'user_changed');
+		assert.equal(state.grants.has(`${principal}.laptop`), false);
+	});
+
 	it("re-checks the principal's role under the lock, so a role change mid-request issues nothing", async () => {
 		const { store, state } = owned('eng-public');
 		state.hooks.lock = () => (state.users.get(principal).role = 'eng');
@@ -582,20 +619,21 @@ describe('rotate', () => {
 		assert.equal((await call(store, { body: { action: 'rotate', username: 'bad name' } })).status, 400);
 	});
 
-	it('withholds and scrambles the password when an admin promotes the user mid-rotation', async () => {
+	it('withholds the password, and leaves an admin reset alone, when an admin changes the user mid-rotation', async () => {
 		const { store, state } = owned();
-		state.hooks.authenticate = () => (state.users.get(username).role = 'super_user');
+		state.hooks.authenticate = () => {
+			state.users.get(username).role = 'super_user';
+			state.passwords.set(username, 'admin-reset');
+		};
 		const response = await call(store, { body: { action: 'rotate', username } });
 		assert.equal(response.status, 409);
 		assert.equal(response.body.code, 'user_changed');
 		assert.equal(response.body.password, undefined);
-		assert.deepEqual(state.calls, [
-			['setPassword', username],
-			['setPassword', username],
-		]);
+		assert.deepEqual(state.calls, [['setPassword', username]]);
+		assert.equal(state.passwords.get(username), 'admin-reset');
 	});
 
-	it('withholds its password without scrambling when a competing rotation won', async () => {
+	it('withholds its password when a competing rotation won', async () => {
 		const { store, state } = owned();
 		state.hooks.authenticate = () => state.passwords.set(username, 'the-other-rotation');
 		const response = await call(store, { body: { action: 'rotate', username } });
