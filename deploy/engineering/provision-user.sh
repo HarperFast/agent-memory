@@ -91,7 +91,8 @@ AGENT_MEMORY_USER=$USERNAME"
     ssh:*) printf '%s\n' "$ENV_CONTENT" | ssh -o ProxyJump=none "${TARGET#ssh:}" "$WRITE";;
     # mktemp creates the file 0600, and the rename never leaves a readable partial file at the destination.
     file:*) TMP="$(mktemp "$DEST_DIR/.agent-memory-env.XXXXXX")"; trap 'rm -f -- "$TMP"' EXIT
-      printf '%s\n' "$ENV_CONTENT" >"$TMP"; mv -f -- "$TMP" "$DEST";;
+      printf '%s\n' "$ENV_CONTENT" >"$TMP"; mv -f -- "$TMP" "$DEST"
+      [ ! -d "$DEST" ] || { echo "$DEST became a directory; the credentials are in $DEST/${TMP##*/}" >&2; exit 1; };;
   esac
   case "$TARGET" in
     file:*) echo "credentials written to $DEST";;

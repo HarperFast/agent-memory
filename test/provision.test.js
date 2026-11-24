@@ -54,11 +54,8 @@ function fakeStore({ users = {}, records = {}, grants = {} } = {}) {
 		async getGrantRow(name) {
 			return state.grants.get(name);
 		},
-		async *delegatesOf(principal, limit) {
-			let count = 0;
-			for (const row of state.records.values()) {
-				if (row.principal === principal && count++ < limit) yield row;
-			}
+		async *delegatesOf(principal) {
+			for (const row of state.records.values()) if (row.principal === principal) yield row;
 		},
 		async hasInboundDelegation(name) {
 			return [...state.grants.values()].some((row) => row.actsFor === name);
@@ -501,7 +498,7 @@ describe('addDelegate', () => {
 		assert.equal((await call(abandoned.store, { body })).status, 201);
 	});
 
-	it('puts back the grant row after a takeover whose earlier request created the user', async () => {
+	it('writes no grant row after a takeover whose earlier request created the user', async () => {
 		const delegate = `${principal}.laptop`;
 		const staleAt = new Date(NOW - RESERVATION_TTL_MS - 1);
 		const { store, state } = owned('eng', {
@@ -546,6 +543,7 @@ describe('addDelegate', () => {
 			assert.equal(response.body.code, 'mixed_delegation');
 		}
 		assert.deepEqual(state.calls, []);
+		assert.equal((await call(store, { method: 'GET', path: `/${principal}` })).body.managed, false);
 		state.grants.set(delegate, { actsFor: null });
 		assert.equal((await call(store, { body: { action: 'rotate', username: delegate } })).status, 200);
 	});

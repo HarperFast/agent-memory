@@ -8,8 +8,6 @@ const PROVISIONER_ROLE = 'provisioner';
 export const MAX_DELEGATES = 16;
 // A reservation younger than this belongs to a request still running; an older one with no user was interrupted.
 export const RESERVATION_TTL_MS = 60_000;
-// Bounds the rows one request reads for a principal's machine users, whatever an admin left in the table.
-const DELEGATE_SCAN_LIMIT = 64;
 
 // provision-user.sh's username rule.
 const USERNAME = /^[A-Za-z0-9._@-]{1,122}$/;
@@ -42,7 +40,7 @@ class StageFailure extends Error {
 }
 
 const fail = (statusCode, code, message) => new ProvisionError(statusCode, code, message);
-const userChanged = () => fail(409, 'user_changed', 'The user changed during the request; nothing was issued');
+const userChanged = () => fail(409, 'user_changed', 'The user changed during the request; no password is returned');
 const time = (value) => new Date(value).getTime();
 
 async function stage(name, fn) {
@@ -115,8 +113,8 @@ function parseBody(body) {
 const assignable = (role) => (ASSIGNABLE_ROLES.includes(role) ? role : null);
 const manageable = (user, record) => Boolean(record) && user.active && assignable(user.role) !== null;
 
-// Grants on a leftover row would pass to a new user of that name, and an actsFor would make it act for someone. A
-// delegate may reuse the row its own interrupted attempt wrote.
+// Grants on a leftover row would pass to a new user of that name, and an actsFor naming anyone but the intended
+// principal would make it act for them.
 function grantRowReusable(row, actsFor) {
 	if (!row) return true;
 	if ((row.read?.length ?? 0) > 0 || (row.write?.length ?? 0) > 0) return false;
@@ -131,7 +129,7 @@ function grantRowReusable(row, actsFor) {
  * - `addUser(username, password, role)`; rejects with a `user_exists` ProvisionError when the name is taken
  * - `setPassword(username, password)`
  * - `getRecord(username)`, `getGrantRow(username)` → the ProvisionedUser row, the ScopeGrant `user:` row, or undefined
- * - `delegatesOf(principal, limit)` → async iterable of the principal's ProvisionedUser rows (committed)
+ * - `delegatesOf(principal)` → async iterable of the principal's ProvisionedUser rows (committed)
  * - `hasInboundDelegation(username)` → whether any ScopeGrant user row acts for `username`
  * - `withNameLock(usernames, fn)`: runs `fn(tx)` in one transaction holding each name's lock; `tx` has `getRecord`,
  *   `putRecord`, `deleteRecord`, `getGrantRow`, `putGrantRow` and `deleteGrantRow`
@@ -153,7 +151,7 @@ function createProvisioning(store) {
 
 	// `actsFor` comes from the grant row rather than the record, so an admin's revocation shows.
 	async function* liveDelegates(principal) {
-		for await (const row of store.delegatesOf(principal, DELEGATE_SCAN_LIMIT)) {
+		for await (const row of store.delegatesOf(principal)) {
 			if (row.machine == null) continue;
 			const user = await store.getUser(row.username);
 			if (!user) continue;
@@ -164,22 +162,19 @@ function createProvisioning(store) {
 
 	// An admin role change can leave a delegate acting for a principal of another role; nothing more is issued in
 	// that group until an admin settles it (DESIGN.md).
+	const mixed = (delegates, principalRole) => delegates.some((d) => d.actsFor && d.role !== principalRole);
 	async function refuseMixedGroup(principal, principalRole) {
-		for await (const delegate of liveDelegates(principal)) {
-			if (delegate.actsFor && delegate.role !== principalRole) {
-				throw fail(
-					409,
-					'mixed_delegation',
-					'A machine user acts for a person of another role; an admin must settle it',
-				);
-			}
+		const delegates = [];
+		for await (const delegate of liveDelegates(principal)) delegates.push(delegate);
+		if (mixed(delegates, principalRole)) {
+			throw fail(409, 'mixed_delegation', 'A machine user acts for a person of another role; an admin must settle it');
 		}
 	}
 
 	// Machine users that exist, plus reservations still being created; read under the principal's lock.
 	async function countMachines(principal, now) {
 		let count = 0;
-		for await (const row of store.delegatesOf(principal, DELEGATE_SCAN_LIMIT)) {
+		for await (const row of store.delegatesOf(principal)) {
 			if (row.machine == null) continue;
 			if (now - time(row.createdAt) < RESERVATION_TTL_MS || (await store.getUser(row.username))) count++;
 		}
@@ -200,23 +195,27 @@ function createProvisioning(store) {
 	// dropped: nobody else ever held it, so no further write (which could clobber an admin's reset) is needed.
 	async function confirmIssued(username, password, role) {
 		const current = await stage('confirm', () => store.authenticate(username, password));
-		const record = await store.getRecord(username);
-		if (!current?.active || current.role !== role || !record) throw userChanged();
+		if (!current?.active || current.role !== role) throw userChanged();
+		if (!(await store.getRecord(username))) throw userChanged();
 	}
 
-	// Reserve, then create, so that every crash point leaves state the flow recovers (DESIGN.md). `owner` is the
-	// principal a machine user is created under, re-checked under its lock.
+	// The principal's role must still be the one the delegate was matched to, read under the principal's lock.
+	async function requirePrincipalRole(principal, role) {
+		const current = await store.getUser(principal);
+		if (!current?.active || current.role !== role) throw userChanged();
+	}
+
+	// Reserve, create, then grant, so that every crash point leaves state the flow recovers or that grants less
+	// (DESIGN.md). `owner` is the principal a machine user is created under.
 	async function issue({ username, principal, machine, role, actsFor, owner }, caller) {
 		const createdAt = store.now();
-		let previousGrant;
 		let tookOver = false;
 		const names = machine === null ? [username] : [principal, username];
 		await stage('reserve', () =>
 			store.withNameLock(names, async (tx) => {
 				if (await store.getUser(username)) throw fail(409, 'user_exists', 'User already exists');
 				if (owner) {
-					const current = await store.getUser(principal);
-					if (!current?.active || current.role !== owner.role) throw userChanged();
+					await requirePrincipalRole(principal, owner.role);
 					if ((await countMachines(principal, time(createdAt))) >= MAX_DELEGATES) {
 						throw fail(409, 'too_many_delegates', `A person has at most ${MAX_DELEGATES} machine users`);
 					}
@@ -228,45 +227,39 @@ function createProvisioning(store) {
 					}
 					tookOver = true;
 				}
-				previousGrant = await tx.getGrantRow(username);
-				if (!grantRowReusable(previousGrant, actsFor)) {
+				if (!grantRowReusable(await tx.getGrantRow(username), actsFor)) {
 					throw fail(409, 'grant_row_exists', 'A ScopeGrant row for this name already exists; an admin must remove it');
 				}
-				if (machine === null && (await store.hasInboundDelegation(username))) {
+				if (await store.hasInboundDelegation(username)) {
 					throw fail(409, 'inbound_delegation', 'Another user still acts for this name; an admin must remove that');
 				}
 				await tx.putRecord({ username, principal, machine, createdAt, createdBy: caller });
-				if (actsFor) await tx.putGrantRow({ username, actsFor });
 			}),
 		);
-		// Undoes this request's writes while they are still its own. After a takeover the record stays: the user that
-		// exists is most likely the earlier request's, but the grant row is put back to what that request left.
-		const release = () =>
-			stage('release', () =>
-				store.withNameLock([username], async (tx) => {
-					const reservation = await tx.getRecord(username);
-					if (!reservation || time(reservation.createdAt) !== time(createdAt)) return;
-					if (!tookOver) await tx.deleteRecord(username);
-					if (!actsFor) return;
-					if (previousGrant) await tx.putGrantRow({ ...previousGrant, username });
-					else await tx.deleteGrantRow(username);
-				}),
-			);
 		const password = generatePassword();
 		try {
 			await stage('add_user', () => store.addUser(username, password, role));
 		} catch (error) {
+			// A 409 means another writer made the user: after a takeover most likely the earlier request, whose record
+			// stays. Any other failure may still have made this request's user, whose record stays too.
 			const duplicate = error instanceof ProvisionError && error.code === 'user_exists';
-			// An add_user that failed for another reason may still have created the user; keep the record if so.
-			if (duplicate || !(await store.getUser(username))) await release();
+			if (duplicate ? !tookOver : !(await store.getUser(username))) {
+				await stage('release', () =>
+					store.withNameLock([username], async (tx) => {
+						const reservation = await tx.getRecord(username);
+						if (reservation && time(reservation.createdAt) === time(createdAt)) await tx.deleteRecord(username);
+					}),
+				);
+			}
 			throw error;
 		}
-		if (owner && actsFor) {
-			const current = await store.getUser(principal);
-			if (!current?.active || current.role !== owner.role) {
-				await stage('release', () => store.withNameLock([username], (tx) => tx.deleteGrantRow(username)));
-				throw userChanged();
-			}
+		if (actsFor) {
+			await stage('grant', () =>
+				store.withNameLock([principal, username], async (tx) => {
+					await requirePrincipalRole(principal, owner.role);
+					await tx.putGrantRow({ username, actsFor });
+				}),
+			);
 		}
 		await confirmIssued(username, password, role);
 		return { username, password };
@@ -280,7 +273,8 @@ function createProvisioning(store) {
 			const record = await store.getRecord(principal);
 			const delegates = [];
 			for await (const delegate of liveDelegates(principal)) delegates.push(delegate);
-			return { exists: true, managed: manageable(user, record), role: assignable(user.role), delegates };
+			const managed = manageable(user, record) && !mixed(delegates, user.role);
+			return { exists: true, managed, role: assignable(user.role), delegates };
 		},
 
 		async create(body, caller) {
@@ -429,8 +423,8 @@ function harperStore(user) {
 		async getGrantRow(username) {
 			return (await ScopeGrant.get(grantId(username), read)) ?? undefined;
 		},
-		delegatesOf(principal, limit) {
-			return ProvisionedUser.search({ conditions: [{ attribute: 'principal', value: principal }], limit }, read);
+		delegatesOf(principal) {
+			return ProvisionedUser.search({ conditions: [{ attribute: 'principal', value: principal }] }, read);
 		},
 		async hasInboundDelegation(username) {
 			// actsFor is not indexed; the table holds one row per role and per user with grants.
@@ -486,6 +480,7 @@ export class Provision extends Resource {
 	}
 
 	static async subscribe(_target, context) {
+		context?.data?.catch?.(() => {});
 		authorizeCaller(context?.user);
 		throw fail(405, 'method_not_allowed', 'Method not allowed');
 	}
