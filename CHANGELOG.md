@@ -15,6 +15,11 @@ agent-memory@agent-memory` brings an install to the current `main`. A unit test 
 
 ### Added
 
+- Engineering deployment: self-serve provisioning. Dispatch, signed in as a `provisioner` user, creates engineers'
+  users, per-machine delegates and new passwords through a `Provision` resource, so onboarding no longer needs an
+  admin. New role `eng-public` (reads and writes only `global`) for agents on individual AI plans. A delegation group
+  never mixes `eng-public` with another role, and `provision-user.sh --acts-for` now refuses such a pair
+  ([deploy/engineering/README.md](deploy/engineering/README.md#self-serve-provisioning)).
 - Onboarding: [docs/onboarding.md](docs/onboarding.md) and `scripts/onboarding/` take an engineer from a provisioned
   user to a verified install in each Claude profile (`install-claude-profile.sh`) and Codex (`install-codex.sh`),
   checked with `hook-test.sh`, plus update, rollback and uninstall steps.

@@ -297,6 +297,9 @@ export const models = {
 
 export const logger = { trace() {}, debug() {}, info() {}, warn() {}, error() {}, notify() {} };
 
+// Tests replace the methods they need.
+export const server = {};
+
 export class Resource {
 	static loadAsInstance = true;
 	constructor(context) {

@@ -1,0 +1,10 @@
+[
+	{ "operation": "add_role", "role": "eng-public", "permission": { "super_user": false } },
+	{ "operation": "add_role", "role": "provisioner", "permission": { "super_user": false } },
+	{
+		"operation": "upsert",
+		"database": "memory",
+		"table": "ScopeGrant",
+		"records": [{ "id": "role:eng-public", "read": ["global"], "write": ["global"] }]
+	}
+]
