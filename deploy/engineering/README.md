@@ -96,6 +96,7 @@ does not share or edit the person's private memories.
   (another request is creating that name; retry after a minute), `grant_row_exists` and `inbound_delegation` (an
   admin must clean up first), `user_changed` (an admin changed the user mid-request; nothing was issued),
   `not_managed`, `user_inactive`, `role_not_assignable`, `too_many_delegates` (16 machines per person),
+  `mixed_delegation` (an admin's role change left a machine user acting for a person of another role),
   `reserved_name`, plus 400s for malformed input. A 500 carries a `ref` that matches the server log line. A create
   or addDelegate that answered 500 after the user was made answers `user_exists` on retry; rotate recovers it.
 - **Passwords** are 40 random characters, returned once, with `Cache-Control: no-store`, and never logged here.

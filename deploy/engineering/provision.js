@@ -162,6 +162,20 @@ function createProvisioning(store) {
 		}
 	}
 
+	// An admin role change can leave a delegate acting for a principal of another role; nothing more is issued in
+	// that group until an admin settles it (DESIGN.md).
+	async function refuseMixedGroup(principal, principalRole) {
+		for await (const delegate of liveDelegates(principal)) {
+			if (delegate.actsFor && delegate.role !== principalRole) {
+				throw fail(
+					409,
+					'mixed_delegation',
+					'A machine user acts for a person of another role; an admin must settle it',
+				);
+			}
+		}
+	}
+
 	// Machine users that exist, plus reservations still being created; read under the principal's lock.
 	async function countMachines(principal, now) {
 		let count = 0;
@@ -283,6 +297,7 @@ function createProvisioning(store) {
 			const username = delegateName(principal, machine);
 			const owner = await requireManaged(principal);
 			if (owner.record.machine != null) throw fail(400, 'not_a_principal', 'principal is itself a delegate');
+			await refuseMixedGroup(principal, owner.user.role);
 			// A delegate shares the principal's private scope, which is never content-checked, so only a delegate of
 			// the principal's own role acts for it; any other is a standalone user (DESIGN.md).
 			const actsFor = role === owner.user.role ? principal : null;
@@ -292,7 +307,10 @@ function createProvisioning(store) {
 
 		async rotate(body) {
 			const username = parseUsername(body.username);
-			const { user } = await requireManaged(username);
+			const { user, record } = await requireManaged(username);
+			const principal = record.machine == null ? username : record.principal;
+			const principalRole = principal === username ? user.role : (await store.getUser(principal))?.role;
+			await refuseMixedGroup(principal, principalRole);
 			const password = generatePassword();
 			await stage('set_password', () => store.setPassword(username, password));
 			await confirmIssued(username, password, user.role);

@@ -38,6 +38,13 @@ resource calls `server.operation` with authorization off, after its own checks.
   principal's own role; one of another role (an `eng` person's `eng-public` machine) is a standalone user, tied to the
   person only by its `ProvisionedUser` row. `provision-user.sh --acts-for` refuses a pair whose roles differ in
   customer clearance (`clearance`). A later admin role change is outside both; README says how to handle it.
+- **The threat is the caller, not the admin.** The checks above assume the provisioner credential may be
+  compromised or Dispatch buggy: whatever it sends, no role but `eng`/`eng-public` is assigned, no user the flow
+  did not create is touched, no password for another role is obtained, and concurrent requests make neither two
+  users nor a mixed delegation group. Admins are trusted and rare, so their changes get no fencing. An admin who
+  changes a managed user's role, drops it or recreates its name updates or deletes its `ProvisionedUser` row, and
+  one who changes a person's role clears `actsFor` on that person's machine users whose role now differs.
+  `refuseMixedGroup` is the backstop: rotate and addDelegate refuse (`mixed_delegation`) in a group left mixed.
 - **`<principal>.<machine>` is a machine user's name.** `refuseDelegateShapedName` stops a principal from reading as a
   delegate of an existing user. The row's `machine` says which a managed user is.
 - **No secret leaves in a log.** Failures log a stage, the cause's name and status, and a `ref` (`StageFailure`),

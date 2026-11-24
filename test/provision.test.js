@@ -529,6 +529,27 @@ describe('addDelegate', () => {
 		assert.equal(state.grants.has(`${principal}.laptop`), false);
 	});
 
+	it("issues nothing more in a group an admin's role change left mixed", async () => {
+		const delegate = `${principal}.laptop`;
+		const { store, state } = owned('eng', {
+			users: { [principal]: { role: 'eng' }, [delegate]: { role: 'eng-public' } },
+			records: { [principal]: managed(principal), [delegate]: managed(principal, { machine: 'laptop' }) },
+			grants: { [delegate]: { actsFor: principal } },
+		});
+		for (const body of [
+			{ action: 'addDelegate', principal, machine: 'desk', role: 'eng' },
+			{ action: 'rotate', username: delegate },
+			{ action: 'rotate', username: principal },
+		]) {
+			const response = await call(store, { body });
+			assert.equal(response.status, 409, body.action);
+			assert.equal(response.body.code, 'mixed_delegation');
+		}
+		assert.deepEqual(state.calls, []);
+		state.grants.set(delegate, { actsFor: null });
+		assert.equal((await call(store, { body: { action: 'rotate', username: delegate } })).status, 200);
+	});
+
 	it("re-checks the principal's role under the lock, so a role change mid-request issues nothing", async () => {
 		const { store, state } = owned('eng-public');
 		state.hooks.lock = () => (state.users.get(principal).role = 'eng');
