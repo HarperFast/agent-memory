@@ -281,14 +281,6 @@ suite('deploy/engineering self-serve provisioning over HTTP', (ctx: ContextWithH
 		});
 		strictEqual(duplicate.status, 409);
 		strictEqual(duplicate.body.code, 'user_exists');
-		const mismatch = await provision({
-			action: 'addDelegate',
-			principal: 'pub@example.com',
-			machine: 'desk',
-			role: 'eng',
-		});
-		strictEqual(mismatch.status, 400);
-		strictEqual(mismatch.body.code, 'role_mismatch');
 		const unmanaged = await provision({
 			action: 'addDelegate',
 			principal: 'admin-made@example.com',
@@ -302,14 +294,57 @@ suite('deploy/engineering self-serve provisioning over HTTP', (ctx: ContextWithH
 			exists: true,
 			managed: true,
 			role: 'eng-public',
-			delegates: [{ username: 'pub@example.com.laptop', role: 'eng-public' }],
+			delegates: [{ username: 'pub@example.com.laptop', role: 'eng-public', actsFor: true }],
 		});
 	});
 
-	test('an eng person and delegate read customer content', async () => {
+	test("an eng person's eng-public machine is a standalone user outside the person's private scope", async () => {
 		await issue({ action: 'create', principal: 'cleared@example.com', role: 'eng' });
-		await issue({ action: 'addDelegate', principal: 'cleared@example.com', machine: 'desk', role: 'eng' });
+		const desk = await issue({ action: 'addDelegate', principal: 'cleared@example.com', machine: 'desk', role: 'eng' });
+		strictEqual(desk.actsFor, true);
 		strictEqual((await memory('cleared@example.com.desk', 'GET', memId('acme-secret'))).status, 200);
+
+		const personal = await issue({
+			action: 'addDelegate',
+			principal: 'cleared@example.com',
+			machine: 'personal',
+			role: 'eng-public',
+		});
+		strictEqual(personal.actsFor, false);
+		const rows = await operation({
+			operation: 'search_by_id',
+			database: 'memory',
+			table: 'ScopeGrant',
+			ids: ['user:cleared@example.com.personal'],
+			get_attributes: ['id', 'actsFor'],
+		});
+		deepStrictEqual(rows, []);
+		const privateNote = memId('cleared-private');
+		const sharedNote = memId('cleared-shared');
+		strictEqual(
+			(await memory('cleared@example.com', 'PUT', privateNote, { title: 'p', content: 'acme private' })).status,
+			201,
+		);
+		strictEqual(
+			(await memory('cleared@example.com', 'PUT', sharedNote, { title: 's', content: 'shared', visibility: 'shared' }))
+				.status,
+			201,
+		);
+		const machine = 'cleared@example.com.personal';
+		strictEqual((await memory(machine, 'GET', privateNote)).status, 404);
+		strictEqual((await memory(machine, 'GET', memId('acme-secret'))).status, 404);
+		const edit = await memory(machine, 'PUT', sharedNote, { content: 'edited' }, 1);
+		strictEqual(edit.status, 403, JSON.stringify(edit.body));
+		strictEqual(edit.body.code, 'not_memory_owner');
+		const own = await memory(machine, 'PUT', memId('personal-note'), { title: 'n', content: 'mine' });
+		strictEqual(own.status, 201);
+		strictEqual((await memory('cleared@example.com', 'GET', memId('personal-note'))).status, 404);
+
+		deepStrictEqual((await describeUser('cleared@example.com')).body.delegates, [
+			{ username: 'cleared@example.com.desk', role: 'eng', actsFor: true },
+			{ username: 'cleared@example.com.personal', role: 'eng-public', actsFor: false },
+		]);
+		strictEqual((await issue({ action: 'rotate', username: machine })).username, machine);
 	});
 
 	test('rotate replaces the password of a managed user only, and the old password stops working', async () => {

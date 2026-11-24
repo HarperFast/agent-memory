@@ -26,9 +26,11 @@ resource calls `server.operation` with authorization off, after its own checks.
   `actsFor` other than the delegate's own principal. `hasInboundDelegation` refuses a principal name that some user
   still acts for.
 - **A delegation group never mixes clearance.** A delegate shares `user:<principal>`, and private memories are never
-  content-checked (`src/quarantine.ts` `decideContentFlag`). So addDelegate requires the delegate's role to equal the
-  principal's, and `provision-user.sh --acts-for` refuses `eng-public` paired with another role.
-- **`<principal>.<machine>` is a delegate's name.** `refuseDelegateShapedName` stops a principal from reading as a
+  content-checked (`src/quarantine.ts` `decideContentFlag`). So addDelegate sets `actsFor` only on a delegate of the
+  principal's own role; one of another role (an `eng` person's `eng-public` machine) is a standalone user, tied to the
+  person only by its `ProvisionedUser` row. `provision-user.sh --acts-for` refuses `eng-public` paired with another
+  role.
+- **`<principal>.<machine>` is a machine user's name.** `refuseDelegateShapedName` stops a principal from reading as a
   delegate of an existing user. The row's `machine` says which a managed user is.
 - **No secret leaves in a log.** Failures log a stage, the cause's name and status, and a `ref` (`StageFailure`),
   never the cause's text, which may echo credentials. Harper's operation log already drops `password`.

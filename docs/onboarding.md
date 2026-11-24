@@ -36,9 +36,10 @@ AGENT_MEMORY_USER=<username>
 ```
 
 Give each machine its own credential: **add a machine** with a label (lowercase letters, digits and `-`, up to 32).
-That creates `<email>.<label>`, a user with your role that acts for you. It can correct your memories and shares
-your private ones, and it can be rotated without touching your other machines. All of a person's machines take the
-person's role.
+That creates `<email>.<label>`, which can be rotated without touching your other machines. A machine with your role
+acts for you: it can correct your memories and shares your private ones. A machine with the other role, such as an
+`eng-public` machine for an `eng` person, is a standalone user: it does not share or edit your private memories, so
+customer detail you keep there never reaches an individual-plan agent.
 
 **Rotate** issues a new password for your user or one machine. The old password stops working at once, so every
 machine using it is logged out (401) until it gets the new file. Then rerun `install-codex.sh` on any machine with
@@ -77,7 +78,7 @@ deploy/engineering/provision-user.sh <person>-agents eng-agents <target> --acts-
 - `none` creates the user without writing credentials anywhere. Rerun with `--rotate` later to issue some.
 
 `--acts-for` refuses to pair `eng-public` with any other role: the pair would share one private scope, and private
-memories are never checked for customer detail.
+memories are never checked for customer detail. Leave `--acts-for` off to make such a machine user standalone.
 
 A machine has one env file, so its sessions act as whoever's credentials are in it. On a machine where Claude
 Code or Codex works on someone's behalf, write the agent user's credentials there, and keep the person's own

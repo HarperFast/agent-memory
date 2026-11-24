@@ -68,7 +68,7 @@ if [ -n "$ACTS_FOR" ]; then
 const u=JSON.parse(process.env.USERS).find((x)=>x.username===process.env.NAME); process.stdout.write(u ? String(u.role?.role ?? "") : "-");')"
   [ "$PRINCIPAL_ROLE" != - ] || { echo "--acts-for user $ACTS_FOR does not exist" >&2; exit 1; }
   if { [ "$ROLE" = eng-public ] || [ "$PRINCIPAL_ROLE" = eng-public ]; } && [ "$ROLE" != "$PRINCIPAL_ROLE" ]; then
-    echo "a $ROLE user cannot act for a ${PRINCIPAL_ROLE:-roleless} user: eng-public never shares a delegation group with another role" >&2
+    echo "a $ROLE user cannot act for a ${PRINCIPAL_ROLE:-roleless} user: eng-public never shares a delegation group with another role (leave --acts-for off for a standalone user)" >&2
     exit 1
   fi
 fi

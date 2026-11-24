@@ -129,6 +129,7 @@ function grantRowReusable(row, actsFor) {
  * - `addUser(username, password, role)`; rejects with a `user_exists` ProvisionError when the name is taken
  * - `setPassword(username, password)`
  * - `getRecord(username)` → ProvisionedUser row or undefined; `delegatesOf(principal, limit)` → async iterable of rows
+ * - `getGrantRow(username)` → the ScopeGrant `user:<username>` row or undefined
  * - `hasInboundDelegation(username)` → whether any ScopeGrant user row acts for `username`
  * - `withNameLock(username, fn)`: runs `fn(tx)` in one transaction holding the name's lock, where `tx` has
  *   `getRecord`, `putRecord`, `deleteRecord`, `getGrantRow`, `putGrantRow` and `deleteGrantRow` (grant rows by username)
@@ -147,11 +148,14 @@ export function createProvisioning(store) {
 		return { user, record };
 	}
 
+	// `actsFor` is read from the grant row rather than the record, so an admin's revocation shows.
 	async function* liveDelegates(principal) {
 		for await (const row of store.delegatesOf(principal, DELEGATE_SCAN_LIMIT)) {
 			if (row.machine == null) continue;
 			const user = await store.getUser(row.username);
-			if (user) yield { username: row.username, role: assignable(user.role) };
+			if (!user) continue;
+			const grant = await store.getGrantRow(row.username);
+			yield { username: row.username, role: assignable(user.role), actsFor: grant?.actsFor === principal };
 		}
 	}
 
@@ -183,9 +187,8 @@ export function createProvisioning(store) {
 	// Reserve, then create: a crash after the reservation leaves a record that a retry takes over once it is stale,
 	// and a crash after add_user leaves a managed user its owner can rotate. Nothing is ever compensated by deleting
 	// a user, which could delete one an admin created under the same name.
-	async function issue({ username, principal, machine, role }, caller) {
+	async function issue({ username, principal, machine, role, actsFor }, caller) {
 		const createdAt = store.now();
-		const actsFor = machine === null ? null : principal;
 		let previousGrant;
 		await stage('reserve', () =>
 			store.withNameLock(username, async (tx) => {
@@ -242,7 +245,7 @@ export function createProvisioning(store) {
 			const principal = parsePrincipal(body.principal);
 			const role = parseRole(body.role);
 			await refuseDelegateShapedName(principal);
-			return issue({ username: principal, principal, machine: null, role }, caller);
+			return issue({ username: principal, principal, machine: null, role, actsFor: null }, caller);
 		},
 
 		async addDelegate(body, caller) {
@@ -252,16 +255,16 @@ export function createProvisioning(store) {
 			const username = delegateName(principal, machine);
 			const owner = await requireManaged(principal);
 			if (owner.record.machine != null) throw fail(400, 'not_a_principal', 'principal is itself a delegate');
-			// A delegation group shares one private scope, so it must share one clearance (DESIGN.md).
-			if (owner.user.role !== role) {
-				throw fail(400, 'role_mismatch', `A delegate takes its principal's role, ${owner.user.role}`);
-			}
 			let count = 0;
 			for await (const _ of liveDelegates(principal)) {
 				if (++count >= MAX_DELEGATES)
 					throw fail(409, 'too_many_delegates', `A principal has at most ${MAX_DELEGATES} delegates`);
 			}
-			return issue({ username, principal, machine, role }, caller);
+			// A delegate shares the principal's private scope, which is never content-checked, so only a delegate of
+			// the principal's own role acts for it; any other is a standalone user (DESIGN.md).
+			const actsFor = role === owner.user.role ? principal : null;
+			const credentials = await issue({ username, principal, machine, role, actsFor }, caller);
+			return { ...credentials, actsFor: actsFor !== null };
 		},
 
 		async rotate(body) {
@@ -372,6 +375,9 @@ export function harperStore(user) {
 		},
 		async getRecord(username) {
 			return (await ProvisionedUser.get(username, read)) ?? undefined;
+		},
+		async getGrantRow(username) {
+			return (await ScopeGrant.get(grantId(username), read)) ?? undefined;
 		},
 		delegatesOf(principal, limit) {
 			return ProvisionedUser.search({ conditions: [{ attribute: 'principal', value: principal }], limit }, read);

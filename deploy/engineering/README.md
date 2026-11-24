@@ -53,7 +53,8 @@ user; to revoke, upsert `actsFor: null`. Never put `actsFor` on a `role:` row: i
 
 A delegation group shares one private scope, so it never mixes `eng-public` with another role: a customer-cleared
 member could write customer detail there for an `eng-public` member to read, since private memories are never
-content-checked. The self-serve resource and `provision-user.sh --acts-for` both refuse such a pair. Two admin
+content-checked. The self-serve resource gives a machine of the other role no `actsFor`, and
+`provision-user.sh --acts-for` refuses such a pair (leave `--acts-for` off for a standalone user). Two admin
 actions can still leave an `eng-public` user reading customer content, so avoid them:
 
 - Changing a user's role to `eng-public`: the user keeps reading what it owns, customer memories included. Create a
@@ -65,15 +66,17 @@ actions can still leave an `eng-public` user reading customer content, so avoid 
 
 Engineers get credentials from Dispatch's Connect agent-memory page, which calls this app's `Provision` resource as
 the `provisioner` user ([`provision.js`](provision.js), rules in [DESIGN.md](DESIGN.md)). The username is the person's
-company email, with role `eng` or `eng-public`; each machine can get its own delegate `<email>.<machine>`, of the
-same role, acting for the person.
+company email, with role `eng` or `eng-public`. Each machine can get its own user `<email>.<machine>`. With the
+person's role it acts for the person (`actsFor`: it corrects the person's memories and shares their private ones).
+With the other role, for example an `eng` person's machine on an individual AI plan, it is a standalone user: it
+does not share or edit the person's private memories.
 
-| Request                                                                           | Answer                                                                                   |
-| --------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
-| `GET /Provision/<email>`                                                          | `200 { exists, managed, role, delegates: [{ username, role }] }`                         |
-| `POST /Provision/` `{ "action": "create", "principal": <email>, "role": <role> }` | `201 { username, password }`                                                             |
-| `POST /Provision/` `{ "action": "addDelegate", "principal", "machine", "role" }`  | `201 { username, password }`; `role` must equal the principal's                          |
-| `POST /Provision/` `{ "action": "rotate", "username": <managed user> }`           | `200 { username, password }`; every machine using the old password must take the new one |
+| Request                                                                           | Answer                                                                                          |
+| --------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| `GET /Provision/<email>`                                                          | `200 { exists, managed, role, delegates: [{ username, role, actsFor }] }`                       |
+| `POST /Provision/` `{ "action": "create", "principal": <email>, "role": <role> }` | `201 { username, password }`                                                                    |
+| `POST /Provision/` `{ "action": "addDelegate", "principal", "machine", "role" }`  | `201 { username, password, actsFor }`; `actsFor` is false when `role` differs from the person's |
+| `POST /Provision/` `{ "action": "rotate", "username": <managed user> }`           | `200 { username, password }`; every machine using the old password must take the new one        |
 
 - **Who may call.** Only role `provisioner` (or a `super_user`): 401 without credentials, 403 for every other role.
   Other methods answer 405. The resource is hidden from MCP and OpenAPI.
@@ -82,7 +85,7 @@ same role, acting for the person.
 - **Errors** are `{ error, code }`. Branch on `code`, since several share a status: `user_exists`, `in_progress`
   (another request is creating that name; retry after a minute), `grant_row_exists` and `inbound_delegation` (an
   admin must clean up first), `user_changed` (an admin changed the user mid-request; nothing was issued),
-  `role_mismatch`, `not_managed`, `user_inactive`, `role_not_assignable`, `too_many_delegates` (16 per person),
+  `not_managed`, `user_inactive`, `role_not_assignable`, `too_many_delegates` (16 machines per person),
   `reserved_name`, plus 400s for malformed input. A 500 carries a `ref` that matches the server log line.
 - **Passwords** are 40 random characters, returned once, with `Cache-Control: no-store`, and never logged here.
   Nothing between Dispatch and this app may log response bodies. A rotate whose answer was lost is recovered by

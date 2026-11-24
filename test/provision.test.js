@@ -51,6 +51,9 @@ function fakeStore({ users = {}, records = {}, grants = {} } = {}) {
 		async getRecord(name) {
 			return state.records.get(name);
 		},
+		async getGrantRow(name) {
+			return state.grants.get(name);
+		},
 		async *delegatesOf(principal, limit) {
 			let count = 0;
 			for (const row of state.records.values()) {
@@ -335,6 +338,7 @@ describe('addDelegate', () => {
 		});
 		assert.equal(response.status, 201);
 		assert.equal(response.body.username, 'kris@example.com.laptop');
+		assert.equal(response.body.actsFor, true);
 		assert.equal(state.passwords.get('kris@example.com.laptop'), response.body.password);
 		assert.deepEqual(state.users.get('kris@example.com.laptop'), { role: 'eng-public', active: true });
 		assert.deepEqual(state.grants.get('kris@example.com.laptop'), { actsFor: principal });
@@ -342,17 +346,33 @@ describe('addDelegate', () => {
 		assert.equal(state.records.get('kris@example.com.laptop').principal, principal);
 	});
 
-	it("refuses a delegate whose role differs from its principal's", async () => {
+	it('makes a delegate of another role a standalone user that does not act for the principal', async () => {
 		for (const [principalRole, role] of [
 			['eng', 'eng-public'],
 			['eng-public', 'eng'],
 		]) {
 			const { store, state } = owned(principalRole);
 			const response = await call(store, { body: { action: 'addDelegate', principal, machine: 'laptop', role } });
-			assert.equal(response.status, 400);
-			assert.equal(response.body.code, 'role_mismatch');
-			assert.deepEqual(state.calls, []);
+			assert.equal(response.status, 201, `${role} under ${principalRole}`);
+			assert.equal(response.body.actsFor, false);
+			assert.deepEqual(state.users.get(`${principal}.laptop`), { role, active: true });
+			assert.equal(state.grants.has(`${principal}.laptop`), false);
+			assert.equal(state.records.get(`${principal}.laptop`).principal, principal);
+			const listed = await call(store, { method: 'GET', path: `/${principal}` });
+			assert.deepEqual(listed.body.delegates, [{ username: `${principal}.laptop`, role, actsFor: false }]);
+			const rotated = await call(store, { body: { action: 'rotate', username: `${principal}.laptop` } });
+			assert.equal(rotated.status, 200);
 		}
+	});
+
+	it('refuses a standalone delegate a leftover row that acts for anyone', async () => {
+		const { store, state } = owned('eng', { grants: { [`${principal}.laptop`]: { actsFor: principal } } });
+		const response = await call(store, {
+			body: { action: 'addDelegate', principal, machine: 'laptop', role: 'eng-public' },
+		});
+		assert.equal(response.status, 409);
+		assert.equal(response.body.code, 'grant_row_exists');
+		assert.deepEqual(state.calls, []);
 	});
 
 	it('acts only for an active, managed principal holding an assignable role', async () => {
@@ -500,7 +520,7 @@ describe('rotate', () => {
 });
 
 describe('describe (GET)', () => {
-	it('reports a managed principal with its live delegates and their roles', async () => {
+	it('reports a managed principal with its live delegates, their roles and whether each acts for it', async () => {
 		const principal = 'kris@example.com';
 		const { store } = fakeStore({
 			users: {
@@ -514,6 +534,7 @@ describe('describe (GET)', () => {
 				[`${principal}.old`]: managed(principal, { machine: 'old' }),
 				[`${principal}.gone`]: managed(principal, { machine: 'gone' }),
 			},
+			grants: { [`${principal}.laptop`]: { actsFor: principal }, [`${principal}.old`]: { actsFor: null } },
 		});
 		const response = await call(store, { method: 'GET', path: `/${principal}` });
 		assert.equal(response.status, 200);
@@ -522,8 +543,8 @@ describe('describe (GET)', () => {
 			managed: true,
 			role: 'eng-public',
 			delegates: [
-				{ username: `${principal}.laptop`, role: 'eng-public' },
-				{ username: `${principal}.old`, role: null },
+				{ username: `${principal}.laptop`, role: 'eng-public', actsFor: true },
+				{ username: `${principal}.old`, role: null, actsFor: false },
 			],
 		});
 	});
