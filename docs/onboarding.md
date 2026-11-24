@@ -19,12 +19,13 @@ prints the token.
 
 ### Self-serve (Dispatch)
 
-Open Dispatch's **Connect agent-memory** page and sign in with GitHub. Your username is your verified company email.
-Your role is one of two:
+Open Dispatch's **Connect agent-memory** page and sign in with GitHub. (If your Dispatch has no such page yet, use
+the admin route below.) Your username is your verified company email. Your role is one of two:
 
 - `eng` if your agents run on a company AI plan. Reads and writes `global` and `customer:*` memories.
 - `eng-public` if they run on an individual (non-company) AI plan. Public only: it never receives a `customer:*`
-  memory, nor a `global` one flagged as possible customer detail.
+  memory, nor a `global` one flagged as possible customer detail. Like every `global` reader, it still sees customer
+  detail that someone put in `global` and the check missed, so keep customer detail under `customer:` labels.
 
 The page shows your password once, as the contents of the credential file. Save it as `~/.config/agent-memory/env`,
 readable only by you (`chmod 600`):

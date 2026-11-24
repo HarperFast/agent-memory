@@ -22,7 +22,7 @@ deploy/deploy.sh deploy/engineering
 - `provision-user.sh <username> <role> <local|ssh:user@host|file:path|none> [--rotate] [--acts-for <user>]`: the
   admin route. It creates a Harper user and writes its credentials to that machine's `~/.config/agent-memory/env`,
   or to `file:<path>` on this machine (mode 0600). `--acts-for` then sets the user's `actsFor`; it refuses a user
-  that does not exist and an `eng-public` user on either side of another role. The password is never printed. It
+  that does not exist and a pair of different customer clearance. The password is never printed. It
   reads the same two variables, plus `AGENT_MEMORY_URL` (the cluster's base URL) unless the target is `none`.
   Engineers normally get credentials themselves ([Self-serve provisioning](#self-serve-provisioning)).
 
@@ -51,20 +51,26 @@ share `user:<engineer>`. The `eng-agents` role grants their labels, so that row 
 `provision-user.sh <agent user> eng-agents <target> --acts-for <engineer user>` upserts it after creating the
 user; to revoke, upsert `actsFor: null`. Never put `actsFor` on a `role:` row: it grants nothing there.
 
-A delegation group shares one private scope, so it never mixes `eng-public` with another role: a customer-cleared
-member could write customer detail there for an `eng-public` member to read, since private memories are never
-content-checked. The self-serve resource gives a machine of the other role no `actsFor`, and
-`provision-user.sh --acts-for` refuses such a pair (leave `--acts-for` off for a standalone user). Two admin
-actions can still leave an `eng-public` user reading customer content, so avoid them:
+A delegation group shares one private scope, so it never mixes customer clearance (`eng` and `eng-agents` are
+cleared; `eng-public`, `dispatch-worker` and `provisioner` are not): a cleared member could write customer detail
+there for an uncleared member to read, since private memories are never content-checked. The self-serve resource
+gives a machine of the other role no `actsFor`, and `provision-user.sh --acts-for` refuses such a pair (leave
+`--acts-for` off for a standalone user). Three admin actions can still leave an `eng-public` user reading customer
+content, so take care with them:
 
+- Changing a person's role, most often `eng-public` to `eng` when they move to a company plan: their machine users
+  keep `actsFor`. Clear it (`actsFor: null`) on each machine user whose role now differs, or change those roles
+  too. `GET /Provision/<email>` shows each machine user's role and `actsFor`.
 - Changing a user's role to `eng-public`: the user keeps reading what it owns, customer memories included. Create a
   fresh user instead, or withdraw those memories first.
 - Dropping a user: its memories and any `actsFor` naming it stay, and a later user of the same name inherits both.
-  Drop its delegates with it (self-serve refuses to recreate a name that something still acts for).
+  Drop its machine users with it (self-serve refuses to recreate a name that something still acts for), and delete
+  its `memory.ProvisionedUser` rows, or self-serve could rotate a later user of that name.
 
 ## Self-serve provisioning
 
-Engineers get credentials from Dispatch's Connect agent-memory page, which calls this app's `Provision` resource as
+Engineers get credentials from Dispatch's Connect agent-memory page (shipped separately in Dispatch; until it is
+live, the admin route above stays the only one), which calls this app's `Provision` resource as
 the `provisioner` user ([`provision.js`](provision.js), rules in [DESIGN.md](DESIGN.md)). The username is the person's
 company email, with role `eng` or `eng-public`. Each machine can get its own user `<email>.<machine>`. With the
 person's role it acts for the person (`actsFor`: it corrects the person's memories and shares their private ones).
@@ -81,7 +87,9 @@ does not share or edit the person's private memories.
 - **Who may call.** Only role `provisioner` (or a `super_user`): 401 without credentials, 403 for every other role.
   Other methods answer 405. The resource is hidden from MCP and OpenAPI.
 - **What it changes.** It assigns only `eng` and `eng-public`, and creates only names that do not exist. It rotates
-  and adds delegates only for users it created, still active and still holding one of those roles (`managed`).
+  and adds machine users only for users it created, still active and still holding one of those roles; `managed`
+  in the GET answer says exactly that. A rotate writes by username, so one that lands with an admin's reset of the
+  same user can overwrite it; nothing is returned for a user an admin changed mid-request.
 - **Errors** are `{ error, code }`. Branch on `code`, since several share a status: `user_exists`, `in_progress`
   (another request is creating that name; retry after a minute), `grant_row_exists` and `inbound_delegation` (an
   admin must clean up first), `user_changed` (an admin changed the user mid-request; nothing was issued),
@@ -93,7 +101,7 @@ does not share or edit the person's private memories.
 
 **Trust.** The provisioner can create a customer-cleared (`eng`) user for any new email. Dispatch decides who gets
 one: it must act only for a signed-in person (not a worker token), take the email from the identity provider's
-verified company address, and choose the role server-side.
+verified company address (lowercased; the resource refuses capitals), and choose the role server-side.
 
 ### Setup (admin, once, after the deploy)
 

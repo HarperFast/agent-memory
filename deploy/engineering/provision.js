@@ -1,15 +1,14 @@
-// Self-serve provisioning: Dispatch, signed in as the `provisioner` user, creates and re-passwords engineers' Harper
-// users. This file is an auth boundary; its rules are in DESIGN.md next to it.
+// An auth boundary: it issues Harper credentials. Its invariants are in DESIGN.md next to it.
 import { randomBytes, randomUUID } from 'node:crypto';
 import { Resource, databases, logger, server, transaction } from 'harper';
 import { getLockScope } from '@harperfast/agent-memory';
 
-export const ASSIGNABLE_ROLES = Object.freeze(['eng', 'eng-public']);
-export const PROVISIONER_ROLE = 'provisioner';
+const ASSIGNABLE_ROLES = Object.freeze(['eng', 'eng-public']);
+const PROVISIONER_ROLE = 'provisioner';
 export const MAX_DELEGATES = 16;
 // A reservation younger than this belongs to a request still running; an older one with no user was interrupted.
 export const RESERVATION_TTL_MS = 60_000;
-// Bounds the rows one request reads for a principal's delegates, whatever an admin left in the table.
+// Bounds the rows one request reads for a principal's machine users, whatever an admin left in the table.
 const DELEGATE_SCAN_LIMIT = 64;
 
 // provision-user.sh's username rule.
@@ -43,6 +42,8 @@ class StageFailure extends Error {
 }
 
 const fail = (statusCode, code, message) => new ProvisionError(statusCode, code, message);
+const userChanged = () => fail(409, 'user_changed', 'The user changed during the request; nothing was issued');
+const time = (value) => new Date(value).getTime();
 
 async function stage(name, fn) {
 	try {
@@ -89,7 +90,7 @@ function parseRole(value) {
 	return value;
 }
 
-export function delegateName(principal, machine) {
+function delegateName(principal, machine) {
 	const username = `${principal}.${machine}`;
 	if (!USERNAME.test(username)) throw fail(400, 'invalid_machine', 'principal and machine exceed 122 characters');
 	return username;
@@ -112,9 +113,10 @@ function parseBody(body) {
 }
 
 const assignable = (role) => (ASSIGNABLE_ROLES.includes(role) ? role : null);
+const manageable = (user, record) => Boolean(record) && user.active && assignable(user.role) !== null;
 
-// Grants on a leftover row would pass to a new user of that name, and an actsFor would make a principal act for
-// someone else. A delegate may reuse the row its own interrupted attempt wrote.
+// Grants on a leftover row would pass to a new user of that name, and an actsFor would make it act for someone. A
+// delegate may reuse the row its own interrupted attempt wrote.
 function grantRowReusable(row, actsFor) {
 	if (!row) return true;
 	if ((row.read?.length ?? 0) > 0 || (row.write?.length ?? 0) > 0) return false;
@@ -125,16 +127,16 @@ function grantRowReusable(row, actsFor) {
  * The provisioning rules over a store, so tests can drive them with fakes. The store:
  * - `now()` → Date
  * - `getUser(username)` → `{ role, active }` or undefined (`role` is the role's name)
- * - `authenticate(username, password)` → `{ role, active }`; rejects when the credentials do not authenticate
+ * - `authenticate(username, password)` → `{ role, active }`, or undefined when the credentials are refused
  * - `addUser(username, password, role)`; rejects with a `user_exists` ProvisionError when the name is taken
  * - `setPassword(username, password)`
- * - `getRecord(username)` → ProvisionedUser row or undefined; `delegatesOf(principal, limit)` → async iterable of rows
- * - `getGrantRow(username)` → the ScopeGrant `user:<username>` row or undefined
+ * - `getRecord(username)`, `getGrantRow(username)` → the ProvisionedUser row, the ScopeGrant `user:` row, or undefined
+ * - `delegatesOf(principal, limit)` → async iterable of the principal's ProvisionedUser rows (committed)
  * - `hasInboundDelegation(username)` → whether any ScopeGrant user row acts for `username`
- * - `withNameLock(username, fn)`: runs `fn(tx)` in one transaction holding the name's lock, where `tx` has
- *   `getRecord`, `putRecord`, `deleteRecord`, `getGrantRow`, `putGrantRow` and `deleteGrantRow` (grant rows by username)
+ * - `withNameLock(usernames, fn)`: runs `fn(tx)` in one transaction holding each name's lock; `tx` has `getRecord`,
+ *   `putRecord`, `deleteRecord`, `getGrantRow`, `putGrantRow` and `deleteGrantRow`
  */
-export function createProvisioning(store) {
+function createProvisioning(store) {
 	async function requireManaged(username) {
 		const user = await store.getUser(username);
 		if (!user) throw fail(404, 'user_not_found', 'No such user');
@@ -143,12 +145,13 @@ export function createProvisioning(store) {
 			throw fail(403, 'not_managed', 'This user was not created by self-serve provisioning; an admin manages it');
 		}
 		if (!user.active) throw fail(403, 'user_inactive', 'This user is deactivated; an admin manages it');
-		if (!assignable(user.role))
+		if (!assignable(user.role)) {
 			throw fail(403, 'role_not_assignable', 'This user holds a role provisioning does not manage');
+		}
 		return { user, record };
 	}
 
-	// `actsFor` is read from the grant row rather than the record, so an admin's revocation shows.
+	// `actsFor` comes from the grant row rather than the record, so an admin's revocation shows.
 	async function* liveDelegates(principal) {
 		for await (const row of store.delegatesOf(principal, DELEGATE_SCAN_LIMIT)) {
 			if (row.machine == null) continue;
@@ -159,7 +162,17 @@ export function createProvisioning(store) {
 		}
 	}
 
-	// `<principal>.<machine>` names a delegate, so no principal may read as one of an existing user.
+	// Machine users that exist, plus reservations still being created; read under the principal's lock.
+	async function countMachines(principal, now) {
+		let count = 0;
+		for await (const row of store.delegatesOf(principal, DELEGATE_SCAN_LIMIT)) {
+			if (row.machine == null) continue;
+			if (now - time(row.createdAt) < RESERVATION_TTL_MS || (await store.getUser(row.username))) count++;
+		}
+		return count;
+	}
+
+	// `<principal>.<machine>` names a machine user, so no principal may read as one of an existing user.
 	async function refuseDelegateShapedName(principal) {
 		for (let dot = principal.indexOf('.', principal.indexOf('@')); dot !== -1; dot = principal.indexOf('.', dot + 1)) {
 			const prefix = principal.slice(0, dot);
@@ -169,33 +182,40 @@ export function createProvisioning(store) {
 		}
 	}
 
-	// The new password is returned only while it authenticates the user it was meant for; an admin changing the
-	// user mid-request (a promotion, a deactivation) gets a password nobody holds instead.
+	// A password is returned only while it authenticates the user it was meant for. A user an admin changed
+	// mid-request gets a password nobody holds; one whose password a competing request replaced is left alone.
 	async function confirmIssued(username, password, role) {
-		let current;
-		try {
-			current = await store.authenticate(username, password);
-		} catch {
-			throw fail(409, 'user_changed', 'The user changed during the request; nothing was issued');
-		}
+		const current = await stage('confirm', () => store.authenticate(username, password));
+		if (!current) throw userChanged();
 		const record = await store.getRecord(username);
 		if (current.active && current.role === role && record) return;
 		await stage('scramble', () => store.setPassword(username, generatePassword()));
-		throw fail(409, 'user_changed', 'The user changed during the request; nothing was issued');
+		throw userChanged();
 	}
 
-	// Reserve, then create: a crash after the reservation leaves a record that a retry takes over once it is stale,
-	// and a crash after add_user leaves a managed user its owner can rotate. Nothing is ever compensated by deleting
-	// a user, which could delete one an admin created under the same name.
-	async function issue({ username, principal, machine, role, actsFor }, caller) {
+	// Reserve, then create, so that every crash point leaves state the flow recovers (DESIGN.md). `owner` is the
+	// principal a machine user is created under, re-checked under its lock.
+	async function issue({ username, principal, machine, role, actsFor, owner }, caller) {
 		const createdAt = store.now();
 		let previousGrant;
+		let tookOver = false;
+		const names = machine === null ? [username] : [principal, username];
 		await stage('reserve', () =>
-			store.withNameLock(username, async (tx) => {
+			store.withNameLock(names, async (tx) => {
 				if (await store.getUser(username)) throw fail(409, 'user_exists', 'User already exists');
+				if (owner) {
+					const current = await store.getUser(principal);
+					if (!current?.active || current.role !== owner.role) throw userChanged();
+					if ((await countMachines(principal, time(createdAt))) >= MAX_DELEGATES) {
+						throw fail(409, 'too_many_delegates', `A person has at most ${MAX_DELEGATES} machine users`);
+					}
+				}
 				const reservation = await tx.getRecord(username);
-				if (reservation && createdAt - reservation.createdAt < RESERVATION_TTL_MS) {
-					throw fail(409, 'in_progress', 'Another request is creating this user; retry in a minute');
+				if (reservation) {
+					if (time(createdAt) - time(reservation.createdAt) < RESERVATION_TTL_MS) {
+						throw fail(409, 'in_progress', 'Another request is creating this user; retry in a minute');
+					}
+					tookOver = true;
 				}
 				previousGrant = await tx.getGrantRow(username);
 				if (!grantRowReusable(previousGrant, actsFor)) {
@@ -212,11 +232,12 @@ export function createProvisioning(store) {
 		try {
 			await stage('add_user', () => store.addUser(username, password, role));
 		} catch (error) {
-			if (error instanceof ProvisionError && error.code === 'user_exists') {
+			// After a takeover, the user that now exists is most likely the earlier request's, so its row stays.
+			if (error instanceof ProvisionError && error.code === 'user_exists' && !tookOver) {
 				await stage('release', () =>
-					store.withNameLock(username, async (tx) => {
+					store.withNameLock([username], async (tx) => {
 						const reservation = await tx.getRecord(username);
-						if (reservation?.createdAt?.getTime() !== createdAt.getTime()) return;
+						if (!reservation || time(reservation.createdAt) !== time(createdAt)) return;
 						await tx.deleteRecord(username);
 						if (!actsFor) return;
 						if (previousGrant) await tx.putGrantRow({ ...previousGrant, username });
@@ -238,7 +259,7 @@ export function createProvisioning(store) {
 			const record = await store.getRecord(principal);
 			const delegates = [];
 			for await (const delegate of liveDelegates(principal)) delegates.push(delegate);
-			return { exists: true, managed: Boolean(record), role: assignable(user.role), delegates };
+			return { exists: true, managed: manageable(user, record), role: assignable(user.role), delegates };
 		},
 
 		async create(body, caller) {
@@ -255,15 +276,10 @@ export function createProvisioning(store) {
 			const username = delegateName(principal, machine);
 			const owner = await requireManaged(principal);
 			if (owner.record.machine != null) throw fail(400, 'not_a_principal', 'principal is itself a delegate');
-			let count = 0;
-			for await (const _ of liveDelegates(principal)) {
-				if (++count >= MAX_DELEGATES)
-					throw fail(409, 'too_many_delegates', `A principal has at most ${MAX_DELEGATES} delegates`);
-			}
 			// A delegate shares the principal's private scope, which is never content-checked, so only a delegate of
 			// the principal's own role acts for it; any other is a standalone user (DESIGN.md).
 			const actsFor = role === owner.user.role ? principal : null;
-			const credentials = await issue({ username, principal, machine, role, actsFor }, caller);
+			const credentials = await issue({ username, principal, machine, role, actsFor, owner: owner.user }, caller);
 			return { ...credentials, actsFor: actsFor !== null };
 		},
 
@@ -318,14 +334,16 @@ function errorResponse(error, method) {
 }
 
 /**
- * One request to `/Provision/`. `user` is the authenticated Harper user, or undefined. Every method checks the
- * caller first, so nothing about users is answered to anyone but the provisioner.
+ * One request to `/Provision/`. `user` is the authenticated Harper user, or undefined; `openStore()` returns the
+ * store, opened only once the caller is the provisioner.
  */
-export async function handleProvisionRequest(method, target, data, user, store) {
+export async function handleProvisionRequest(method, target, data, user, openStore) {
+	// A body nobody reads must not become an unhandled rejection.
+	data?.catch?.(() => {});
 	try {
 		const caller = authorizeCaller(user);
 		const path = principalFromPath(target);
-		const provisioning = createProvisioning(store);
+		const provisioning = createProvisioning(openStore());
 		if (method === 'GET') return json(await provisioning.describe(path));
 		if (method !== 'POST') throw fail(405, 'method_not_allowed', 'Method not allowed');
 		if (path !== '') throw fail(404, 'not_found', 'POST to /Provision/');
@@ -343,8 +361,8 @@ export async function handleProvisionRequest(method, target, data, user, store) 
 	}
 }
 
-/** The Harper-backed store for `createProvisioning`; `user` is the caller, recorded as the writes' author. */
-export function harperStore(user) {
+// `user` is the caller, recorded as the writes' author.
+function harperStore(user) {
 	const system = databases.system;
 	const { ProvisionedUser, ScopeGrant } = databases.memory;
 	const read = { authorize: false };
@@ -359,8 +377,16 @@ export function harperStore(user) {
 			return { role: typeof role?.role === 'string' ? role.role : null, active: record.active === true };
 		},
 		async authenticate(username, password) {
-			const authenticated = await server.authenticateUser(username, password);
-			return { role: authenticated?.role?.role ?? null, active: authenticated?.active === true };
+			let authenticated;
+			try {
+				authenticated = await server.authenticateUser(username, password);
+			} catch (error) {
+				// Harper refuses a wrong password or an inactive user with 401; anything else is a fault.
+				if (error?.statusCode === 401) return undefined;
+				throw error;
+			}
+			if (!authenticated) return undefined;
+			return { role: authenticated.role?.role ?? null, active: authenticated.active === true };
 		},
 		async addUser(username, password, role) {
 			try {
@@ -391,10 +417,13 @@ export function harperStore(user) {
 			for await (const row of rows) if (row.actsFor === username) return true;
 			return false;
 		},
-		withNameLock(username, fn) {
+		withNameLock(usernames, fn) {
 			const context = { user };
 			return transaction(context, async () => {
-				await ProvisionedUser.lock(username, { scope: getLockScope() ?? 'node' }, context);
+				// One order for every request, so two locking the same names cannot deadlock.
+				for (const name of [...usernames].sort()) {
+					await ProvisionedUser.lock(name, { scope: getLockScope() ?? 'node' }, context);
+				}
 				return fn({
 					getRecord: async (id) => (await ProvisionedUser.get(id, context)) ?? undefined,
 					putRecord: (record) => ProvisionedUser.put(record, context),
@@ -413,23 +442,23 @@ export class Provision extends Resource {
 	static hidden = true;
 
 	static get(target, context) {
-		return handleProvisionRequest('GET', target, undefined, context?.user, harperStore(context?.user));
+		return handleProvisionRequest('GET', target, undefined, context?.user, () => harperStore(context?.user));
 	}
 
 	static post(target, data, context) {
-		return handleProvisionRequest('POST', target, data, context?.user, harperStore(context?.user));
+		return handleProvisionRequest('POST', target, data, context?.user, () => harperStore(context?.user));
 	}
 
-	static put(target, _data, context) {
-		return handleProvisionRequest('PUT', target, undefined, context?.user, harperStore(context?.user));
+	static put(target, data, context) {
+		return handleProvisionRequest('PUT', target, data, context?.user, () => harperStore(context?.user));
 	}
 
-	static patch(target, _data, context) {
-		return handleProvisionRequest('PATCH', target, undefined, context?.user, harperStore(context?.user));
+	static patch(target, data, context) {
+		return handleProvisionRequest('PATCH', target, data, context?.user, () => harperStore(context?.user));
 	}
 
 	static delete(target, context) {
-		return handleProvisionRequest('DELETE', target, undefined, context?.user, harperStore(context?.user));
+		return handleProvisionRequest('DELETE', target, undefined, context?.user, () => harperStore(context?.user));
 	}
 
 	static async subscribe(_target, context) {
@@ -439,7 +468,7 @@ export class Provision extends Resource {
 
 	static async connect(target, incomingMessages, context) {
 		if (incomingMessages == null) {
-			return handleProvisionRequest('CONNECT', target, undefined, context?.user, harperStore(context?.user));
+			return handleProvisionRequest('CONNECT', target, undefined, context?.user, () => harperStore(context?.user));
 		}
 		return this.subscribe(target, context);
 	}

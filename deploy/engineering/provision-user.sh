@@ -14,7 +14,8 @@
 #             none             -> create the user without writing credentials anywhere
 #     --acts-for  upsert actsFor onto the user's ScopeGrant row "user:<username>", so this agent user acts for
 #                 that user (DESIGN.md Identity › Delegation). The upsert keeps any read/write the row has. That user
-#                 must exist, and eng-public never shares a delegation group with another role.
+#                 must exist and hold the same customer clearance (eng and eng-agents are cleared; eng-public,
+#                 dispatch-worker and provisioner are not).
 #   The cluster is never defaulted (this repo is public). AGENT_MEMORY_URL is the base URL written into the
 #   credentials file, so it is only needed when target is not none.
 set -euo pipefail
@@ -40,6 +41,7 @@ URL="${AGENT_MEMORY_URL:-}"
 case "$TARGET" in
   ssh:*) ssh -o ProxyJump=none "${TARGET#ssh:}" true || { echo "cannot reach ${TARGET#ssh:}" >&2; exit 1; };;
   file:*) DEST="${TARGET#file:}"; DEST_DIR="$(dirname -- "$DEST")"
+    [ ! -d "$DEST" ] || { echo "$DEST is a directory; name the file to write" >&2; exit 1; }
     [ -d "$DEST_DIR" ] && [ -w "$DEST_DIR" ] || { echo "cannot write to $DEST_DIR" >&2; exit 1; };;
 esac
 
@@ -60,15 +62,16 @@ operation() {
   RESULT="$result" node -e 'const r=JSON.parse(process.env.RESULT.trim().split("\n").pop()); if (r.error) { console.error("cluster refused:", JSON.stringify(r)); process.exit(1); } process.stdout.write(JSON.stringify(r));'
 }
 
-# A delegation group shares one private scope, so a customer-cleared member would put customer detail where an
-# eng-public member reads it (deploy/engineering/DESIGN.md). Checked before the cluster changes.
+# A delegation group shares one private scope, which is never content-checked, so both members need the same
+# clearance (deploy/engineering/DESIGN.md). A role outside these lists pairs only with itself.
+clearance() { case "$1" in eng|eng-agents) echo cleared;; eng-public|dispatch-worker|provisioner) echo public;; *) echo "role:$1";; esac; }
 if [ -n "$ACTS_FOR" ]; then
   USERS="$(printf '%s' '{"operation":"list_users"}' | operation)"
   PRINCIPAL_ROLE="$(USERS="$USERS" NAME="$ACTS_FOR" node -e '
 const u=JSON.parse(process.env.USERS).find((x)=>x.username===process.env.NAME); process.stdout.write(u ? String(u.role?.role ?? "") : "-");')"
   [ "$PRINCIPAL_ROLE" != - ] || { echo "--acts-for user $ACTS_FOR does not exist" >&2; exit 1; }
-  if { [ "$ROLE" = eng-public ] || [ "$PRINCIPAL_ROLE" = eng-public ]; } && [ "$ROLE" != "$PRINCIPAL_ROLE" ]; then
-    echo "a $ROLE user cannot act for a ${PRINCIPAL_ROLE:-roleless} user: eng-public never shares a delegation group with another role (leave --acts-for off for a standalone user)" >&2
+  if [ "$(clearance "$ROLE")" != "$(clearance "$PRINCIPAL_ROLE")" ]; then
+    echo "a $ROLE user cannot act for a ${PRINCIPAL_ROLE:-roleless} user: a delegation group never mixes customer clearance (leave --acts-for off for a standalone user)" >&2
     exit 1
   fi
 fi
@@ -86,7 +89,8 @@ AGENT_MEMORY_USER=$USERNAME"
     local) printf '%s\n' "$ENV_CONTENT" | bash -c "$WRITE";;
     ssh:*) printf '%s\n' "$ENV_CONTENT" | ssh -o ProxyJump=none "${TARGET#ssh:}" "$WRITE";;
     # mktemp creates the file 0600, and the rename never leaves a readable partial file at the destination.
-    file:*) TMP="$(mktemp "$DEST_DIR/.agent-memory-env.XXXXXX")"; printf '%s\n' "$ENV_CONTENT" >"$TMP"; mv -f -- "$TMP" "$DEST";;
+    file:*) TMP="$(mktemp "$DEST_DIR/.agent-memory-env.XXXXXX")"; trap 'rm -f -- "$TMP"' EXIT
+      printf '%s\n' "$ENV_CONTENT" >"$TMP"; mv -f -- "$TMP" "$DEST";;
   esac
   case "$TARGET" in
     file:*) echo "credentials written to $DEST";;

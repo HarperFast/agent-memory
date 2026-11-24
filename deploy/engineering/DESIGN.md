@@ -20,16 +20,22 @@ resource calls `server.operation` with authorization off, after its own checks.
 - **No orphaned users.** `issue` commits the reservation (row, and a delegate's `actsFor` row) under the name's
   record lock (`getLockScope()`) before `add_user`. A crash after `add_user` leaves a managed user its owner can
   rotate. A crash before leaves a reservation that a retry takes over after `RESERVATION_TTL_MS`. A 409 from
-  `add_user` releases only a reservation still carrying this request's `createdAt`. Nothing deletes a user, which
-  could delete one an admin made under the same name.
+  `add_user` releases only a reservation this request made fresh and still carrying its `createdAt`: after a
+  takeover, the user that exists is most likely the earlier request's, so its row stays. Nothing deletes a user,
+  which could delete one an admin made under the same name. Left open: a crash before `add_user` followed by an
+  admin creating that name leaves the admin's user managed, and a rotate writes by username, so it can overwrite an
+  admin's concurrent reset (no credential is returned for a changed user either way).
+- **Machine users are admitted under the principal's lock.** addDelegate locks the principal and the machine name,
+  re-reads the principal's role there, and counts machine users that exist or are still being created
+  (`countMachines`) against `MAX_DELEGATES`, so concurrent requests cannot exceed it or act on a stale role.
 - **A new user inherits no grants.** `grantRowReusable` refuses a leftover `user:<name>` row with grants, or with an
   `actsFor` other than the delegate's own principal. `hasInboundDelegation` refuses a principal name that some user
   still acts for.
 - **A delegation group never mixes clearance.** A delegate shares `user:<principal>`, and private memories are never
   content-checked (`src/quarantine.ts` `decideContentFlag`). So addDelegate sets `actsFor` only on a delegate of the
   principal's own role; one of another role (an `eng` person's `eng-public` machine) is a standalone user, tied to the
-  person only by its `ProvisionedUser` row. `provision-user.sh --acts-for` refuses `eng-public` paired with another
-  role.
+  person only by its `ProvisionedUser` row. `provision-user.sh --acts-for` refuses a pair whose roles differ in
+  customer clearance (`clearance`). A later admin role change is outside both; README says how to handle it.
 - **`<principal>.<machine>` is a machine user's name.** `refuseDelegateShapedName` stops a principal from reading as a
   delegate of an existing user. The row's `machine` says which a managed user is.
 - **No secret leaves in a log.** Failures log a stage, the cause's name and status, and a `ref` (`StageFailure`),

@@ -33,7 +33,7 @@ function fakeStore({ users = {}, records = {}, grants = {} } = {}) {
 		async authenticate(name, password) {
 			await state.hooks.authenticate?.(name);
 			const user = state.users.get(name);
-			if (!user?.active || state.passwords.get(name) !== password) throw new Error('rejected');
+			if (!user?.active || state.passwords.get(name) !== password) return undefined;
 			return { role: user.role, active: true };
 		},
 		async addUser(name, password, role) {
@@ -63,7 +63,8 @@ function fakeStore({ users = {}, records = {}, grants = {} } = {}) {
 		async hasInboundDelegation(name) {
 			return [...state.grants.values()].some((row) => row.actsFor === name);
 		},
-		async withNameLock(_name, fn) {
+		async withNameLock(names, fn) {
+			await state.hooks.lock?.(names);
 			const records = new Map(state.records);
 			const grants = new Map(state.grants);
 			const result = await fn({
@@ -88,7 +89,7 @@ async function call(store, { method = 'POST', path = '/', body, user = PROVISION
 		{ pathname: path },
 		body instanceof Promise ? body : Promise.resolve(body),
 		user,
-		store,
+		() => store,
 	);
 	return { status: response.status, headers: response.headers, body: await response.json() };
 }
@@ -147,6 +148,26 @@ describe('handleProvisionRequest routing', () => {
 			assert.equal(refused.body.code, 'provisioner_required');
 		}
 		assert.deepEqual(state.calls, []);
+	});
+
+	it('opens no store and leaves no unhandled rejection for a refused request', async () => {
+		const refusedStore = () => {
+			throw new Error('the store was opened for an unauthorized caller');
+		};
+		for (const method of ['POST', 'PUT', 'PATCH']) {
+			const response = await handleProvisionRequest(
+				method,
+				{ pathname: '/' },
+				Promise.reject(new SyntaxError('bad json')),
+				null,
+				refusedStore,
+			);
+			assert.equal(response.status, 401);
+		}
+		const { store } = fakeStore();
+		const misdirected = await call(store, { path: '/a@example.com', body: Promise.reject(new SyntaxError('bad')) });
+		assert.equal(misdirected.status, 404);
+		await new Promise((resolve) => setImmediate(resolve));
 	});
 
 	it('decodes the principal from the path and refuses bad encoding', async () => {
@@ -300,6 +321,18 @@ describe('create', () => {
 		assert.equal(state.records.has('kris@example.com'), false);
 	});
 
+	it('keeps a reservation it took over when the earlier request creates the user first', async () => {
+		const staleAt = new Date(NOW - RESERVATION_TTL_MS - 1);
+		const { store, state } = fakeStore({
+			records: { 'kris@example.com': managed('kris@example.com', { createdAt: staleAt }) },
+		});
+		state.hooks.addUser = (name) => state.users.set(name, { role: 'eng', active: true });
+		const response = await call(store, { body: { action: 'create', principal: 'kris@example.com', role: 'eng' } });
+		assert.equal(response.status, 409);
+		assert.equal(response.body.code, 'user_exists');
+		assert.equal(state.records.has('kris@example.com'), true);
+	});
+
 	it('keeps its reservation when add_user fails for another reason, so the user stays recoverable', async () => {
 		const { store, state } = fakeStore();
 		state.hooks.addUser = () => {
@@ -323,6 +356,21 @@ describe('create', () => {
 			state.calls.map(([kind]) => kind),
 			['addUser', 'setPassword'],
 		);
+	});
+});
+
+describe('confirming a new password', () => {
+	it('answers 500 at the confirm stage, not user_changed, when authentication itself fails', async () => {
+		let logged = '';
+		logger.error = (message) => (logged = String(message));
+		const { store, state } = fakeStore();
+		state.hooks.authenticate = () => {
+			throw Object.assign(new Error('backend down'), { statusCode: 500 });
+		};
+		const response = await call(store, { body: { action: 'create', principal: 'kris@example.com', role: 'eng' } });
+		assert.equal(response.status, 500);
+		assert.match(logged, /failed at confirm/);
+		assert.equal(state.records.has('kris@example.com'), true);
 	});
 });
 
@@ -416,6 +464,44 @@ describe('addDelegate', () => {
 		const refused = await call(full.store, { body });
 		assert.equal(refused.status, 409);
 		assert.equal(refused.body.code, 'too_many_delegates');
+	});
+
+	it('counts machine users still being created toward the limit, but not abandoned reservations', async () => {
+		const body = { action: 'addDelegate', principal, machine: 'laptop', role: 'eng' };
+		const fill = (state, extra) => {
+			for (let i = 0; i < MAX_DELEGATES - 1; i++) {
+				state.users.set(`${principal}.m${i}`, { role: 'eng', active: true });
+				state.records.set(
+					`${principal}.m${i}`,
+					managed(principal, { username: `${principal}.m${i}`, machine: `m${i}` }),
+				);
+			}
+			state.records.set(
+				`${principal}.pending`,
+				managed(principal, { username: `${principal}.pending`, machine: 'pending', ...extra }),
+			);
+		};
+		const busy = owned('eng');
+		fill(busy.state, { createdAt: new Date(NOW - 1_000) });
+		const refused = await call(busy.store, { body });
+		assert.equal(refused.status, 409);
+		assert.equal(refused.body.code, 'too_many_delegates');
+
+		const abandoned = owned('eng');
+		fill(abandoned.state, { createdAt: new Date(NOW - RESERVATION_TTL_MS - 1) });
+		assert.equal((await call(abandoned.store, { body })).status, 201);
+	});
+
+	it("re-checks the principal's role under the lock, so a role change mid-request issues nothing", async () => {
+		const { store, state } = owned('eng-public');
+		state.hooks.lock = () => (state.users.get(principal).role = 'eng');
+		const response = await call(store, {
+			body: { action: 'addDelegate', principal, machine: 'laptop', role: 'eng-public' },
+		});
+		assert.equal(response.status, 409);
+		assert.equal(response.body.code, 'user_changed');
+		assert.deepEqual(state.calls, []);
+		assert.equal(state.grants.size, 0);
 	});
 
 	it('validates the machine label and the combined length', async () => {
@@ -567,6 +653,18 @@ describe('describe (GET)', () => {
 		});
 		assert.equal((await call(store, { method: 'GET', path: '/root@example.com' })).body.role, null);
 		assert.equal((await call(store, { method: 'GET', path: '/' })).status, 400);
+	});
+
+	it('reports managed only where rotate would succeed', async () => {
+		const { store } = fakeStore({
+			users: { 'off@example.com': { role: 'eng', active: false }, 'up@example.com': { role: 'super_user' } },
+			records: { 'off@example.com': managed('off@example.com'), 'up@example.com': managed('up@example.com') },
+		});
+		for (const name of ['off@example.com', 'up@example.com']) {
+			const response = await call(store, { method: 'GET', path: `/${name}` });
+			assert.equal(response.body.exists, true);
+			assert.equal(response.body.managed, false, name);
+		}
 	});
 });
 

@@ -199,17 +199,30 @@ describe('deploy/engineering/provision-user.sh roles, targets and delegation', (
 		assert.equal(result.status, 1);
 		assert.match(result.stderr, /cannot write to \/nonexistent-dir/);
 		assert.deepEqual(result.operations, []);
+
+		const dir = mkdtempSync(join(tmpdir(), 'provision-dir-'));
+		try {
+			const directory = provision(['dispatch-provisioner', 'provisioner', `file:${dir}`, '--rotate']);
+			assert.equal(directory.status, 1);
+			assert.match(directory.stderr, /is a directory/);
+			assert.deepEqual(directory.operations, []);
+			assert.deepEqual(readdirSync(dir), []);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
 	});
 
-	it('refuses --acts-for across eng-public and another role, or to a missing user, before the cluster changes', () => {
+	it('refuses --acts-for across customer clearance, or to a missing user, before the cluster changes', () => {
 		for (const [role, principal] of [
 			['eng-public', 'kris@example.com'],
+			['dispatch-worker', 'kris@example.com'],
+			['provisioner', 'kris@example.com'],
 			['eng-agents', 'pat@example.com'],
 			['eng', 'pat@example.com'],
 		]) {
 			const result = provision([`agent-${role}`, role, 'none', '--acts-for', principal]);
 			assert.equal(result.status, 1, `${role} for ${principal}`);
-			assert.match(result.stderr, /never shares a delegation group/);
+			assert.match(result.stderr, /never mixes customer clearance/);
 			assert.deepEqual(
 				result.operations.map((op) => op.operation),
 				['list_users'],
@@ -224,6 +237,7 @@ describe('deploy/engineering/provision-user.sh roles, targets and delegation', (
 		for (const [role, principal] of [
 			['eng-agents', 'kris@example.com'],
 			['eng-public', 'pat@example.com'],
+			['dispatch-worker', 'pat@example.com'],
 		]) {
 			const result = provision([`agent-${role}`, role, 'none', '--acts-for', principal]);
 			assert.equal(result.status, 0, result.stderr);
